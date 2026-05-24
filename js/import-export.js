@@ -1,0 +1,256 @@
+/* WhenDidI - Import / Export
+ * Round-trips the original whendidibk.json format byte-compatibly.
+ */
+
+const REQUIRED_KEYS = ['topics', 'events'];
+const KNOWN_TOP_KEYS = new Set([
+  'version', 'saveddatelong', 'saveddate', 'eventcount', 'topiccount',
+  'measurements', 'pendtimes', 'topics', 'events', 'appdata',
+]);
+
+function formatSavedDate(d) {
+  const months = ['Jan','Feb','Mar','Apr','May','Jun',
+                  'Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${months[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
+}
+
+function validateBackup(obj) {
+  const errors = [];
+  if (!obj || typeof obj !== 'object') {
+    errors.push('File is not a JSON object.');
+    return errors;
+  }
+  for (const k of REQUIRED_KEYS) {
+    if (!Array.isArray(obj[k])) errors.push(`Missing or invalid "${k}" array.`);
+  }
+  if (Array.isArray(obj.topics)) {
+    for (const [i, t] of obj.topics.entries()) {
+      if (typeof t.id !== 'number') errors.push(`topics[${i}].id missing/non-numeric`);
+      if (typeof t.name !== 'string') errors.push(`topics[${i}].name missing/non-string`);
+    }
+  }
+  if (Array.isArray(obj.events)) {
+    for (const [i, e] of obj.events.entries()) {
+      if (typeof e.id !== 'number') { errors.push(`events[${i}].id missing/non-numeric`); break; }
+      if (typeof e.time !== 'number') { errors.push(`events[${i}].time missing/non-numeric`); break; }
+      if (typeof e.topicid !== 'number') { errors.push(`events[${i}].topicid missing/non-numeric`); break; }
+    }
+  }
+  return errors;
+}
+
+function summarize(obj) {
+  const events = obj.events || [];
+  let minT = Infinity, maxT = -Infinity;
+  for (const e of events) {
+    if (e.time < minT) minT = e.time;
+    if (e.time > maxT) maxT = e.time;
+  }
+  return {
+    version: obj.version ?? '(unknown)',
+    topics: (obj.topics || []).length,
+    events: events.length,
+    measurements: (obj.measurements || []).length,
+    minTime: events.length ? new Date(minT) : null,
+    maxTime: events.length ? new Date(maxT) : null,
+    saveddate: obj.saveddate || '(not set)',
+  };
+}
+
+/**
+ * Replace local DB with the contents of `obj`.
+ * Preserves unknown top-level keys in meta.extraKeys.
+ */
+async function importReplace(obj) {
+  await WDDB.clearAll();
+  await applyBackup(obj);
+}
+
+/**
+ * Merge `obj` into local DB.
+ *  - topics: keyed by name (case-insensitive). If a topic with the same
+ *    name exists, reuse the existing id; otherwise allocate a new one
+ *    that doesn't collide. Re-map event topicids accordingly.
+ *  - events: keyed by id. Skip duplicates by id+topicid+time.
+ */
+async function importMerge(obj) {
+  // existing topics
+  const existingTopics = await WDDB.getAll('topics');
+  const existingByName = new Map(
+    existingTopics.map((t) => [t.name.toLowerCase(), t]));
+  const existingIds = new Set(existingTopics.map((t) => t.id));
+  let nextTopicId = existingTopics.reduce((m, t) => Math.max(m, t.id), 0) + 1;
+
+  const topicIdMap = new Map(); // incoming id -> final id
+  const topicsToWrite = [];
+  for (const t of (obj.topics || [])) {
+    const key = (t.name || '').toLowerCase();
+    if (existingByName.has(key)) {
+      topicIdMap.set(t.id, existingByName.get(key).id);
+    } else {
+      let finalId = t.id;
+      if (existingIds.has(finalId)) finalId = nextTopicId++;
+      existingIds.add(finalId);
+      const newTopic = { ...t, id: finalId };
+      topicIdMap.set(t.id, finalId);
+      topicsToWrite.push(newTopic);
+      existingByName.set(key, newTopic);
+    }
+  }
+  if (topicsToWrite.length) await WDDB.putMany('topics', topicsToWrite);
+
+  // existing events: build a dedupe set by topicid|time
+  const existingEvents = await WDDB.getAll('events');
+  const existingEventIds = new Set(existingEvents.map((e) => e.id));
+  const existingEventKeys = new Set(
+    existingEvents.map((e) => `${e.topicid}|${e.time}|${e.qant}`));
+  let nextEventId = existingEvents.reduce((m, e) => Math.max(m, e.id), 0) + 1;
+
+  const eventsToWrite = [];
+  for (const e of (obj.events || [])) {
+    const mappedTopic = topicIdMap.get(e.topicid) ?? e.topicid;
+    const key = `${mappedTopic}|${e.time}|${e.qant ?? 0}`;
+    if (existingEventKeys.has(key)) continue;
+    let finalId = e.id;
+    if (existingEventIds.has(finalId)) finalId = nextEventId++;
+    existingEventIds.add(finalId);
+    existingEventKeys.add(key);
+    eventsToWrite.push({ ...e, id: finalId, topicid: mappedTopic });
+  }
+  if (eventsToWrite.length) await WDDB.putMany('events', eventsToWrite);
+
+  // Merge measurements / pendtimes / appdata by id/name; existing wins.
+  if (Array.isArray(obj.measurements)) {
+    const existing = await WDDB.getAll('measurements');
+    const have = new Set(existing.map((m) => m.id));
+    const add = obj.measurements.filter((m) => !have.has(m.id));
+    if (add.length) await WDDB.putMany('measurements', add);
+  }
+  if (Array.isArray(obj.pendtimes)) {
+    const existing = await WDDB.getAll('pendtimes');
+    const have = new Set(existing.map((p) => p.id));
+    const add = obj.pendtimes.filter((p) => !have.has(p.id));
+    if (add.length) await WDDB.putMany('pendtimes', add);
+  }
+  if (Array.isArray(obj.appdata)) {
+    const existing = await WDDB.getAll('appdata');
+    const have = new Set(existing.map((a) => a.name));
+    const add = obj.appdata.filter((a) => !have.has(a.name));
+    if (add.length) await WDDB.putMany('appdata', add);
+  }
+
+  await preserveUnknownKeys(obj);
+}
+
+async function applyBackup(obj) {
+  if (Array.isArray(obj.measurements) && obj.measurements.length) {
+    await WDDB.putMany('measurements', obj.measurements);
+  } else {
+    await WDDB.putMany('measurements', window.WDDB_DEFAULT_MEASUREMENTS);
+  }
+  if (Array.isArray(obj.pendtimes) && obj.pendtimes.length) {
+    await WDDB.putMany('pendtimes', obj.pendtimes);
+  } else {
+    await WDDB.putMany('pendtimes', window.WDDB_DEFAULT_PENDTIMES);
+  }
+  if (Array.isArray(obj.topics)) await WDDB.putMany('topics', obj.topics);
+  if (Array.isArray(obj.events)) await WDDB.putMany('events', obj.events);
+  if (Array.isArray(obj.appdata)) await WDDB.putMany('appdata', obj.appdata);
+
+  await preserveUnknownKeys(obj);
+  await WDDB.setMeta('lastImport', Date.now());
+  await WDDB.setMeta('originalVersion', obj.version ?? 4);
+}
+
+async function preserveUnknownKeys(obj) {
+  const extras = {};
+  for (const k of Object.keys(obj)) {
+    if (!KNOWN_TOP_KEYS.has(k)) extras[k] = obj[k];
+  }
+  if (Object.keys(extras).length) {
+    await WDDB.setMeta('extraTopKeys', extras);
+  }
+}
+
+async function buildExportObject() {
+  const now = new Date();
+  const [measurements, pendtimes, topics, events, appdata] = await Promise.all([
+    WDDB.getAll('measurements'),
+    WDDB.getAll('pendtimes'),
+    WDDB.getAll('topics'),
+    WDDB.getAll('events'),
+    WDDB.getAll('appdata'),
+  ]);
+
+  // sort topics by name to match the original layout
+  topics.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  // events: keep stable order; the original groups by topicid then desc time
+  events.sort((a, b) => (a.topicid - b.topicid) || (b.time - a.time));
+  measurements.sort((a, b) => {
+    // duration measurements (type 3) listed first by id
+    if (a.type !== b.type) return b.type - a.type;
+    return a.id - b.id;
+  });
+  pendtimes.sort((a, b) => a.id - b.id);
+
+  const version = await WDDB.getMeta('originalVersion', 4);
+  const out = {
+    version,
+    saveddatelong: now.getTime(),
+    saveddate: formatSavedDate(now),
+    eventcount: events.length,
+    topiccount: topics.length,
+    measurements,
+    pendtimes,
+    topics,
+    events,
+    appdata,
+  };
+
+  const extras = await WDDB.getMeta('extraTopKeys', {});
+  for (const [k, v] of Object.entries(extras)) {
+    if (!(k in out)) out[k] = v;
+  }
+  return out;
+}
+
+function downloadJSON(filename, obj) {
+  const json = JSON.stringify(obj, null, 0); // compact like original
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+async function exportToFile(filename) {
+  const obj = await buildExportObject();
+  const name = filename || `whendidibk.json`;
+  downloadJSON(name, obj);
+  await WDDB.setMeta('lastExport', Date.now());
+}
+
+async function safetyBackup() {
+  const events = await WDDB.getAll('events');
+  if (!events.length) return; // nothing to back up
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-` +
+                `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  await exportToFile(`whendidibk-backup-${stamp}.json`);
+}
+
+window.WDIO = {
+  validateBackup,
+  summarize,
+  importReplace,
+  importMerge,
+  buildExportObject,
+  exportToFile,
+  safetyBackup,
+  downloadJSON,
+};
