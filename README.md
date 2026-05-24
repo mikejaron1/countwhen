@@ -9,6 +9,25 @@ backup format, so your years of history come along for the ride.
 > whose original install no longer works. Should be just as useful
 > for anyone in the same boat.
 
+## Live URL
+
+**<https://mikejaron1.github.io/whendidi-pwa/>**
+
+Open in Chrome on your phone, tap ⋮ → **Install app**. Done.
+
+## Update workflow (for the dev)
+
+This repo auto-deploys to GitHub Pages on every push to `main`.
+
+```sh
+cd ~/projects/whendidi-pwa
+# (make edits)
+./deploy.sh "what changed"
+# Wait ~30-60s for Pages to rebuild, then reload the app on the phone.
+```
+
+No drag-and-drop, no console clicks. Pages handles the rest.
+
 ## Features
 
 - **Categories** — full topic list with time-since-last + last-event
@@ -36,31 +55,15 @@ backup format, so your years of history come along for the ride.
 
 ## Install it on a Pixel (or any Android)
 
-### Step 1 — Host the app (free)
+### Step 1 — Open the URL in Chrome
 
-The app is just static files. Easiest free option:
-
-**GitHub Pages**
-
-1. Create a new public repo (e.g. `whendidi-pwa`).
-2. Copy the contents of this `webapp/` folder into the repo root.
-3. Push to GitHub.
-4. In the repo: **Settings → Pages → Source: Deploy from a branch →
-   main → /(root) → Save**.
-5. Wait ~1 minute. Your app is live at
-   `https://<your-user>.github.io/whendidi-pwa/`.
-
-Other equally-free alternatives: Netlify Drop (drag the folder onto
-[netlify.com/drop](https://app.netlify.com/drop)), Cloudflare Pages,
-or any static host. Must be **HTTPS** (or `localhost`) for the
-service worker and Drive sync to work.
+<https://mikejaron1.github.io/whendidi-pwa/>
 
 ### Step 2 — Install on the phone
 
-1. Open the URL in **Chrome** on your Pixel 10 Pro.
-2. Chrome will show an "Install app" prompt (or open the ⋮ menu →
+1. Chrome shows an "Install app" prompt (or open the ⋮ menu →
    *Install app* / *Add to Home Screen*).
-3. Confirm — the app appears on your home screen and launches in a
+2. Confirm — the app appears on your home screen and launches in a
    standalone window, no browser chrome.
 
 ### Step 3 — Import your old data
@@ -77,7 +80,7 @@ service worker and Drive sync to work.
 The simplest dev loop:
 
 ```sh
-cd webapp
+cd ~/projects/whendidi-pwa
 python3 -m http.server 8000
 ```
 
@@ -107,9 +110,8 @@ this up once:
    own Google account as a Test user.
 4. **Credentials → Create Credentials → OAuth Client ID →
    Web application**.
-5. Under **Authorized JavaScript origins** add your app's origin
-   (e.g. `https://<your-user>.github.io` or your Netlify URL — just
-   the origin, no path, no trailing slash).
+5. Under **Authorized JavaScript origins** add the app's origin:
+   `https://mikejaron1.github.io` (no path, no trailing slash).
 6. Copy the resulting Client ID.
 
 ### Bake the Client ID into the app
@@ -121,10 +123,14 @@ this up once:
    driveClientId: '123456789-abc...xyz.apps.googleusercontent.com',
    ```
 
-9. Save the file, then redeploy:
-   - **Netlify Drop**: drag the `webapp/` folder onto the page again.
-   - **GitHub Pages**: commit + push (or re-upload the file in the
-     web UI).
+9. Save the file, then deploy:
+
+   ```sh
+   cd ~/projects/whendidi-pwa
+   ./deploy.sh "enable drive sync"
+   ```
+
+   (Or commit + push manually.)
 10. Reload the app on your phone. The first time it syncs you'll see
     Google's "unverified app" warning — tap *Advanced → Go to WhenDidI
     (unsafe)* (it's *your* Cloud project, talking to *your* Drive).
