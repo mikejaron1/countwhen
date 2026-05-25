@@ -31,6 +31,8 @@ const DEFAULT_MEASUREMENTS = [
   { id: 7,  name: 'seconds',        symbol: 's',        type: 3, format: 2 },
   { id: 100, name: 'count',         symbol: '',         type: 0, format: 0 },
   { id: 101, name: 'ounces',        symbol: 'oz',       type: 0, format: 0 },
+  { id: 102, name: 'pounds',        symbol: 'lb',       type: 0, format: 0 },
+  { id: 103, name: 'grams',         symbol: 'g',        type: 0, format: 0 },
 ];
 
 const DEFAULT_PENDTIMES = [
@@ -206,11 +208,37 @@ const db = {
     return all.map((f) => f.topicid);
   },
 
+  /* Topic kinds: in-app metadata only. Not exported in whendidibk.json.
+   *   'timeonly' — log a timestamp; qant defaults to 60, no input shown
+   *   'duration' — log a hh:mm duration (msureid 10/11/12)
+   *   'amount'   — log a numeric amount in the topic's measurement unit
+   */
+  async getTopicKind(topicId) {
+    const map = (await this.getMeta('topicKinds')) || {};
+    return map[topicId] || null;
+  },
+
+  async setTopicKind(topicId, kind) {
+    const map = (await this.getMeta('topicKinds')) || {};
+    if (kind == null) delete map[topicId];
+    else map[topicId] = kind;
+    await this.setMeta('topicKinds', map);
+  },
+
+  async getAllTopicKinds() {
+    return (await this.getMeta('topicKinds')) || {};
+  },
+
   async seedDefaults() {
-    const ms = await this.getAll('measurements');
-    if (!ms.length) await this.putMany('measurements', DEFAULT_MEASUREMENTS);
+    // Pendtimes: seed if empty
     const pt = await this.getAll('pendtimes');
     if (!pt.length) await this.putMany('pendtimes', DEFAULT_PENDTIMES);
+    // Measurements: ADD any that aren't already present (so existing
+    // installs gain newly-added ones like pounds/grams on upgrade).
+    const existing = await this.getAll('measurements');
+    const haveIds = new Set(existing.map((m) => m.id));
+    const missing = DEFAULT_MEASUREMENTS.filter((m) => !haveIds.has(m.id));
+    if (missing.length) await this.putMany('measurements', missing);
   },
 };
 

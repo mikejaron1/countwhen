@@ -29,7 +29,7 @@ global.document = {
   body: { appendChild(){}, removeChild(){} },
 };
 
-const inputPath = path.join(__dirname, '..', 'context', 'whendidibk.json');
+const inputPath = process.argv[2] || path.join(__dirname, '..', 'context', 'whendidibk.json');
 const input = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
 
 // ---- Mock the db module the same shape as window.WDDB ----

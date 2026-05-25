@@ -8,6 +8,7 @@ const state = {
   measurements: [],
   favorites: new Set(),
   topicOrder: [], // ordered topic IDs, used by Categories view
+  topicKinds: {}, // topicId -> 'timeonly' | 'duration' | 'amount'
   statsTopicId: null,
   statsPeriod: 'daily',
   chart: null,
@@ -81,6 +82,8 @@ function relativeFromNow(ts) {
 
 /* Format an event's qant for display based on its topic's measurement. */
 function fmtQant(qant, topic) {
+  const kind = state.topicKinds?.[topic?.id] || inferKind(topic);
+  if (kind === 'timeonly') return ''; // don't show "1m" for timestamps
   const m = state.measurements.find((m) => m.id === topic?.msureid);
   if (!m) return String(qant ?? '');
   // type 3 = time-based; qant is in seconds (per observed data)
@@ -120,14 +123,28 @@ function fmtQant(qant, topic) {
   return `${qant}${sym}`;
 }
 
+/* Infer a topic kind from its measurement when no explicit kind set. */
+function inferKind(topic) {
+  if (!topic) return 'amount';
+  const m = state.measurements.find((mm) => mm.id === topic.msureid);
+  if (!m) return 'amount';
+  if (m.type === 3) return 'duration';  // imported duration topics
+  return 'amount';
+}
+
+function topicKind(topic) {
+  return state.topicKinds?.[topic?.id] || inferKind(topic);
+}
+
 /* ======== DATA LOADING ======== */
 
 async function reload() {
-  const [topics, events, measurements, favIds] = await Promise.all([
+  const [topics, events, measurements, favIds, topicKinds] = await Promise.all([
     WDDB.getAll('topics'),
     WDDB.getAll('events'),
     WDDB.getAll('measurements'),
     WDDB.getFavoriteTopicIds(),
+    WDDB.getAllTopicKinds(),
   ]);
   // Apply saved topic order: known IDs first (in saved order), then any
   // new topics appended alphabetically.
@@ -140,8 +157,6 @@ async function reload() {
     .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
     .map((t) => t.id);
   const finalOrder = [...orderedKnown, ...rest];
-  // Persist the computed order back so subsequent inserts (new topics)
-  // append correctly to the end of the alphabetical baseline.
   const orderChanged =
     finalOrder.length !== savedOrder.length ||
     finalOrder.some((id, i) => savedOrder[i] !== id);
@@ -149,12 +164,12 @@ async function reload() {
     await WDDB.setMeta('topicOrder', finalOrder);
   }
   state.topicOrder = finalOrder;
-  // Sort topics array to match the order, but keep the underlying objects
   const byId = new Map(topics.map((t) => [t.id, t]));
   state.topics = finalOrder.map((id) => byId.get(id)).filter(Boolean);
   state.events = events;
   state.measurements = measurements;
   state.favorites = new Set(favIds);
+  state.topicKinds = topicKinds || {};
   if (state.statsTopicId == null && state.topics.length) {
     state.statsTopicId = state.topics[0].id;
   }
@@ -239,7 +254,7 @@ function renderCategories() {
   }).join('');
 
   main.innerHTML = `
-    <div class="reorder-hint">Long-press a card to drag it into a new order. Tap to log, ADD to log with details.</div>
+    <div class="reorder-hint">Tap a topic to rename/edit it. Tap ADD to log an event. Long-press a card to drag-reorder (or use ☰ → Manage Topics for arrow reordering).</div>
     <div id="categoriesList">${html}</div>
     <button class="new-topic-tile" id="addTopicBtn">+ New topic</button>
   `;
@@ -305,6 +320,8 @@ function attachReorder(listEl, onCommit) {
   const startDrag = (card) => {
     drag = { card };
     card.classList.add('dragging');
+    // Lock touch handling so the page can't scroll out from under us
+    document.body.classList.add('drag-active');
     try { card.setPointerCapture(pointerId); } catch (_) {}
     if (navigator.vibrate) navigator.vibrate(25);
   };
@@ -336,6 +353,7 @@ function attachReorder(listEl, onCommit) {
     if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
     if (!drag) { pressedCard = null; return; }
     drag.card.classList.remove('dragging');
+    document.body.classList.remove('drag-active');
     clearHighlight();
     drag.card.dataset.justDragged = '1';
     const newOrder = Array.from(listEl.children).map((c) => Number(c.dataset.topic));
@@ -347,6 +365,7 @@ function attachReorder(listEl, onCommit) {
     if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
     if (drag) {
       drag.card.classList.remove('dragging');
+      document.body.classList.remove('drag-active');
       clearHighlight();
       drag = null;
     }
@@ -527,13 +546,15 @@ async function logNow(topic) {
 }
 
 function openAddEvent(topic, existing = null) {
+  const kind = topicKind(topic);
   const m = state.measurements.find((mm) => mm.id === topic.msureid);
-  const isDuration = m && m.type === 3;
+  const isDuration = kind === 'duration';
+  const isAmount = kind === 'amount';
+  const isTimeOnly = kind === 'timeonly';
   const initTime = existing ? existing.time : Date.now();
   const initQantSec = existing ? Number(existing.qant || 0) : (isDuration ? 60 : 0);
   const initQantUnit = existing ? Number(existing.qant || 0) : 0;
 
-  // For duration topics, present hh:mm input.
   const qantHhmm = (() => {
     if (!isDuration) return '';
     const s = initQantSec;
@@ -542,22 +563,31 @@ function openAddEvent(topic, existing = null) {
     return `${pad(h)}:${pad(mn)}`;
   })();
 
+  let qantField = '';
+  if (isDuration) {
+    qantField = `
+      <div class="field">
+        <label>Duration (hh:mm)</label>
+        <input id="qHhmm" type="text" inputmode="numeric" pattern="[0-9:]*" value="${qantHhmm}" placeholder="00:00">
+      </div>`;
+  } else if (isAmount) {
+    qantField = `
+      <div class="field">
+        <label>Amount${m?.symbol ? ` (${m.symbol})` : ''}</label>
+        <input id="qNum" type="number" step="any" value="${initQantUnit}">
+      </div>`;
+  }
+  // time-only → no qant field at all; qant defaults to 60 like the original
+
   openModal(`
     <header>
       <button class="icon-btn" data-close>←</button>
       <div class="title">${existing ? 'Edit Event' : 'Add Event'}</div>
-      <button class="icon-btn" id="dialogStar" title="Pin topic to Quick Links">${state.favorites.has(topic.id)?'★':'☆'}</button>
       <button class="icon-btn" id="dialogSave" title="Save">✓</button>
     </header>
     <div class="body">
       <div class="topic-name">${escapeHtml(topic.name)}</div>
-      <div class="field">
-        <label>${isDuration ? 'Duration (hh:mm)' : `Amount${m?.symbol ? ` (${m.symbol})` : ''}`}</label>
-        ${isDuration
-          ? `<input id="qHhmm" type="text" inputmode="numeric" pattern="[0-9:]*" value="${qantHhmm}" placeholder="00:00">`
-          : `<input id="qNum" type="number" step="any" value="${initQantUnit}">`
-        }
-      </div>
+      ${qantField}
       <div class="row-2">
         <div class="field">
           <label>Date</label>
@@ -576,13 +606,6 @@ function openAddEvent(topic, existing = null) {
     </div>
   `);
 
-  $('#dialogStar').addEventListener('click', async () => {
-    const on = !state.favorites.has(topic.id);
-    await WDDB.setFavorite(topic.id, on);
-    if (on) state.favorites.add(topic.id); else state.favorites.delete(topic.id);
-    $('#dialogStar').textContent = on ? '★' : '☆';
-  });
-
   $('#dialogSave').addEventListener('click', async () => {
     const dateStr = $('#evDate').value;
     const timeStr = $('#evTime').value;
@@ -593,11 +616,14 @@ function openAddEvent(topic, existing = null) {
       const [h, mn] = raw.split(':').map((x) => Number(x || 0));
       if (Number.isNaN(h) || Number.isNaN(mn)) { snack('Bad duration'); return; }
       qant = h * 3600 + mn * 60;
-      if (qant === 0) qant = 60; // match original default behavior
-    } else {
+      if (qant === 0) qant = 60;
+    } else if (isAmount) {
       const raw = Number($('#qNum').value || 0);
       if (Number.isNaN(raw)) { snack('Bad amount'); return; }
       qant = raw;
+    } else {
+      // time-only: match original "poop start" pattern: qant=60
+      qant = existing ? Number(existing.qant || 60) : 60;
     }
     const time = parseDateTimeInput(dateStr, timeStr);
     const note = $('#evNote').value.trim();
@@ -635,15 +661,28 @@ function openAddEvent(topic, existing = null) {
 
 /* ======== TOPIC EDIT ======== */
 
+const AMOUNT_UNITS = [
+  // ordered for the picker, friendly names
+  { id: 101, label: 'Ounces (oz)' },
+  { id: 102, label: 'Pounds (lb)' },
+  { id: 4,   label: 'Kilograms (kg)' },
+  { id: 103, label: 'Grams (g)' },
+  { id: 1,   label: 'Litres (l)' },
+  { id: 2,   label: 'Gallons (gal)' },
+  { id: 3,   label: 'Miles (mi)' },
+  { id: 5,   label: 'Kilometres (km)' },
+  { id: 6,   label: 'Metres (m)' },
+  { id: 100, label: 'Count (no unit)' },
+];
+
 function openTopicEdit(existing) {
-  const measurements = state.measurements.slice().sort((a, b) => {
-    if (a.type !== b.type) return b.type - a.type;
-    return (a.name || '').localeCompare(b.name || '');
-  });
-  const optsHtml = measurements.map((m) => {
-    const lab = `${m.name}${m.symbol?` (${m.symbol})`:''}`;
-    return `<option value="${m.id}" ${existing && existing.msureid===m.id?'selected':''}>${escapeHtml(lab)}</option>`;
-  }).join('');
+  const existingKind = existing ? topicKind(existing) : 'timeonly';
+  // For amount kind we need a unit picker; default unit when creating
+  // is ounces (101).
+  const initialUnit = existing && existingKind === 'amount'
+    ? existing.msureid
+    : 101;
+
   openModal(`
     <header>
       <button class="icon-btn" data-close>←</button>
@@ -653,46 +692,82 @@ function openTopicEdit(existing) {
     <div class="body">
       <div class="field">
         <label>Name</label>
-        <input id="topicName" type="text" value="${existing ? escapeHtml(existing.name) : ''}" placeholder="e.g. poop start">
+        <input id="topicName" type="text" value="${existing ? escapeHtml(existing.name) : ''}" placeholder="e.g. poop start" autocomplete="off">
       </div>
       <div class="field">
         <label>Description (optional)</label>
-        <input id="topicDesc" type="text" value="${existing ? escapeHtml(existing.desc || '') : ''}">
+        <input id="topicDesc" type="text" value="${existing ? escapeHtml(existing.desc || '') : ''}" autocomplete="off">
       </div>
       <div class="field">
-        <label>Measurement</label>
-        <select id="topicMeasure">${optsHtml}</select>
+        <label>Topic type</label>
+        <div class="kind-picker" id="kindPicker">
+          <label class="kind-opt"><input type="radio" name="kind" value="timeonly" ${existingKind==='timeonly'?'checked':''}> <strong>Time only</strong><br><span>Just record when it happened (e.g. "poop start", "first meal", "saw blood").</span></label>
+          <label class="kind-opt"><input type="radio" name="kind" value="duration" ${existingKind==='duration'?'checked':''}> <strong>Duration</strong><br><span>Record how long something lasted in hh:mm (e.g. "workout", "nap").</span></label>
+          <label class="kind-opt"><input type="radio" name="kind" value="amount"   ${existingKind==='amount'?'checked':''}> <strong>Amount</strong><br><span>Record a quantity with a unit (e.g. "water 12 oz", "weight 175 lb").</span></label>
+        </div>
+      </div>
+      <div class="field" id="unitField" style="display:${existingKind==='amount'?'block':'none'};">
+        <label>Unit</label>
+        <select id="topicUnit">
+          ${AMOUNT_UNITS.map((u) => `<option value="${u.id}" ${u.id===initialUnit?'selected':''}>${escapeHtml(u.label)}</option>`).join('')}
+        </select>
       </div>
       ${existing ? `
         <div class="field">
           <label>
-            <input type="checkbox" id="topicArchived" ${existing.archived?'checked':''}> Archived
+            <input type="checkbox" id="topicArchived" ${existing.archived?'checked':''}> Archived (hides from Categories without deleting events)
           </label>
         </div>
-        <button class="btn danger" id="topicDelete" style="margin-top:8px;">Delete topic and all its events</button>
       ` : ''}
     </div>
   `);
+
+  // Toggle unit field based on selected kind
+  $$('input[name="kind"]', $('#modalRoot')).forEach((r) => {
+    r.addEventListener('change', () => {
+      const k = r.value;
+      $('#unitField').style.display = (k === 'amount') ? 'block' : 'none';
+    });
+  });
+
   $('#topicSave').addEventListener('click', async () => {
     const name = $('#topicName').value.trim();
     if (!name) { snack('Name required'); return; }
     const desc = $('#topicDesc').value.trim();
-    const msureid = Number($('#topicMeasure').value);
+    const kindEl = document.querySelector('input[name="kind"]:checked');
+    const kind = kindEl ? kindEl.value : 'timeonly';
+    // Map kind to msureid:
+    //   timeonly → keep existing msureid OR use Duration(10); qant defaults to 60
+    //   duration → Duration(10) [preserve existing duration measurement if it's 11/12]
+    //   amount   → user picks the unit
+    let msureid;
+    if (kind === 'amount') {
+      msureid = Number($('#topicUnit').value);
+    } else if (kind === 'duration') {
+      msureid = (existing && [10,11,12].includes(existing.msureid)) ? existing.msureid : 10;
+    } else {
+      // timeonly: use Duration measurement (matches original "poop start"
+      // pattern with qant=60). This keeps round-trip behavior identical
+      // to imported time-only topics.
+      msureid = (existing && [10,11,12].includes(existing.msureid)) ? existing.msureid : 10;
+    }
+
     if (existing) {
       const updated = {
         ...existing,
         name, desc, msureid,
-        archived: $('#topicArchived').checked,
+        archived: $('#topicArchived')?.checked || false,
       };
       await WDDB.put('topics', updated);
+      await WDDB.setTopicKind(existing.id, kind);
     } else {
       const id = await WDDB.nextId('topics');
       const t = { id, name, desc, msureid, optype: 1, type: 1, archived: false };
       await WDDB.put('topics', t);
-      // append new topic to end of saved order
       const order = (await WDDB.getMeta('topicOrder')) || [];
       order.push(id);
       await WDDB.setMeta('topicOrder', order);
+      await WDDB.setTopicKind(id, kind);
     }
     closeModal();
     await reload();
@@ -700,68 +775,76 @@ function openTopicEdit(existing) {
     queueAutoSync('saveTopic');
     renderCurrent();
   });
-  if (existing) {
-    $('#topicDelete').addEventListener('click', () => {
-      openConfirm(
-        `Delete topic "${existing.name}"?`,
-        `All ${state.events.filter((e)=>e.topicid===existing.id).length} of its events will also be deleted. This cannot be undone.`,
-        async () => {
-          const evs = state.events.filter((e) => e.topicid === existing.id);
-          for (const e of evs) await WDDB.delete('events', e.id);
-          await WDDB.delete('topics', existing.id);
-          await WDDB.setFavorite(existing.id, false);
-          // remove from saved order
-          const order = (await WDDB.getMeta('topicOrder')) || [];
-          await WDDB.setMeta('topicOrder', order.filter((x) => x !== existing.id));
-          closeModal();
-          await reload();
-          snack('Topic deleted');
-          queueAutoSync('deleteTopic');
-          renderCurrent();
-        }
-      );
-    });
-  }
 }
 
 function openTopicsManager() {
-  const html = state.topics.map((t) => {
-    const fav = state.favorites.has(t.id);
+  const buildRow = (t, i, total) => {
     const count = state.events.filter((e) => e.topicid === t.id).length;
+    const kind = topicKind(t);
     const m = state.measurements.find((mm) => mm.id === t.msureid);
+    const subline = kind === 'amount'
+      ? `${count.toLocaleString()} events · Amount (${m?.symbol || m?.name || '?'})`
+      : kind === 'duration'
+      ? `${count.toLocaleString()} events · Duration`
+      : `${count.toLocaleString()} events · Time only`;
     return `
       <div class="topic-row ${t.archived?'archived':''}" data-topic="${t.id}">
+        <div class="mgr-arrows">
+          <button class="arrow-btn" data-up="${t.id}" ${i===0?'disabled':''} aria-label="Move up">▲</button>
+          <button class="arrow-btn" data-down="${t.id}" ${i===total-1?'disabled':''} aria-label="Move down">▼</button>
+        </div>
         <div>
           <div class="t-name">${escapeHtml(t.name)}</div>
-          <div class="t-sub">${count.toLocaleString()} events · ${m?escapeHtml(m.name):'?'}</div>
+          <div class="t-sub">${subline}</div>
         </div>
-        <button class="star ${fav?'on':''}" data-fav="${t.id}">★</button>
         <button class="btn secondary" data-edit="${t.id}">Edit</button>
       </div>
     `;
-  }).join('');
+  };
+  const topics = state.topics;
+  const html = topics.map((t, i) => buildRow(t, i, topics.length)).join('');
   openModal(`
     <header>
       <button class="icon-btn" data-close>←</button>
       <div class="title">Manage Topics</div>
       <button class="icon-btn" id="newTopic" title="New topic">＋</button>
     </header>
-    <div class="body" style="padding:0;">${html || '<div class="empty">No topics yet.</div>'}</div>
+    <div class="body" style="padding:0;">
+      <div class="mgr-hint">▲▼ to reorder · Edit to rename or change type</div>
+      ${html || '<div class="empty">No topics yet.</div>'}
+    </div>
   `);
-  $('#newTopic').addEventListener('click', () => { closeModal(); openTopicEdit(null); });
-  $$('[data-edit]').forEach((b) => b.addEventListener('click', (e) => {
-    const id = Number(e.currentTarget.dataset.edit);
-    const t = state.topics.find((x) => x.id === id);
-    closeModal();
-    openTopicEdit(t);
-  }));
-  $$('[data-fav]').forEach((b) => b.addEventListener('click', async (e) => {
-    const id = Number(e.currentTarget.dataset.fav);
-    const on = !state.favorites.has(id);
-    await WDDB.setFavorite(id, on);
-    if (on) state.favorites.add(id); else state.favorites.delete(id);
-    e.currentTarget.classList.toggle('on', on);
-  }));
+  const wire = () => {
+    $('#newTopic').addEventListener('click', () => { closeModal(); openTopicEdit(null); });
+    $$('[data-edit]').forEach((b) => b.addEventListener('click', (e) => {
+      const id = Number(e.currentTarget.dataset.edit);
+      const t = state.topics.find((x) => x.id === id);
+      closeModal();
+      openTopicEdit(t);
+    }));
+    $$('[data-up]').forEach((b) => b.addEventListener('click', async (e) => {
+      const id = Number(e.currentTarget.dataset.up);
+      await moveTopic(id, -1);
+      openTopicsManager(); // re-render
+    }));
+    $$('[data-down]').forEach((b) => b.addEventListener('click', async (e) => {
+      const id = Number(e.currentTarget.dataset.down);
+      await moveTopic(id, +1);
+      openTopicsManager();
+    }));
+  };
+  wire();
+}
+
+async function moveTopic(id, delta) {
+  const order = state.topicOrder.slice();
+  const i = order.indexOf(id);
+  if (i < 0) return;
+  const j = i + delta;
+  if (j < 0 || j >= order.length) return;
+  [order[i], order[j]] = [order[j], order[i]];
+  await saveTopicOrder(order);
+  renderCurrent();
 }
 
 /* ======== IMPORT / EXPORT FLOW ======== */
@@ -943,16 +1026,17 @@ function openModal(html) {
   const root = $('#modalRoot');
   root.innerHTML = `<div class="scrim"><section class="dialog">${html}</section></div>`;
   root.querySelectorAll('[data-close]').forEach((el) => {
-    el.addEventListener('click', closeModal);
+    el.addEventListener('click', () => closeModal());
   });
-  // close on scrim click outside dialog
   root.querySelector('.scrim').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) closeModal();
   });
+  pushOverlayState('modal');
 }
 
-function closeModal() {
+function closeModal({ fromHistory = false } = {}) {
   $('#modalRoot').innerHTML = '';
+  if (!fromHistory) popOverlayState('modal');
 }
 
 function openConfirm(title, body, onYes, yesLabel = 'Yes') {
@@ -978,9 +1062,57 @@ function snack(msg) {
 
 function openDrawer() {
   $('#drawer').classList.add('open');
+  pushOverlayState('drawer');
 }
-function closeDrawer() {
+function closeDrawer({ fromHistory = false } = {}) {
   $('#drawer').classList.remove('open');
+  if (!fromHistory) popOverlayState('drawer');
+}
+
+/* ======== HISTORY-BACKED OVERLAY STACK ========
+ * Pushes a state entry when any overlay (modal, drawer) opens so the
+ * Android system back gesture closes the overlay instead of exiting
+ * the PWA. The stack mirrors what's actually open in the DOM so we
+ * don't pop too many history entries.
+ *
+ * _expectingPop tracks history.back() calls we initiated ourselves
+ * (e.g., closing a drawer then immediately opening a modal). When the
+ * resulting popstate arrives we decrement and ignore it, so we never
+ * mistakenly close the new overlay.
+ */
+const _overlayStack = [];
+let _expectingPop = 0;
+
+function pushOverlayState(kind) {
+  _overlayStack.push(kind);
+  try {
+    history.pushState({ wd_overlay: kind, n: _overlayStack.length }, '');
+  } catch (_) { /* private mode etc. */ }
+}
+
+function popOverlayState(kind) {
+  // Only pop history if the topmost entry matches this overlay.
+  const top = _overlayStack[_overlayStack.length - 1];
+  if (top !== kind) return;
+  _overlayStack.pop();
+  if (history.state?.wd_overlay) {
+    _expectingPop++;
+    try { history.back(); } catch (_) { _expectingPop--; }
+  }
+}
+
+function handlePopState() {
+  if (_expectingPop > 0) {
+    _expectingPop--;
+    return; // self-initiated, ignore
+  }
+  // User-initiated back gesture: close whatever overlay is on top.
+  const top = _overlayStack.pop();
+  if (top === 'modal') {
+    closeModal({ fromHistory: true });
+  } else if (top === 'drawer') {
+    closeDrawer({ fromHistory: true });
+  }
 }
 
 function escapeHtml(s) {
@@ -1069,7 +1201,7 @@ async function init() {
 
   // Drawer
   $('#drawer').querySelectorAll('[data-close]').forEach((el) =>
-    el.addEventListener('click', closeDrawer));
+    el.addEventListener('click', () => closeDrawer()));
   $('#navImport').addEventListener('click', () => { closeDrawer(); triggerImport(); });
   $('#navExport').addEventListener('click', () => { closeDrawer(); doExport(); });
   $('#navBackup').addEventListener('click', () => { closeDrawer(); doSafetyBackup(); });
@@ -1078,6 +1210,9 @@ async function init() {
   $('#navAbout').addEventListener('click', () => { closeDrawer(); openAbout(); });
   $('#navStorage').addEventListener('click', () => { closeDrawer(); openStorageStatus(); });
   $('#navWipe').addEventListener('click', () => { closeDrawer(); openWipe(); });
+
+  // Back-gesture handler: close overlays instead of exiting the PWA
+  window.addEventListener('popstate', handlePopState);
 
   // Listen for service worker update prompts
   if ('serviceWorker' in navigator) {

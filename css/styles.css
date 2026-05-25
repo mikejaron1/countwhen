@@ -458,7 +458,7 @@ body {
 /* ===== Topic manager / list ===== */
 .topic-row {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 8px;
   padding: 12px 14px;
@@ -493,6 +493,11 @@ body {
   touch-action: pan-y;
   transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
+body.drag-active {
+  touch-action: none;
+  overflow: hidden;
+}
+body.drag-active .card { touch-action: none; }
 .card.dragging {
   background: #fff8e0;
   border-color: var(--brown-light);
@@ -507,7 +512,63 @@ body {
   color: var(--ink-soft);
   font-size: 12px;
   text-align: center;
-  padding: 6px 14px 0;
+  padding: 8px 14px 0;
+  line-height: 1.4;
+}
+
+/* ===== Topic-edit "kind" picker ===== */
+.kind-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.kind-opt {
+  display: block;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.35;
+}
+.kind-opt input { margin-right: 6px; vertical-align: middle; }
+.kind-opt span { color: var(--ink-soft); font-size: 12px; }
+.kind-opt:has(input:checked) {
+  background: #f4ede0;
+  border-color: var(--brown);
+}
+
+/* ===== Topics Manager rows ===== */
+.mgr-hint {
+  background: var(--tan-bg);
+  color: var(--brown-dark);
+  font-size: 12px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--rule);
+}
+.topic-row .mgr-arrows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-right: 4px;
+}
+.arrow-btn {
+  background: transparent;
+  border: 1px solid var(--brown-light);
+  color: var(--brown);
+  font-size: 14px;
+  line-height: 1;
+  width: 32px;
+  height: 22px;
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0;
+}
+.arrow-btn:active { background: var(--tan-bg); }
+.arrow-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
 }
 
 /* ===== "+ New topic" tile ===== */
