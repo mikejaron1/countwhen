@@ -16,7 +16,7 @@ window.WD_CONFIG = {
   //   "123456789012-abc...xyz.apps.googleusercontent.com"
   // Leave empty ("") to disable Drive sync entirely; the app still
   // works fully offline with manual Export / Import JSON.
-  driveClientId: '',
+  driveClientId: '377102902188-joh759ie7vtmfd6uo2n4prucbgo1fde7.apps.googleusercontent.com',
 
   // If true, Drive sync only runs when the device is on Wi-Fi or
   // Ethernet (never on cellular). Recommended.
