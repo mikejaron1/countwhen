@@ -254,7 +254,7 @@ function renderCategories() {
   }).join('');
 
   main.innerHTML = `
-    <div class="reorder-hint">Tap a topic to rename/edit it. Tap ADD to log an event. Long-press a card to drag-reorder (or use ☰ → Manage Topics for arrow reordering).</div>
+    <div class="reorder-hint">Tap ADD to log an event. Long-press a card to drag-reorder. Rename / change type / delete in ☰ → Manage Topics.</div>
     <div id="categoriesList">${html}</div>
     <button class="new-topic-tile" id="addTopicBtn">+ New topic</button>
   `;
@@ -268,21 +268,11 @@ function renderCategories() {
     });
   });
 
-  // Tap card (anywhere except ADD button) to open edit modal for the
-  // topic (lets the user rename/archive/delete without going through
-  // the menu). Long-press starts drag.
+  // Cards are no longer tap-to-edit. Editing happens exclusively from
+  // Topics Manager (☰ → Manage Topics). Only the ADD button on each
+  // card is interactive. Long-press still starts drag-to-reorder.
   attachReorder($('#categoriesList'), (newOrderIds) => {
     saveTopicOrder(newOrderIds);
-  });
-
-  $$('#categoriesList .card').forEach((card) => {
-    card.addEventListener('click', (e) => {
-      if (e.target.closest('button')) return;
-      if (card.dataset.justDragged) { delete card.dataset.justDragged; return; }
-      const id = Number(card.dataset.topic);
-      const t = state.topics.find((x) => x.id === id);
-      if (t) openTopicEdit(t);
-    });
   });
 
   $('#addTopicBtn').addEventListener('click', () => openTopicEdit(null));
