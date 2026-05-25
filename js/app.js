@@ -718,6 +718,9 @@ function openTopicEdit(existing) {
             <input type="checkbox" id="topicArchived" ${existing.archived?'checked':''}> Archived (hides from Categories without deleting events)
           </label>
         </div>
+        <hr style="border:0;border-top:1px solid var(--rule);margin:24px 0 16px;">
+        <p style="font-size:12px;color:var(--ink-soft);margin:0 0 8px;">Danger zone</p>
+        <button class="btn danger" id="topicDelete" style="width:100%;">Delete topic and all its events</button>
       ` : ''}
     </div>
   `);
@@ -736,19 +739,12 @@ function openTopicEdit(existing) {
     const desc = $('#topicDesc').value.trim();
     const kindEl = document.querySelector('input[name="kind"]:checked');
     const kind = kindEl ? kindEl.value : 'timeonly';
-    // Map kind to msureid:
-    //   timeonly → keep existing msureid OR use Duration(10); qant defaults to 60
-    //   duration → Duration(10) [preserve existing duration measurement if it's 11/12]
-    //   amount   → user picks the unit
     let msureid;
     if (kind === 'amount') {
       msureid = Number($('#topicUnit').value);
     } else if (kind === 'duration') {
       msureid = (existing && [10,11,12].includes(existing.msureid)) ? existing.msureid : 10;
     } else {
-      // timeonly: use Duration measurement (matches original "poop start"
-      // pattern with qant=60). This keeps round-trip behavior identical
-      // to imported time-only topics.
       msureid = (existing && [10,11,12].includes(existing.msureid)) ? existing.msureid : 10;
     }
 
@@ -775,6 +771,34 @@ function openTopicEdit(existing) {
     queueAutoSync('saveTopic');
     renderCurrent();
   });
+
+  if (existing) {
+    $('#topicDelete').addEventListener('click', () => {
+      const evCount = state.events.filter((e) => e.topicid === existing.id).length;
+      openConfirm(
+        `Delete "${existing.name}"?`,
+        `This will permanently delete the topic AND all ${evCount.toLocaleString()} of its event${evCount === 1 ? '' : 's'}. This cannot be undone. Consider Archive instead if you just want to hide it.`,
+        async () => {
+          // Delete events for this topic
+          const evs = state.events.filter((e) => e.topicid === existing.id);
+          for (const e of evs) await WDDB.delete('events', e.id);
+          // Delete topic + clean up associated metadata
+          await WDDB.delete('topics', existing.id);
+          await WDDB.setTopicKind(existing.id, null);
+          await WDDB.setFavorite(existing.id, false);
+          // Remove from saved topic order
+          const order = (await WDDB.getMeta('topicOrder')) || [];
+          await WDDB.setMeta('topicOrder', order.filter((x) => x !== existing.id));
+          closeModal();
+          await reload();
+          snack(`Deleted "${existing.name}" and ${evCount.toLocaleString()} event${evCount === 1 ? '' : 's'}`);
+          queueAutoSync('deleteTopic');
+          renderCurrent();
+        },
+        'Delete forever'
+      );
+    });
+  }
 }
 
 function openTopicsManager() {
