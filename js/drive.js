@@ -13,6 +13,7 @@
 const DRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
 const DRIVE_FOLDER_NAME = 'WhenDidI';
 const DRIVE_FILE_NAME = 'whendidibk.json';
+const DRIVE_MAX_VERSIONS = 5; // rotated snapshots
 
 const CFG = () => window.WD_CONFIG || {};
 
@@ -165,51 +166,105 @@ async function findOrCreateFolder() {
   return (await createResp.json()).id;
 }
 
-async function findSyncFile(folderId) {
+async function findFileInFolder(folderId, name) {
   const q = encodeURIComponent(
-    `name='${DRIVE_FILE_NAME}' and '${folderId}' in parents and trashed=false`
+    `name='${name}' and '${folderId}' in parents and trashed=false`
   );
   const resp = await driveFetch(`/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&spaces=drive`);
   const data = await resp.json();
   return (data.files && data.files[0]) || null;
 }
 
-async function uploadSyncFile() {
-  const folderId = await findOrCreateFolder();
-  const existing = await findSyncFile(folderId);
-  const obj = await WDIO.buildExportObject();
-  const json = JSON.stringify(obj);
-  const blob = new Blob([json], { type: 'application/json' });
+async function findSyncFile(folderId) {
+  return findFileInFolder(folderId, DRIVE_FILE_NAME);
+}
 
-  if (existing) {
-    await driveFetch(`/upload/drive/v3/files/${existing.id}?uploadType=media`, {
+async function copyDriveFile(srcId, newName, parents) {
+  const resp = await driveFetch(`/drive/v3/files/${srcId}/copy?fields=id`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: newName, parents }),
+  });
+  return (await resp.json()).id;
+}
+
+async function deleteDriveFile(id) {
+  await driveFetch(`/drive/v3/files/${id}`, { method: 'DELETE' });
+}
+
+/* Rotate any existing whendidibk.json to whendidibk-1.json, shifting
+ * older versions down. Keep at most DRIVE_MAX_VERSIONS. Best-effort:
+ * any error here is non-fatal — it shouldn't block the upload.
+ */
+async function rotateVersions(folderId) {
+  try {
+    const cur = await findFileInFolder(folderId, DRIVE_FILE_NAME);
+    if (!cur) return;
+    // Find existing version files
+    const existing = [];
+    for (let i = 1; i <= DRIVE_MAX_VERSIONS + 2; i++) {
+      const f = await findFileInFolder(folderId, `whendidibk-${i}.json`);
+      if (f) existing.push({ idx: i, file: f });
+    }
+    // Sort by index asc; delete anything that would push past max
+    existing.sort((a, b) => a.idx - b.idx);
+    // After rotation: the highest desired index is (DRIVE_MAX_VERSIONS).
+    // We will rename existing N → N+1 starting from highest. Anything
+    // above DRIVE_MAX_VERSIONS gets deleted.
+    for (let i = existing.length - 1; i >= 0; i--) {
+      const slot = existing[i];
+      const newIdx = slot.idx + 1;
+      if (newIdx > DRIVE_MAX_VERSIONS) {
+        await deleteDriveFile(slot.file.id);
+      } else {
+        await driveFetch(`/drive/v3/files/${slot.file.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: `whendidibk-${newIdx}.json` }),
+        });
+      }
+    }
+    // Now rename current to -1
+    await driveFetch(`/drive/v3/files/${cur.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: blob,
+      body: JSON.stringify({ name: 'whendidibk-1.json' }),
     });
-    return existing.id;
-  } else {
-    const boundary = '-------whendidi-boundary-' + Math.random().toString(36).slice(2);
-    const metadata = {
-      name: DRIVE_FILE_NAME,
-      parents: [folderId],
-      mimeType: 'application/json',
-    };
-    const body =
-      `--${boundary}\r\n` +
-      `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
-      JSON.stringify(metadata) + `\r\n` +
-      `--${boundary}\r\n` +
-      `Content-Type: application/json\r\n\r\n` +
-      json + `\r\n` +
-      `--${boundary}--`;
-    const resp = await driveFetch(`/upload/drive/v3/files?uploadType=multipart&fields=id`, {
-      method: 'POST',
-      headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
-      body,
-    });
-    return (await resp.json()).id;
+  } catch (e) {
+    // Versioning is a nice-to-have; log and continue with the upload
+    console.warn('drive version rotation failed:', e?.message || e);
   }
+}
+
+async function uploadSyncFile() {
+  const folderId = await findOrCreateFolder();
+  // Rotate previous versions first (best-effort)
+  await rotateVersions(folderId);
+  // After rotation there is no current whendidibk.json — create a new
+  // one with the current data.
+  const obj = await WDIO.buildExportObject();
+  const json = JSON.stringify(obj);
+
+  const boundary = '-------whendidi-boundary-' + Math.random().toString(36).slice(2);
+  const metadata = {
+    name: DRIVE_FILE_NAME,
+    parents: [folderId],
+    mimeType: 'application/json',
+  };
+  const body =
+    `--${boundary}\r\n` +
+    `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+    JSON.stringify(metadata) + `\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Type: application/json\r\n\r\n` +
+    json + `\r\n` +
+    `--${boundary}--`;
+  const resp = await driveFetch(`/upload/drive/v3/files?uploadType=multipart&fields=id`, {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+    body,
+  });
+  return (await resp.json()).id;
 }
 
 async function downloadSyncFile() {

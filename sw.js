@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'whendidi-v3.2-2026-05-24';
+const CACHE_VERSION = 'whendidi-v4-2026-05-25';
 
 const SHELL = [
   './',

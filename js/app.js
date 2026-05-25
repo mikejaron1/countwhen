@@ -1,17 +1,25 @@
 /* WhenDidI PWA - UI controller. Vanilla JS, single-page, 3 views. */
 
-const VIEWS = ['categories', 'recent', 'stats'];
+const VIEWS = ['categories', 'recent', 'day', 'stats'];
 const state = {
   view: 'categories',
   topics: [],
   events: [],
   measurements: [],
   favorites: new Set(),
-  topicOrder: [], // ordered topic IDs, used by Categories view
+  topicOrder: [],
   topicKinds: {}, // topicId -> 'timeonly' | 'duration' | 'amount'
+  topicMeta: {},  // topicId -> { emoji, color }
   statsTopicId: null,
   statsPeriod: 'daily',
   chart: null,
+  // Per-view UI state
+  recentFilter: { topic: '', from: '', to: '', q: '', tag: '' },
+  dayDate: null,            // ms epoch (start of day)
+  detailTopicId: null,      // currently-open detail view (in Stats)
+  charts: {},               // multiple chart instances on Stats page
+  // Undo queue
+  lastUndo: null,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -139,15 +147,14 @@ function topicKind(topic) {
 /* ======== DATA LOADING ======== */
 
 async function reload() {
-  const [topics, events, measurements, favIds, topicKinds] = await Promise.all([
+  const [topics, events, measurements, favIds, topicKinds, topicMeta] = await Promise.all([
     WDDB.getAll('topics'),
     WDDB.getAll('events'),
     WDDB.getAll('measurements'),
     WDDB.getFavoriteTopicIds(),
     WDDB.getAllTopicKinds(),
+    WDDB.getAllTopicMeta(),
   ]);
-  // Apply saved topic order: known IDs first (in saved order), then any
-  // new topics appended alphabetically.
   const savedOrder = (await WDDB.getMeta('topicOrder')) || [];
   const knownIds = new Set(topics.map((t) => t.id));
   const orderedKnown = savedOrder.filter((id) => knownIds.has(id));
@@ -170,6 +177,7 @@ async function reload() {
   state.measurements = measurements;
   state.favorites = new Set(favIds);
   state.topicKinds = topicKinds || {};
+  state.topicMeta = topicMeta || {};
   if (state.statsTopicId == null && state.topics.length) {
     state.statsTopicId = state.topics[0].id;
   }
@@ -215,6 +223,21 @@ function bindWelcomeBanner() {
 
 /* ======== VIEW: CATEGORIES ======== */
 
+function frequentTopicsLast30Days() {
+  const cutoff = Date.now() - 30 * 86400000;
+  const counts = new Map();
+  for (const e of state.events) {
+    if (e.time < cutoff) continue;
+    counts.set(e.topicid, (counts.get(e.topicid) || 0) + 1);
+  }
+  const ranked = Array.from(counts.entries())
+    .map(([id, c]) => ({ id, c, topic: state.topics.find((t) => t.id === id) }))
+    .filter((r) => r.topic && !r.topic.archived)
+    .sort((a, b) => b.c - a.c)
+    .slice(0, 5);
+  return ranked;
+}
+
 function renderCategories() {
   const main = $('#main');
   const topics = state.topics.filter((t) => !t.archived);
@@ -230,19 +253,34 @@ function renderCategories() {
     return;
   }
 
+  const frequent = frequentTopicsLast30Days();
+  const quickBar = frequent.length ? `
+    <div class="quick-bar">
+      ${frequent.map((f) => {
+        const emoji = topicEmoji(f.topic);
+        const color = topicColor(f.topic);
+        return `<button class="quick-chip" data-quick="${f.id}" style="--accent:${color}">
+          ${emoji ? `<span class="qc-emoji">${escapeHtml(emoji)}</span>` : ''}
+          <span class="qc-name">+ ${escapeHtml(f.topic.name)}</span>
+        </button>`;
+      }).join('')}
+    </div>` : '';
+
   const html = topics.map((t) => {
     const last = lastEventForTopic(t.id);
     const rel = last ? relativeFromNow(last.time) : null;
+    const emoji = topicEmoji(t);
+    const color = topicColor(t);
     const lastLine = last
       ? `${fmtDateShort(last.time)} <strong>${escapeHtml(fmtQant(last.qant, t))}</strong>`
       : '<em>no entries yet</em>';
     return `
-      <div class="card" data-topic="${t.id}">
+      <div class="card" data-topic="${t.id}" style="--accent:${color}">
         <div class="delta">
           ${rel ? `<div class="big">${rel.big}</div><div class="small">${rel.small}</div>` : `<div class="small">—</div>`}
         </div>
         <div>
-          <div class="name">${escapeHtml(t.name)}</div>
+          <div class="name">${emoji ? `<span class="card-emoji">${escapeHtml(emoji)}</span>` : ''}${escapeHtml(t.name)}</div>
           ${t.desc ? `<div class="desc">${escapeHtml(t.desc)}</div>` : ''}
           <div class="last">${lastLine}</div>
         </div>
@@ -254,10 +292,20 @@ function renderCategories() {
   }).join('');
 
   main.innerHTML = `
-    <div class="reorder-hint">Tap ADD to log an event. Long-press a card to drag-reorder. Rename / change type / delete in ☰ → Manage Topics.</div>
+    ${quickBar}
+    <div class="reorder-hint">Tap ADD to log. Long-press a card to drag-reorder. Rename / change type / delete in ☰ → Manage Topics.</div>
     <div id="categoriesList">${html}</div>
     <button class="new-topic-tile" id="addTopicBtn">+ New topic</button>
   `;
+
+  // Quick-bar one-tap log
+  $$('[data-quick]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const id = Number(e.currentTarget.dataset.quick);
+      const topic = state.topics.find((t) => t.id === id);
+      if (topic) logNow(topic);
+    });
+  });
 
   $$('[data-add]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
@@ -268,9 +316,6 @@ function renderCategories() {
     });
   });
 
-  // Cards are no longer tap-to-edit. Editing happens exclusively from
-  // Topics Manager (☰ → Manage Topics). Only the ADD button on each
-  // card is interactive. Long-press still starts drag-to-reorder.
   attachReorder($('#categoriesList'), (newOrderIds) => {
     saveTopicOrder(newOrderIds);
   });
@@ -376,40 +421,87 @@ function renderRecent() {
     bindWelcomeBanner();
     return;
   }
-  const sorted = state.events.slice().sort((a, b) => b.time - a.time);
-
-  // simple "load more" pagination to keep DOM size sane for 17k events
-  const PAGE = 200;
-  let shown = Math.min(PAGE, sorted.length);
-
+  const f = state.recentFilter;
   const topicById = new Map(state.topics.map((t) => [t.id, t]));
+  // Filter
+  let filtered = state.events;
+  if (f.topic) filtered = filtered.filter((e) => e.topicid === Number(f.topic));
+  if (f.from) {
+    const fromMs = new Date(f.from + 'T00:00:00').getTime();
+    filtered = filtered.filter((e) => e.time >= fromMs);
+  }
+  if (f.to) {
+    const toMs = new Date(f.to + 'T23:59:59.999').getTime();
+    filtered = filtered.filter((e) => e.time <= toMs);
+  }
+  if (f.q) {
+    const q = f.q.toLowerCase();
+    filtered = filtered.filter((e) => {
+      const topic = topicById.get(e.topicid);
+      const tname = topic ? topic.name.toLowerCase() : '';
+      const note = (e.note || '').toLowerCase();
+      return note.includes(q) || tname.includes(q);
+    });
+  }
+  if (f.tag) {
+    const tag = f.tag.toLowerCase();
+    filtered = filtered.filter((e) => WDSTATS.tagSet(e.note || '').has(tag));
+  }
+  const sorted = filtered.slice().sort((a, b) => b.time - a.time);
 
+  // Build the filter bar
+  const topicOpts = `<option value="">All topics</option>` +
+    state.topics.map((t) => `<option value="${t.id}" ${String(t.id)===f.topic?'selected':''}>${escapeHtml(t.name)}</option>`).join('');
+  const tags = WDSTATS.allTagsFromEvents(state.events).slice(0, 12);
+  const tagBar = tags.length ? `
+    <div class="recent-tag-row">
+      <button class="tag-filter-chip ${!f.tag?'active':''}" data-tag-filter="">all</button>
+      ${tags.map((t) => `<button class="tag-filter-chip ${f.tag===t.tag?'active':''}" data-tag-filter="${escapeHtml(t.tag)}">#${escapeHtml(t.tag)} <small>(${t.count})</small></button>`).join('')}
+    </div>` : '';
+
+  let shown = Math.min(200, sorted.length);
   const renderList = () => {
     const rows = sorted.slice(0, shown).map((e) => {
       const t = topicById.get(e.topicid);
       const name = t ? t.name : `(topic ${e.topicid})`;
       const qant = t ? fmtQant(e.qant, t) : e.qant;
+      const emoji = t ? topicEmoji(t) : '';
       return `
         <div class="recent-row" data-event="${e.id}">
           <div>
-            <div class="r-name">${escapeHtml(name)}</div>
+            <div class="r-name">${emoji ? `<span class="card-emoji">${escapeHtml(emoji)}</span>` : ''}${escapeHtml(name)} ${severityBadge(e)}</div>
             <div class="r-when">${fmtDateLong(e.time)} <small>${fmtTime(e.time)}</small></div>
-            ${e.note ? `<div class="r-note">${escapeHtml(e.note)}</div>` : ''}
+            ${e.note ? `<div class="r-note">${renderNoteWithTags(e.note)}</div>` : ''}
           </div>
           <div class="r-qant">${escapeHtml(qant)}</div>
         </div>
       `;
     }).join('');
     const more = (shown < sorted.length)
-      ? `<div style="text-align:center;padding:14px;"><button class="btn secondary" id="loadMore">Load ${Math.min(PAGE, sorted.length - shown)} more (${sorted.length - shown} remaining)</button></div>`
-      : `<div class="empty">— end of ${sorted.length} events —</div>`;
+      ? `<div style="text-align:center;padding:14px;"><button class="btn secondary" id="loadMore">Load ${Math.min(200, sorted.length - shown)} more (${sorted.length - shown} remaining)</button></div>`
+      : (sorted.length ? `<div class="empty">— end of ${sorted.length.toLocaleString()} matching events —</div>` : `<div class="empty">No events match the filters.</div>`);
     main.innerHTML = `
-      <div class="sticky-header">${sorted.length.toLocaleString()} events · showing ${shown.toLocaleString()}</div>
+      <div class="recent-filter">
+        <div class="row-2">
+          <div class="field"><label>Topic</label><select id="rfTopic">${topicOpts}</select></div>
+          <div class="field"><label>Search</label><input id="rfQuery" type="text" placeholder="text in note or topic" value="${escapeHtml(f.q)}"></div>
+        </div>
+        <div class="row-2">
+          <div class="field"><label>From</label><input id="rfFrom" type="date" value="${escapeHtml(f.from)}"></div>
+          <div class="field"><label>To</label><input id="rfTo" type="date" value="${escapeHtml(f.to)}"></div>
+        </div>
+        ${tagBar}
+        <div class="recent-filter-actions">
+          <button class="btn secondary" id="rfClear">Clear</button>
+          <button class="btn" id="rfApply">Apply</button>
+        </div>
+      </div>
+      <div class="sticky-header">${sorted.length.toLocaleString()} matching · showing ${Math.min(shown, sorted.length).toLocaleString()}</div>
       ${rows}
       ${more}
     `;
     $('#loadMore')?.addEventListener('click', () => {
-      shown = Math.min(shown + PAGE, sorted.length);
+      shown = Math.min(shown + 200, sorted.length);
       renderList();
     });
     $$('.recent-row').forEach((row) => {
@@ -420,13 +512,156 @@ function renderRecent() {
         if (t && e) openAddEvent(t, e);
       });
     });
+    $('#rfApply')?.addEventListener('click', () => {
+      state.recentFilter = {
+        topic: $('#rfTopic').value,
+        q: $('#rfQuery').value.trim(),
+        from: $('#rfFrom').value,
+        to: $('#rfTo').value,
+        tag: state.recentFilter.tag,
+      };
+      renderRecent();
+    });
+    $('#rfClear')?.addEventListener('click', () => {
+      state.recentFilter = { topic: '', q: '', from: '', to: '', tag: '' };
+      renderRecent();
+    });
+    $$('[data-tag-filter]').forEach((b) => b.addEventListener('click', () => {
+      state.recentFilter = { ...state.recentFilter, tag: b.dataset.tagFilter };
+      renderRecent();
+    }));
   };
   renderList();
 }
 
-/* ======== VIEW: STATISTICS ======== */
+/* ======== VIEW: DAY ======== */
+
+function renderDay() {
+  const main = $('#main');
+  if (!state.events.length) {
+    main.innerHTML = `${welcomeBannerHtml()}<div class="empty">No events yet — log something to start.</div>`;
+    bindWelcomeBanner();
+    return;
+  }
+  if (!state.dayDate) state.dayDate = WDSTATS.startOfDay(Date.now());
+  const day = state.dayDate;
+  const nextDay = day + 86400000;
+  const events = state.events
+    .filter((e) => e.time >= day && e.time < nextDay)
+    .sort((a, b) => a.time - b.time);
+
+  const topicById = new Map(state.topics.map((t) => [t.id, t]));
+
+  // Per-topic summary
+  const groupMap = new Map();
+  for (const e of events) {
+    if (!groupMap.has(e.topicid)) groupMap.set(e.topicid, []);
+    groupMap.get(e.topicid).push(e);
+  }
+  const groups = Array.from(groupMap.entries())
+    .map(([tid, evs]) => ({ topic: topicById.get(tid), evs }))
+    .filter((g) => g.topic)
+    .sort((a, b) => b.evs.length - a.evs.length);
+
+  const dateStr = fmtDateLong(day);
+  const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(day).getDay()];
+  const isToday = day === WDSTATS.startOfDay(Date.now());
+  const todayLabel = isToday ? 'Today' : (day === WDSTATS.startOfDay(Date.now() - 86400000) ? 'Yesterday' : '');
+
+  // Chronological list
+  const chronoHtml = events.map((e) => {
+    const t = topicById.get(e.topicid);
+    const name = t ? t.name : `(${e.topicid})`;
+    const emoji = t ? topicEmoji(t) : '';
+    const q = t ? fmtQant(e.qant, t) : e.qant;
+    return `
+      <div class="day-event" data-event="${e.id}">
+        <div class="day-time">${fmtTime(e.time)}</div>
+        <div class="day-info">
+          <div class="day-name">${emoji ? `<span class="card-emoji">${escapeHtml(emoji)}</span>` : ''}${escapeHtml(name)} ${severityBadge(e)}</div>
+          ${e.note ? `<div class="day-note">${renderNoteWithTags(e.note)}</div>` : ''}
+        </div>
+        <div class="day-qant">${escapeHtml(q)}</div>
+      </div>`;
+  }).join('') || '<div class="empty">No events on this day.</div>';
+
+  // Per-topic summary cards
+  const summaryHtml = groups.map((g) => {
+    const t = g.topic;
+    const emoji = topicEmoji(t);
+    const color = topicColor(t);
+    const kind = topicKind(t);
+    let qantSummary = '';
+    if (kind === 'amount' || kind === 'duration') {
+      const sum = g.evs.reduce((s, e) => s + Number(e.qant || 0), 0);
+      qantSummary = ` · sum ${escapeHtml(fmtQant(sum, t))}`;
+    }
+    const times = g.evs.map((e) => fmtTime(e.time)).join(', ');
+    return `
+      <div class="day-summary-row" style="--accent:${color}">
+        <div class="dsr-head">
+          <span class="dsr-name">${emoji ? `<span class="card-emoji">${escapeHtml(emoji)}</span>` : ''}${escapeHtml(t.name)}</span>
+          <span class="dsr-count">${g.evs.length}×${qantSummary}</span>
+        </div>
+        <div class="dsr-times">${escapeHtml(times)}</div>
+      </div>`;
+  }).join('');
+
+  main.innerHTML = `
+    <div class="day-nav">
+      <button class="icon-btn day-prev" id="dayPrev" aria-label="Previous day">‹</button>
+      <div class="day-title">
+        <div class="dt-main">${dow}, ${dateStr}</div>
+        ${todayLabel ? `<div class="dt-sub">${todayLabel}</div>` : ''}
+      </div>
+      <button class="icon-btn day-next" id="dayNext" aria-label="Next day" ${isToday ? 'disabled' : ''}>›</button>
+      <input type="date" id="dayPick" value="${fmtDateInput(day)}">
+    </div>
+    <div class="day-stats-strip">
+      <div><b>${events.length}</b><span>events</span></div>
+      <div><b>${groups.length}</b><span>topics</span></div>
+      <div><b>${events.filter((e) => Number(e.cost||0) >= 3).length}</b><span>severity 3+</span></div>
+    </div>
+    ${groups.length ? `<div class="day-section-h">Per topic</div>${summaryHtml}` : ''}
+    <div class="day-section-h">Timeline</div>
+    ${chronoHtml}
+  `;
+
+  $('#dayPrev').addEventListener('click', () => {
+    state.dayDate = state.dayDate - 86400000;
+    renderDay();
+  });
+  $('#dayNext').addEventListener('click', () => {
+    state.dayDate = Math.min(state.dayDate + 86400000, WDSTATS.startOfDay(Date.now()));
+    renderDay();
+  });
+  $('#dayPick').addEventListener('change', (e) => {
+    const v = e.target.value;
+    if (v) {
+      const [y, mo, d] = v.split('-').map(Number);
+      state.dayDate = new Date(y, mo - 1, d).getTime();
+      renderDay();
+    }
+  });
+  $$('.day-event').forEach((row) => row.addEventListener('click', () => {
+    const id = Number(row.dataset.event);
+    const ev = state.events.find((x) => x.id === id);
+    const t = topicById.get(ev?.topicid);
+    if (ev && t) openAddEvent(t, ev);
+  }));
+}
+
+/* ======== VIEW: STATISTICS (per-topic detail) ======== */
+
+function destroyCharts() {
+  for (const c of Object.values(state.charts)) {
+    try { c?.destroy(); } catch (_) {}
+  }
+  state.charts = {};
+}
 
 function renderStats() {
+  destroyCharts();
   const main = $('#main');
   if (!state.topics.length) {
     main.innerHTML = `${welcomeBannerHtml()}<div class="empty">Import data or add a topic to see statistics.</div>`;
@@ -439,13 +674,39 @@ function renderStats() {
   }
   const topic = topics.find((t) => t.id === state.statsTopicId);
   const events = state.events.filter((e) => e.topicid === topic.id);
-  const rows = WDSTATS.aggregate(events, state.statsPeriod);
   const measurement = state.measurements.find((m) => m.id === topic?.msureid);
-  const showSum = measurement && measurement.type !== 0
-    ? true
-    : (measurement?.type === 0 && events.some((e) => Number(e.qant || 0) !== 0));
-
+  const kind = topicKind(topic);
+  const isMeasurable = kind === 'amount' || kind === 'duration';
   const totalQant = events.reduce((s, e) => s + Number(e.qant || 0), 0);
+  const totalQantStr = isMeasurable ? fmtQant(totalQant, topic) : '';
+
+  // Build the top selector + period tabs
+  const topOpts = topics.map((t) => `<option value="${t.id}" ${t.id===topic.id?'selected':''}>${escapeHtml(t.name)}</option>`).join('');
+
+  // Interval stats
+  const iv = WDSTATS.intervalStats(events);
+  const intervalSummary = iv ? `
+    <div class="stats-cards">
+      <div><b>${events.length.toLocaleString()}</b><span>events</span></div>
+      <div><b>${WDSTATS.fmtIntervalShort(iv.avg)}</b><span>avg interval</span></div>
+      <div><b>${WDSTATS.fmtIntervalShort(iv.median)}</b><span>median</span></div>
+      <div><b>${WDSTATS.fmtIntervalShort(iv.min)}</b><span>min</span></div>
+      <div><b>${WDSTATS.fmtIntervalShort(iv.max)}</b><span>max</span></div>
+      <div><b>${WDSTATS.fmtIntervalShort(iv.last)}</b><span>since last</span></div>
+      ${isMeasurable ? `<div><b>${escapeHtml(totalQantStr)}</b><span>total</span></div>` : ''}
+    </div>` : `<div class="stats-cards"><div><b>${events.length}</b><span>events</span></div></div>`;
+
+  // Cross-topic correlations
+  const correlations = WDSTATS.correlations(state.events, topic.id, 24 * 3600 * 1000);
+  const corrRows = correlations.slice(0, 8).map((c) => {
+    const other = state.topics.find((t) => t.id === c.otherTopicId);
+    if (!other) return '';
+    const dir = c.avgOffsetMs < 0 ? 'before' : 'after';
+    return `<div class="corr-row">
+      <div><strong>${escapeHtml(other.name)}</strong></div>
+      <div><span class="muted">avg</span> ${WDSTATS.fmtIntervalShort(Math.abs(c.avgOffsetMs))} <span class="muted">${dir}</span> (n=${c.sampleCount})</div>
+    </div>`;
+  }).join('');
 
   main.innerHTML = `
     <div class="period-tabs" id="periodTabs" role="tablist">
@@ -454,25 +715,36 @@ function renderStats() {
       <button class="tab" data-period="monthly" aria-selected="${state.statsPeriod==='monthly'}">Monthly</button>
     </div>
     <div class="stats-bar">
-      <select id="statsTopic">
-        ${topics.map((t) => `<option value="${t.id}" ${t.id===topic.id?'selected':''}>${escapeHtml(t.name)}</option>`).join('')}
-      </select>
-      <div class="total"><b>${events.length.toLocaleString()}</b>events</div>
+      <select id="statsTopic">${topOpts}</select>
     </div>
-    <div class="chart-wrap"><canvas id="statsChart"></canvas></div>
-    ${rows.map((r) => {
-      const fakeEv = { qant: r.sumQant };
-      const sumStr = fmtQant(r.sumQant, topic);
-      return `
-        <div class="stats-row">
-          <div>
-            <div class="sr-label">${WDSTATS.labelFor(state.statsPeriod, r.bucket)}</div>
-            <div class="sr-sub">${r.count} event${r.count===1?'':'s'}${showSum ? ` · sum ${escapeHtml(sumStr)}` : ''}</div>
-          </div>
-          <div class="sr-val">${r.count}</div>
-        </div>
-      `;
-    }).join('') || '<div class="empty">No events for this topic.</div>'}
+    ${intervalSummary}
+
+    <div class="stats-section">
+      <h3>Count over time</h3>
+      <div class="chart-wrap"><canvas id="chartOverTime"></canvas></div>
+    </div>
+
+    <div class="stats-section">
+      <h3>Calendar (last 26 weeks)</h3>
+      <div id="heatmap" class="heatmap"></div>
+    </div>
+
+    <div class="stats-section">
+      <h3>Time of day</h3>
+      <div class="chart-wrap"><canvas id="chartTOD"></canvas></div>
+    </div>
+
+    <div class="stats-section">
+      <h3>Day of week</h3>
+      <div class="chart-wrap"><canvas id="chartDOW"></canvas></div>
+    </div>
+
+    ${corrRows ? `
+      <div class="stats-section">
+        <h3>Correlated topics (within 24h)</h3>
+        <p class="muted-small">For each event of <em>${escapeHtml(topic.name)}</em>, the nearest event of another topic within 24 hours.</p>
+        ${corrRows}
+      </div>` : ''}
   `;
 
   $$('#periodTabs .tab').forEach((tb) => {
@@ -486,28 +758,24 @@ function renderStats() {
     renderStats();
   });
 
-  drawChart(rows, topic);
+  // Render charts
+  drawOverTime(events, topic);
+  drawTimeOfDay(events);
+  drawDayOfWeek(events);
+  drawHeatmap(events);
 }
 
-function drawChart(rows, topic) {
-  const canvas = $('#statsChart');
+function drawOverTime(events, topic) {
+  const canvas = $('#chartOverTime');
   if (!canvas) return;
+  const rows = WDSTATS.aggregate(events, state.statsPeriod);
   const cutoff = { daily: 30, weekly: 12, monthly: 12 }[state.statsPeriod];
   const slice = rows.slice(0, cutoff).reverse();
   const labels = slice.map((r) => WDSTATS.labelFor(state.statsPeriod, r.bucket));
   const counts = slice.map((r) => r.count);
-
-  if (state.chart) { state.chart.destroy(); state.chart = null; }
-  state.chart = new Chart(canvas, {
+  state.charts.overTime = new Chart(canvas, {
     type: 'bar',
-    data: {
-      labels,
-      datasets: [{
-        label: `${topic.name} (count)`,
-        data: counts,
-        backgroundColor: '#6fa8c4',
-      }],
-    },
+    data: { labels, datasets: [{ label: 'count', data: counts, backgroundColor: '#6fa8c4' }] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -517,22 +785,91 @@ function drawChart(rows, topic) {
   });
 }
 
+function drawTimeOfDay(events) {
+  const canvas = $('#chartTOD');
+  if (!canvas) return;
+  const buckets = WDSTATS.timeOfDay(events);
+  const labels = buckets.map((_, i) => `${i}`);
+  state.charts.tod = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: '#8a5a2b' }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { title: { display: true, text: 'hour' } }, y: { beginAtZero: true, ticks: { precision: 0 } } },
+    },
+  });
+}
+
+function drawDayOfWeek(events) {
+  const canvas = $('#chartDOW');
+  if (!canvas) return;
+  const buckets = WDSTATS.dayOfWeek(events);
+  const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  state.charts.dow = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: '#e2a920' }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+    },
+  });
+}
+
+function drawHeatmap(events) {
+  const root = $('#heatmap');
+  if (!root) return;
+  const mat = WDSTATS.calendarMatrix(events, 26);
+  const maxC = Math.max(1, mat.maxCount);
+  const heatLevel = (c) => {
+    if (c === 0) return 0;
+    if (c <= maxC * 0.25) return 1;
+    if (c <= maxC * 0.5) return 2;
+    if (c <= maxC * 0.75) return 3;
+    return 4;
+  };
+  let html = '<div class="heatmap-grid">';
+  for (let w = 0; w < mat.weeks.length; w++) {
+    html += '<div class="heatmap-col">';
+    for (let d = 0; d < 7; d++) {
+      const cell = mat.weeks[w][d];
+      const lvl = heatLevel(cell.count);
+      const date = new Date(cell.date);
+      html += `<div class="heatmap-cell level-${lvl}" title="${date.toDateString()}: ${cell.count} event${cell.count===1?'':'s'}"></div>`;
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+  html += `<div class="heatmap-legend">Less <span class="heatmap-cell level-0"></span><span class="heatmap-cell level-1"></span><span class="heatmap-cell level-2"></span><span class="heatmap-cell level-3"></span><span class="heatmap-cell level-4"></span> More · ${mat.total} total in window</div>`;
+  root.innerHTML = html;
+}
+
 /* ======== ADD / EDIT EVENT MODAL ======== */
 
 async function logNow(topic) {
   const now = Date.now();
   const id = await WDDB.nextId('events');
-  // default qant: 60 (1 min) for duration types, 0 for unit types — matches original
   const m = state.measurements.find((m) => m.id === topic.msureid);
   const defaultQant = (m && m.type === 3) ? 60 : 0;
   const ev = { id, cost: 0, qant: defaultQant, time: now, topicid: topic.id, note: '' };
   await WDDB.put('events', ev);
   state.events.push(ev);
-  snack(`Logged ${topic.name}`);
+  snack(`Logged ${topic.name}`, {
+    undo: async () => {
+      await WDDB.delete('events', id);
+      state.events = state.events.filter((e) => e.id !== id);
+      snack('Undone');
+      queueAutoSync('undoLog');
+      renderCurrent();
+    },
+  });
   queueAutoSync('logNow');
-  // refresh current view so deltas update
   if (state.view === 'categories') renderCategories();
   if (state.view === 'recent') renderRecent();
+  if (state.view === 'day') renderDay();
 }
 
 function openAddEvent(topic, existing = null) {
@@ -544,6 +881,7 @@ function openAddEvent(topic, existing = null) {
   const initTime = existing ? existing.time : Date.now();
   const initQantSec = existing ? Number(existing.qant || 0) : (isDuration ? 60 : 0);
   const initQantUnit = existing ? Number(existing.qant || 0) : 0;
+  const initSeverity = existing ? Number(existing.cost || 0) : 0;
 
   const qantHhmm = (() => {
     if (!isDuration) return '';
@@ -567,7 +905,13 @@ function openAddEvent(topic, existing = null) {
         <input id="qNum" type="number" step="any" value="${initQantUnit}">
       </div>`;
   }
-  // time-only → no qant field at all; qant defaults to 60 like the original
+
+  // Build a sorted list of tag suggestions from existing notes
+  const tagSuggest = WDSTATS.allTagsFromEvents(state.events).slice(0, 12);
+  const tagChipsHtml = tagSuggest.length ? `
+    <div class="tag-suggest">
+      ${tagSuggest.map((t) => `<button type="button" class="tag-suggest-chip" data-tag="${escapeHtml(t.tag)}">#${escapeHtml(t.tag)}</button>`).join('')}
+    </div>` : '';
 
   openModal(`
     <header>
@@ -576,7 +920,7 @@ function openAddEvent(topic, existing = null) {
       <button class="icon-btn" id="dialogSave" title="Save">✓</button>
     </header>
     <div class="body">
-      <div class="topic-name">${escapeHtml(topic.name)}</div>
+      <div class="topic-name">${topicEmoji(topic) ? topicEmoji(topic) + ' ' : ''}${escapeHtml(topic.name)}</div>
       ${qantField}
       <div class="row-2">
         <div class="field">
@@ -588,13 +932,69 @@ function openAddEvent(topic, existing = null) {
           <input id="evTime" type="time" value="${fmtTimeInput(initTime)}">
         </div>
       </div>
+      <div class="time-chips">
+        <button type="button" class="t-chip" data-mins="0">Now</button>
+        <button type="button" class="t-chip" data-mins="5">5m ago</button>
+        <button type="button" class="t-chip" data-mins="15">15m ago</button>
+        <button type="button" class="t-chip" data-mins="30">30m ago</button>
+        <button type="button" class="t-chip" data-mins="60">1h ago</button>
+        <button type="button" class="t-chip" data-mins="120">2h ago</button>
+        <button type="button" class="t-chip" data-mins="1440">Yesterday now</button>
+      </div>
       <div class="field">
-        <label>Note</label>
+        <label>Severity (optional, 0–5)</label>
+        <div class="sev-row">
+          <input id="evSev" type="range" min="0" max="5" step="1" value="${initSeverity}">
+          <span class="sev-val" id="sevVal">${initSeverity ? initSeverity : '—'}</span>
+        </div>
+      </div>
+      <div class="field">
+        <label>Note <span class="hint">(use #tags to categorize, e.g. #stressful #traveling)</span></label>
         <textarea id="evNote" placeholder="(optional)">${existing ? escapeHtml(existing.note || '') : ''}</textarea>
+        ${tagChipsHtml}
       </div>
       ${existing ? `<button class="btn danger" id="dialogDelete" style="margin-top:8px;">Delete event</button>` : ''}
     </div>
   `);
+
+  // Severity slider live update
+  const sevInput = $('#evSev');
+  const sevVal = $('#sevVal');
+  if (sevInput) sevInput.addEventListener('input', () => {
+    sevVal.textContent = sevInput.value === '0' ? '—' : sevInput.value;
+  });
+
+  // Time chips
+  $$('.t-chip').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const mins = Number(btn.dataset.mins);
+      const t = Date.now() - mins * 60 * 1000;
+      $('#evDate').value = fmtDateInput(t);
+      $('#evTime').value = fmtTimeInput(t);
+    });
+  });
+
+  // Tag suggestion chips: append to note
+  $$('.tag-suggest-chip').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const tag = btn.dataset.tag;
+      const ta = $('#evNote');
+      const current = ta.value.trim();
+      // toggle: if already contains the tag, remove it
+      const re = new RegExp(`(^|\\s)#${tag}(\\b)`, 'i');
+      if (re.test(current)) {
+        ta.value = current.replace(re, '$1$2').replace(/\s+/g, ' ').trim();
+        btn.classList.remove('active');
+      } else {
+        ta.value = (current ? current + ' ' : '') + '#' + tag;
+        btn.classList.add('active');
+      }
+    });
+    // initialize active state
+    const ta = $('#evNote');
+    const re = new RegExp(`(^|\\s)#${btn.dataset.tag}(\\b)`, 'i');
+    if (re.test(ta.value)) btn.classList.add('active');
+  });
 
   $('#dialogSave').addEventListener('click', async () => {
     const dateStr = $('#evDate').value;
@@ -612,36 +1012,65 @@ function openAddEvent(topic, existing = null) {
       if (Number.isNaN(raw)) { snack('Bad amount'); return; }
       qant = raw;
     } else {
-      // time-only: match original "poop start" pattern: qant=60
       qant = existing ? Number(existing.qant || 60) : 60;
     }
     const time = parseDateTimeInput(dateStr, timeStr);
     const note = $('#evNote').value.trim();
+    const severity = Number($('#evSev').value || 0);
 
     if (existing) {
-      const updated = { ...existing, qant, time, note };
+      const prev = { ...existing };
+      const updated = { ...existing, qant, cost: severity, time, note };
       await WDDB.put('events', updated);
       const idx = state.events.findIndex((e) => e.id === existing.id);
       if (idx >= 0) state.events[idx] = updated;
+      closeModal();
+      snack('Event updated', {
+        undo: async () => {
+          await WDDB.put('events', prev);
+          const j = state.events.findIndex((e) => e.id === prev.id);
+          if (j >= 0) state.events[j] = prev;
+          queueAutoSync('undoEdit');
+          renderCurrent();
+          snack('Undone');
+        },
+      });
     } else {
       const id = await WDDB.nextId('events');
-      const ev = { id, cost: 0, qant, time, topicid: topic.id, note };
+      const ev = { id, cost: severity, qant, time, topicid: topic.id, note };
       await WDDB.put('events', ev);
       state.events.push(ev);
+      closeModal();
+      snack(`Logged ${topic.name}`, {
+        undo: async () => {
+          await WDDB.delete('events', id);
+          state.events = state.events.filter((e) => e.id !== id);
+          queueAutoSync('undoLog');
+          renderCurrent();
+          snack('Undone');
+        },
+      });
     }
-    closeModal();
-    snack(existing ? 'Event updated' : `Logged ${topic.name}`);
     queueAutoSync('saveEvent');
     renderCurrent();
   });
 
   if (existing) {
     $('#dialogDelete').addEventListener('click', () => {
-      openConfirm('Delete this event?', 'This cannot be undone.', async () => {
+      openConfirm('Delete this event?', 'This cannot be undone via the snackbar — only via re-add.', async () => {
+        const removed = { ...existing };
         await WDDB.delete('events', existing.id);
         state.events = state.events.filter((e) => e.id !== existing.id);
         closeModal();
-        snack('Event deleted');
+        snack('Event deleted', {
+          undo: async () => {
+            await WDDB.put('events', removed);
+            state.events.push(removed);
+            queueAutoSync('undoDelete');
+            renderCurrent();
+            snack('Undone');
+          },
+        });
         queueAutoSync('deleteEvent');
         renderCurrent();
       });
@@ -667,11 +1096,12 @@ const AMOUNT_UNITS = [
 
 function openTopicEdit(existing) {
   const existingKind = existing ? topicKind(existing) : 'timeonly';
-  // For amount kind we need a unit picker; default unit when creating
-  // is ounces (101).
   const initialUnit = existing && existingKind === 'amount'
     ? existing.msureid
     : 101;
+  const meta = existing ? topicMeta(existing) : {};
+  const initEmoji = meta.emoji || '';
+  const initColor = meta.color || DEFAULT_TOPIC_COLOR;
 
   openModal(`
     <header>
@@ -687,6 +1117,18 @@ function openTopicEdit(existing) {
       <div class="field">
         <label>Description (optional)</label>
         <input id="topicDesc" type="text" value="${existing ? escapeHtml(existing.desc || '') : ''}" autocomplete="off">
+      </div>
+      <div class="row-2">
+        <div class="field">
+          <label>Emoji (optional)</label>
+          <input id="topicEmoji" type="text" maxlength="4" value="${escapeHtml(initEmoji)}" placeholder="💧 🥖 💤 …" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>Color</label>
+          <div class="color-swatches" id="colorSwatches">
+            ${COLOR_SWATCHES.map((c) => `<button type="button" class="swatch ${c===initColor?'on':''}" style="background:${c}" data-color="${c}" aria-label="Color ${c}"></button>`).join('')}
+          </div>
+        </div>
       </div>
       <div class="field">
         <label>Topic type</label>
@@ -715,7 +1157,15 @@ function openTopicEdit(existing) {
     </div>
   `);
 
-  // Toggle unit field based on selected kind
+  let selectedColor = initColor;
+  $$('#colorSwatches .swatch').forEach((sw) => {
+    sw.addEventListener('click', () => {
+      selectedColor = sw.dataset.color;
+      $$('#colorSwatches .swatch').forEach((s) => s.classList.remove('on'));
+      sw.classList.add('on');
+    });
+  });
+
   $$('input[name="kind"]', $('#modalRoot')).forEach((r) => {
     r.addEventListener('change', () => {
       const k = r.value;
@@ -727,6 +1177,7 @@ function openTopicEdit(existing) {
     const name = $('#topicName').value.trim();
     if (!name) { snack('Name required'); return; }
     const desc = $('#topicDesc').value.trim();
+    const emoji = $('#topicEmoji').value.trim();
     const kindEl = document.querySelector('input[name="kind"]:checked');
     const kind = kindEl ? kindEl.value : 'timeonly';
     let msureid;
@@ -738,6 +1189,7 @@ function openTopicEdit(existing) {
       msureid = (existing && [10,11,12].includes(existing.msureid)) ? existing.msureid : 10;
     }
 
+    let savedTopicId;
     if (existing) {
       const updated = {
         ...existing,
@@ -746,6 +1198,7 @@ function openTopicEdit(existing) {
       };
       await WDDB.put('topics', updated);
       await WDDB.setTopicKind(existing.id, kind);
+      savedTopicId = existing.id;
     } else {
       const id = await WDDB.nextId('topics');
       const t = { id, name, desc, msureid, optype: 1, type: 1, archived: false };
@@ -754,7 +1207,9 @@ function openTopicEdit(existing) {
       order.push(id);
       await WDDB.setMeta('topicOrder', order);
       await WDDB.setTopicKind(id, kind);
+      savedTopicId = id;
     }
+    await WDDB.setTopicMeta(savedTopicId, { emoji, color: selectedColor });
     closeModal();
     await reload();
     snack('Saved');
@@ -769,14 +1224,12 @@ function openTopicEdit(existing) {
         `Delete "${existing.name}"?`,
         `This will permanently delete the topic AND all ${evCount.toLocaleString()} of its event${evCount === 1 ? '' : 's'}. This cannot be undone. Consider Archive instead if you just want to hide it.`,
         async () => {
-          // Delete events for this topic
           const evs = state.events.filter((e) => e.topicid === existing.id);
           for (const e of evs) await WDDB.delete('events', e.id);
-          // Delete topic + clean up associated metadata
           await WDDB.delete('topics', existing.id);
           await WDDB.setTopicKind(existing.id, null);
+          await WDDB.setTopicMeta(existing.id, null);
           await WDDB.setFavorite(existing.id, false);
-          // Remove from saved topic order
           const order = (await WDDB.getMeta('topicOrder')) || [];
           await WDDB.setMeta('topicOrder', order.filter((x) => x !== existing.id));
           closeModal();
@@ -941,6 +1394,14 @@ async function doExport() {
   snack('Exported whendidibk.json');
 }
 
+async function doExportCsv() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}`;
+  await WDIO.exportToCsv(`whendidi-events-${stamp}.csv`);
+  snack('Exported CSV');
+}
+
 async function doSafetyBackup() {
   await WDIO.safetyBackup();
   snack('Safety backup downloaded');
@@ -1031,6 +1492,7 @@ function setView(view) {
 function renderCurrent() {
   if (state.view === 'categories') renderCategories();
   else if (state.view === 'recent') renderRecent();
+  else if (state.view === 'day') renderDay();
   else if (state.view === 'stats') renderStats();
 }
 
@@ -1066,12 +1528,79 @@ function openConfirm(title, body, onYes, yesLabel = 'Yes') {
 }
 
 let snackTimer = null;
-function snack(msg) {
+let snackUndoCallback = null;
+function snack(msg, opts = {}) {
   const sb = $('#snackbar');
-  sb.textContent = msg;
+  const onUndo = opts.undo || null;
+  snackUndoCallback = onUndo;
+  if (onUndo) {
+    sb.innerHTML = `<span class="snack-msg">${escapeHtml(msg)}</span>
+      <button class="snack-action" id="snackUndoBtn">UNDO</button>`;
+    sb.querySelector('#snackUndoBtn').addEventListener('click', async () => {
+      if (snackUndoCallback) {
+        const cb = snackUndoCallback;
+        snackUndoCallback = null;
+        sb.classList.remove('show');
+        try { await cb(); } catch (e) { console.error(e); }
+      }
+    });
+  } else {
+    sb.textContent = msg;
+  }
   sb.classList.add('show');
   if (snackTimer) clearTimeout(snackTimer);
-  snackTimer = setTimeout(() => sb.classList.remove('show'), 2200);
+  const duration = onUndo ? 5000 : 2200;
+  snackTimer = setTimeout(() => {
+    sb.classList.remove('show');
+    snackUndoCallback = null;
+  }, duration);
+}
+
+/* ======== TOPIC META (emoji + color) ======== */
+const DEFAULT_TOPIC_COLOR = '#8a5a2b';
+const COLOR_SWATCHES = [
+  '#8a5a2b', // brown (default)
+  '#6fa8c4', // blue
+  '#76c98b', // green
+  '#e2a920', // gold
+  '#b94343', // red
+  '#9b59b6', // purple
+  '#e67e22', // orange
+  '#34495e', // slate
+  '#16a085', // teal
+  '#e91e63', // pink
+];
+
+function topicMeta(topic) {
+  return state.topicMeta?.[topic?.id] || {};
+}
+function topicEmoji(topic) {
+  return (topicMeta(topic).emoji || '').trim();
+}
+function topicColor(topic) {
+  return topicMeta(topic).color || DEFAULT_TOPIC_COLOR;
+}
+
+/* ======== TAG / SEVERITY / NOTE RENDERING ======== */
+function renderNoteWithTags(note) {
+  if (!note) return '';
+  const tags = WDSTATS.parseTags(note);
+  if (!tags.length) return escapeHtml(note);
+  let out = '';
+  let cursor = 0;
+  for (const t of tags) {
+    out += escapeHtml(note.slice(cursor, t.start));
+    out += `<span class="tag-chip">${escapeHtml(note.slice(t.start, t.end))}</span>`;
+    cursor = t.end;
+  }
+  out += escapeHtml(note.slice(cursor));
+  return out;
+}
+function severityBadge(ev) {
+  const s = Number(ev?.cost || 0);
+  if (!s || s < 1) return '';
+  const cls = s >= 4 ? 'sev-hi' : s >= 2 ? 'sev-med' : 'sev-lo';
+  return `<span class="sev-badge ${cls}" title="Severity ${s}/5">●${s}</span>`;
 }
 
 function openDrawer() {
@@ -1218,6 +1747,7 @@ async function init() {
     el.addEventListener('click', () => closeDrawer()));
   $('#navImport').addEventListener('click', () => { closeDrawer(); triggerImport(); });
   $('#navExport').addEventListener('click', () => { closeDrawer(); doExport(); });
+  $('#navExportCsv').addEventListener('click', () => { closeDrawer(); doExportCsv(); });
   $('#navBackup').addEventListener('click', () => { closeDrawer(); doSafetyBackup(); });
   $('#navTopics').addEventListener('click', () => { closeDrawer(); openTopicsManager(); });
   $('#navDrive').addEventListener('click', () => { closeDrawer(); openDrive(); });

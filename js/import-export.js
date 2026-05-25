@@ -234,6 +234,84 @@ async function exportToFile(filename) {
   await WDDB.setMeta('lastExport', Date.now());
 }
 
+function csvEscape(s) {
+  if (s == null) return '';
+  const str = String(s);
+  if (/[",\n\r]/.test(str)) return '"' + str.replace(/"/g, '""') + '"';
+  return str;
+}
+
+async function exportToCsv(filename) {
+  const [topics, events, measurements] = await Promise.all([
+    WDDB.getAll('topics'),
+    WDDB.getAll('events'),
+    WDDB.getAll('measurements'),
+  ]);
+  const topicById = new Map(topics.map((t) => [t.id, t]));
+  const measById = new Map(measurements.map((m) => [m.id, m]));
+
+  // Re-implement a tiny formatter so we don't depend on app.js here.
+  const fmtQant = (qant, topic) => {
+    if (!topic) return String(qant ?? '');
+    const m = measById.get(topic.msureid);
+    if (!m) return String(qant ?? '');
+    if (m.type === 3) {
+      const secs = Number(qant || 0);
+      const h = Math.floor(secs / 3600);
+      const mn = Math.floor((secs % 3600) / 60);
+      const s = secs % 60;
+      if (m.format === 7) return `${String(Math.floor(secs/60)).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      if (m.format === 6) return `${h}:${String(mn).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      if (m.format === 4) return `${(secs/3600).toFixed(1)} ${m.symbol}`;
+      if (m.format === 3) return `${Math.round(secs/60)} ${m.symbol}`;
+      if (m.format === 2) return `${secs} ${m.symbol}`;
+      if (h === 0) return `${mn}m`;
+      return `${h}:${String(mn).padStart(2,'0')}`;
+    }
+    return `${qant}${m.symbol || ''}`;
+  };
+
+  const TAG_RE = /#([A-Za-z0-9_][A-Za-z0-9_-]{0,30})/g;
+  const extractTags = (note) => {
+    if (!note) return '';
+    const out = [];
+    let m;
+    while ((m = TAG_RE.exec(note)) !== null) out.push(m[1].toLowerCase());
+    return out.join(' ');
+  };
+
+  const header = ['id','time_iso','time_ms','topicid','topic_name','qant_raw','qant_formatted','measurement','cost_severity','tags','note'];
+  const lines = [header.map(csvEscape).join(',')];
+  const sorted = events.slice().sort((a, b) => a.time - b.time);
+  for (const e of sorted) {
+    const t = topicById.get(e.topicid);
+    const m = t ? measById.get(t.msureid) : null;
+    lines.push([
+      e.id,
+      new Date(e.time).toISOString(),
+      e.time,
+      e.topicid,
+      t ? t.name : '',
+      e.qant ?? 0,
+      t ? fmtQant(e.qant, t) : (e.qant ?? ''),
+      m ? m.name : '',
+      e.cost ?? 0,
+      extractTags(e.note),
+      e.note || '',
+    ].map(csvEscape).join(','));
+  }
+  const csv = lines.join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || 'whendidi-events.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 async function safetyBackup() {
   const events = await WDDB.getAll('events');
   if (!events.length) return; // nothing to back up
@@ -251,6 +329,7 @@ window.WDIO = {
   importMerge,
   buildExportObject,
   exportToFile,
+  exportToCsv,
   safetyBackup,
   downloadJSON,
 };

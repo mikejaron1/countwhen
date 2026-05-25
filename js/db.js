@@ -229,6 +229,23 @@ const db = {
     return (await this.getMeta('topicKinds')) || {};
   },
 
+  /* Topic visual metadata (emoji + color). In-app only, not exported. */
+  async getTopicMeta(topicId) {
+    const map = (await this.getMeta('topicMeta')) || {};
+    return map[topicId] || null;
+  },
+
+  async setTopicMeta(topicId, meta) {
+    const map = (await this.getMeta('topicMeta')) || {};
+    if (meta == null) delete map[topicId];
+    else map[topicId] = meta;
+    await this.setMeta('topicMeta', map);
+  },
+
+  async getAllTopicMeta() {
+    return (await this.getMeta('topicMeta')) || {};
+  },
+
   async seedDefaults() {
     // Pendtimes: seed if empty
     const pt = await this.getAll('pendtimes');
