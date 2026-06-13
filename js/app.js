@@ -1873,6 +1873,8 @@ async function init() {
   $('#navAbout').addEventListener('click', () => { closeDrawer(); openAbout(); });
   $('#navStorage').addEventListener('click', () => { closeDrawer(); openStorageStatus(); });
   $('#navWipe').addEventListener('click', () => { closeDrawer(); openWipe(); });
+  const drawerVersionEl = $('#drawerVersion');
+  if (drawerVersionEl) drawerVersionEl.textContent = window.WD_VERSION || '';
 
   // Back-gesture handler: close overlays instead of exiting the PWA
   window.addEventListener('popstate', handlePopState);

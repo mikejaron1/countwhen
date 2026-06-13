@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'whendidi-v5-2026-06-12';
+const CACHE_VERSION = 'whendidi-v5.1-2026-06-12';
 
 const SHELL = [
   './',
@@ -50,14 +50,19 @@ self.addEventListener('fetch', (event) => {
   // Never cache cross-origin (e.g., Google APIs)
   if (url.origin !== self.location.origin) return;
 
-  // Stale-while-revalidate for shell assets
+  // Network-first for same-origin shell assets: always serve the freshest
+  // code when online (so deploys show up on the next reload), and fall
+  // back to the cache only when offline / the network fails.
   event.respondWith((async () => {
     const cache = await caches.open(CACHE_VERSION);
-    const cached = await cache.match(req);
-    const fetchPromise = fetch(req).then((resp) => {
-      if (resp.ok && resp.type === 'basic') cache.put(req, resp.clone());
+    try {
+      const resp = await fetch(req);
+      if (resp && resp.ok && resp.type === 'basic') cache.put(req, resp.clone());
       return resp;
-    }).catch(() => cached);
-    return cached || fetchPromise;
+    } catch (e) {
+      const cached = await cache.match(req);
+      if (cached) return cached;
+      throw e;
+    }
   })());
 });
