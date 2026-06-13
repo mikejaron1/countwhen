@@ -10,6 +10,7 @@ const state = {
   topicOrder: [],
   topicKinds: {}, // topicId -> 'timeonly' | 'duration' | 'amount'
   topicMeta: {},  // topicId -> { emoji, color }
+  quickBar: [],   // fixed, user-curated ordered list of topic ids for the quick-access bar
   statsTopicId: null,
   statsPeriod: 'daily',
   chart: null,
@@ -178,6 +179,15 @@ async function reload() {
   state.favorites = new Set(favIds);
   state.topicKinds = topicKinds || {};
   state.topicMeta = topicMeta || {};
+  // Quick-access bar: keep only ids that still map to existing, non-archived topics.
+  const savedQuick = (await WDDB.getMeta('quickBar')) || [];
+  const validQuick = Array.isArray(savedQuick)
+    ? savedQuick.filter((id) => {
+        const t = byId.get(id);
+        return t && !t.archived;
+      })
+    : [];
+  state.quickBar = validQuick;
   if (state.statsTopicId == null && state.topics.length) {
     state.statsTopicId = state.topics[0].id;
   }
@@ -238,6 +248,19 @@ function frequentTopicsLast30Days() {
   return ranked;
 }
 
+/* Topics to show in the quick-access bar, in fixed order.
+ * Returns the user-curated list when configured; otherwise null to signal
+ * that the auto "frequent topics" fallback should be used. */
+function quickBarList() {
+  const ids = state.quickBar || [];
+  if (!ids.length) return null;
+  const byId = new Map(state.topics.map((t) => [t.id, t]));
+  return ids
+    .map((id) => byId.get(id))
+    .filter((t) => t && !t.archived)
+    .map((t) => ({ id: t.id, topic: t }));
+}
+
 function renderCategories() {
   const main = $('#main');
   const topics = state.topics.filter((t) => !t.archived);
@@ -253,7 +276,8 @@ function renderCategories() {
     return;
   }
 
-  const frequent = frequentTopicsLast30Days();
+  const manual = quickBarList();
+  const frequent = manual !== null ? manual : frequentTopicsLast30Days();
   const quickBar = frequent.length ? `
     <div class="quick-bar">
       ${frequent.map((f) => {
@@ -1314,6 +1338,100 @@ async function moveTopic(id, delta) {
   renderCurrent();
 }
 
+/* ======== QUICK-ACCESS BAR MANAGER ======== */
+
+async function saveQuickBar(ids) {
+  state.quickBar = ids.slice();
+  await WDDB.setQuickBar(state.quickBar);
+  queueAutoSync();
+  renderCurrent();
+}
+
+function openQuickBarManager() {
+  const byId = new Map(state.topics.map((t) => [t.id, t]));
+  const pinnedIds = (state.quickBar || []).filter((id) => {
+    const t = byId.get(id);
+    return t && !t.archived;
+  });
+  const pinnedSet = new Set(pinnedIds);
+  const available = state.topics.filter((t) => !t.archived && !pinnedSet.has(t.id));
+
+  const chipLabel = (t) => {
+    const emoji = topicEmoji(t);
+    return `${emoji ? `<span class="qc-emoji">${escapeHtml(emoji)}</span>` : ''}<span class="t-name">${escapeHtml(t.name)}</span>`;
+  };
+
+  const pinnedRows = pinnedIds.map((id, i) => {
+    const t = byId.get(id);
+    return `
+      <div class="topic-row" data-topic="${id}" style="--accent:${topicColor(t)}">
+        <div class="mgr-arrows">
+          <button class="arrow-btn" data-qup="${id}" ${i===0?'disabled':''} aria-label="Move up">▲</button>
+          <button class="arrow-btn" data-qdown="${id}" ${i===pinnedIds.length-1?'disabled':''} aria-label="Move down">▼</button>
+        </div>
+        <div>${chipLabel(t)}</div>
+        <button class="btn secondary" data-qremove="${id}">Remove</button>
+      </div>`;
+  }).join('');
+
+  const availableRows = available.map((t) => `
+      <div class="topic-row" data-topic="${t.id}" style="--accent:${topicColor(t)}">
+        <div></div>
+        <div>${chipLabel(t)}</div>
+        <button class="btn secondary" data-qadd="${t.id}">＋ Add</button>
+      </div>`).join('');
+
+  const pinnedSection = pinnedIds.length
+    ? pinnedRows
+    : `<div class="mgr-hint">No quick-access topics pinned yet. The bar currently shows your most frequent recent topics automatically. Add topics below to pin a fixed set in a fixed order.</div>`;
+
+  openModal(`
+    <header>
+      <button class="icon-btn" data-close>←</button>
+      <div class="title">Quick-access bar</div>
+    </header>
+    <div class="body" style="padding:0;">
+      <div class="mgr-hint">These chips appear pinned at the top of Categories for one-tap logging. ▲▼ to reorder.</div>
+      <div class="sticky-header">Pinned</div>
+      ${pinnedSection}
+      <div class="sticky-header">Available topics</div>
+      ${availableRows || '<div class="mgr-hint">All topics are already pinned.</div>'}
+    </div>
+  `);
+
+  const reopen = () => openQuickBarManager();
+  $$('[data-qadd]').forEach((b) => b.addEventListener('click', async (e) => {
+    const id = Number(e.currentTarget.dataset.qadd);
+    if (!pinnedSet.has(id)) await saveQuickBar([...pinnedIds, id]);
+    reopen();
+  }));
+  $$('[data-qremove]').forEach((b) => b.addEventListener('click', async (e) => {
+    const id = Number(e.currentTarget.dataset.qremove);
+    await saveQuickBar(pinnedIds.filter((x) => x !== id));
+    reopen();
+  }));
+  $$('[data-qup]').forEach((b) => b.addEventListener('click', async (e) => {
+    const id = Number(e.currentTarget.dataset.qup);
+    await saveQuickBar(swap(pinnedIds, id, -1));
+    reopen();
+  }));
+  $$('[data-qdown]').forEach((b) => b.addEventListener('click', async (e) => {
+    const id = Number(e.currentTarget.dataset.qdown);
+    await saveQuickBar(swap(pinnedIds, id, +1));
+    reopen();
+  }));
+}
+
+function swap(arr, id, delta) {
+  const out = arr.slice();
+  const i = out.indexOf(id);
+  if (i < 0) return out;
+  const j = i + delta;
+  if (j < 0 || j >= out.length) return out;
+  [out[i], out[j]] = [out[j], out[i]];
+  return out;
+}
+
 /* ======== IMPORT / EXPORT FLOW ======== */
 
 function triggerImport() {
@@ -1750,6 +1868,7 @@ async function init() {
   $('#navExportCsv').addEventListener('click', () => { closeDrawer(); doExportCsv(); });
   $('#navBackup').addEventListener('click', () => { closeDrawer(); doSafetyBackup(); });
   $('#navTopics').addEventListener('click', () => { closeDrawer(); openTopicsManager(); });
+  $('#navQuickBar').addEventListener('click', () => { closeDrawer(); openQuickBarManager(); });
   $('#navDrive').addEventListener('click', () => { closeDrawer(); openDrive(); });
   $('#navAbout').addEventListener('click', () => { closeDrawer(); openAbout(); });
   $('#navStorage').addEventListener('click', () => { closeDrawer(); openStorageStatus(); });

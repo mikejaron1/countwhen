@@ -497,6 +497,9 @@ body {
   scrollbar-width: none;
   border-bottom: 1px solid var(--rule);
   background: var(--tan-bg);
+  position: sticky;
+  top: 0;
+  z-index: 6;
 }
 .quick-bar::-webkit-scrollbar { display: none; }
 .quick-chip {

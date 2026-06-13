@@ -41,6 +41,11 @@ No drag-and-drop, no console clicks. Pages handles the rest.
 - **Add / Edit Event** — date, time, duration (hh:mm) or amount, note.
 - **Topics manager** — add, rename, archive, delete (also accessible
   via ☰ menu).
+- **Quick-access bar** — pinned one-tap chips at the top of Categories
+  for fast logging. Stays fixed in place (sticky) and keeps a fixed
+  order. Curate exactly which topics appear and their order via
+  ☰ menu → **Quick-access bar…**. When none are pinned, the bar falls
+  back to auto-showing your most frequent recent topics.
 - **Import / Export JSON** — byte-compatible with the original format.
   Import preview shows topic / event counts + date range; choose
   *Replace* (with auto-downloaded safety backup) or *Merge*

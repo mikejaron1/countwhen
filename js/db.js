@@ -246,6 +246,18 @@ const db = {
     return (await this.getMeta('topicMeta')) || {};
   },
 
+  /* Quick-access bar: a fixed, user-curated, ordered list of topic ids
+   * shown as one-tap chips at the top of the Categories view. When empty,
+   * the app falls back to auto-showing the most frequent recent topics. */
+  async getQuickBar() {
+    const ids = await this.getMeta('quickBar');
+    return Array.isArray(ids) ? ids : [];
+  },
+
+  async setQuickBar(ids) {
+    await this.setMeta('quickBar', Array.isArray(ids) ? ids : []);
+  },
+
   async seedDefaults() {
     // Pendtimes: seed if empty
     const pt = await this.getAll('pendtimes');
