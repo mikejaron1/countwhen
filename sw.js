@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'whendidi-v5.1-2026-06-12';
+const CACHE_VERSION = 'whendidi-v6.0-2026-08-01';
 
 const SHELL = [
   './',
@@ -14,6 +14,7 @@ const SHELL = [
   './js/db.js',
   './js/import-export.js',
   './js/stats.js',
+  './js/insights.js',
   './js/drive.js',
   './js/app.js',
   './vendor/chart.umd.min.js',

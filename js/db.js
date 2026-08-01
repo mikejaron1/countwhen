@@ -86,6 +86,13 @@ function reqToPromise(req) {
   });
 }
 
+/* Meta keys that belong to *this device*, not to the data set. They survive
+ * a replace-import so a Drive restore doesn't disconnect Drive. */
+const DEVICE_META_KEYS = [
+  'driveClientId', 'driveSyncBase', 'driveRemoteMeta',
+  'lastDriveSync', 'lastLocalChangeAt', 'lastFlareAlert',
+];
+
 const db = {
   async getAll(store) {
     const { stores } = await tx(store);
@@ -134,10 +141,26 @@ const db = {
     });
   },
 
-  async clearAll() {
+  /**
+   * Wipe every store, ready for a replace-style import.
+   *
+   * Device-local meta (which Drive account we talk to, where we are in the
+   * sync conversation) is *not* part of the backup, so it is read back and
+   * re-written afterwards — otherwise restoring from Drive would log the
+   * device out of Drive.
+   */
+  async clearAll({ keepDeviceMeta = true } = {}) {
+    const keep = {};
+    if (keepDeviceMeta) {
+      for (const k of DEVICE_META_KEYS) {
+        const v = await this.getMeta(k);
+        if (v !== undefined && v !== null) keep[k] = v;
+      }
+    }
     for (const name of Object.keys(STORES)) {
       await this.clear(name);
     }
+    for (const [k, v] of Object.entries(keep)) await this.setMeta(k, v);
   },
 
   async getEventsByTopic(topicid) {
@@ -256,6 +279,48 @@ const db = {
 
   async setQuickBar(ids) {
     await this.setMeta('quickBar', Array.isArray(ids) ? ids : []);
+  },
+
+  /* Health-insight topic roles: maps a topic to a semantic role the
+   * insights engine understands (bathroom / meal / blood / accident /
+   * sleep / med / trigger). In-app only, not part of whendidibk.json. */
+  async getTopicRoles() {
+    return (await this.getMeta('topicRoles')) || {};
+  },
+
+  async setTopicRole(topicId, role) {
+    const map = (await this.getMeta('topicRoles')) || {};
+    if (role == null || role === '') delete map[topicId];
+    else map[topicId] = role;
+    await this.setMeta('topicRoles', map);
+    return map;
+  },
+
+  async setTopicRoles(map) {
+    await this.setMeta('topicRoles', map || {});
+  },
+
+  /* Insight / alert settings. */
+  async getInsightSettings() {
+    const s = (await this.getMeta('insightSettings')) || {};
+    return {
+      cutoffHour: 4,          // logical day rolls over at 4am
+      windowDays: 7,          // "current" window for flare detection
+      insightWindow: 90,      // lookback for narrative insights
+      alertsEnabled: false,
+      alertOn: 'flare',       // 'flare' | 'watch'
+      alertCooldownHours: 20,
+      lastAlertAt: 0,
+      lastAlertLevel: '',
+      ...s,
+    };
+  },
+
+  async setInsightSettings(patch) {
+    const cur = await this.getInsightSettings();
+    const next = { ...cur, ...patch };
+    await this.setMeta('insightSettings', next);
+    return next;
   },
 
   async seedDefaults() {

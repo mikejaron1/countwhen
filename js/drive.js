@@ -175,10 +175,6 @@ async function findFileInFolder(folderId, name) {
   return (data.files && data.files[0]) || null;
 }
 
-async function findSyncFile(folderId) {
-  return findFileInFolder(folderId, DRIVE_FILE_NAME);
-}
-
 async function copyDriveFile(srcId, newName, parents) {
   const resp = await driveFetch(`/drive/v3/files/${srcId}/copy?fields=id`, {
     method: 'POST',
@@ -192,25 +188,21 @@ async function deleteDriveFile(id) {
   await driveFetch(`/drive/v3/files/${id}`, { method: 'DELETE' });
 }
 
-/* Rotate any existing whendidibk.json to whendidibk-1.json, shifting
- * older versions down. Keep at most DRIVE_MAX_VERSIONS. Best-effort:
- * any error here is non-fatal — it shouldn't block the upload.
+/* Keep up to DRIVE_MAX_VERSIONS historical snapshots as whendidibk-N.json,
+ * WITHOUT touching the primary file's id. The primary file is updated in
+ * place so its Drive `modifiedTime` can be used for conflict detection.
+ * Best-effort: any failure here is non-fatal.
  */
-async function rotateVersions(folderId) {
+async function rotateVersions(folderId, currentFileId) {
   try {
-    const cur = await findFileInFolder(folderId, DRIVE_FILE_NAME);
-    if (!cur) return;
-    // Find existing version files
+    if (!currentFileId) return;
     const existing = [];
     for (let i = 1; i <= DRIVE_MAX_VERSIONS + 2; i++) {
       const f = await findFileInFolder(folderId, `whendidibk-${i}.json`);
       if (f) existing.push({ idx: i, file: f });
     }
-    // Sort by index asc; delete anything that would push past max
     existing.sort((a, b) => a.idx - b.idx);
-    // After rotation: the highest desired index is (DRIVE_MAX_VERSIONS).
-    // We will rename existing N → N+1 starting from highest. Anything
-    // above DRIVE_MAX_VERSIONS gets deleted.
+    // Shift from the highest index down so we never collide with a name.
     for (let i = existing.length - 1; i >= 0; i--) {
       const slot = existing[i];
       const newIdx = slot.idx + 1;
@@ -224,33 +216,19 @@ async function rotateVersions(folderId) {
         });
       }
     }
-    // Now rename current to -1
-    await driveFetch(`/drive/v3/files/${cur.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: 'whendidibk-1.json' }),
-    });
+    // Snapshot the current contents as -1 (a copy, so the id stays stable).
+    await copyDriveFile(currentFileId, 'whendidibk-1.json', [folderId]);
   } catch (e) {
-    // Versioning is a nice-to-have; log and continue with the upload
     console.warn('drive version rotation failed:', e?.message || e);
   }
 }
 
-async function uploadSyncFile() {
-  const folderId = await findOrCreateFolder();
-  // Rotate previous versions first (best-effort)
-  await rotateVersions(folderId);
-  // After rotation there is no current whendidibk.json — create a new
-  // one with the current data.
-  const obj = await WDIO.buildExportObject();
-  const json = JSON.stringify(obj);
+const FILE_FIELDS = 'id,name,modifiedTime,md5Checksum,size';
 
+async function createSyncFile(folderId, obj) {
+  const json = JSON.stringify(obj);
   const boundary = '-------whendidi-boundary-' + Math.random().toString(36).slice(2);
-  const metadata = {
-    name: DRIVE_FILE_NAME,
-    parents: [folderId],
-    mimeType: 'application/json',
-  };
+  const metadata = { name: DRIVE_FILE_NAME, parents: [folderId], mimeType: 'application/json' };
   const body =
     `--${boundary}\r\n` +
     `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
@@ -259,47 +237,245 @@ async function uploadSyncFile() {
     `Content-Type: application/json\r\n\r\n` +
     json + `\r\n` +
     `--${boundary}--`;
-  const resp = await driveFetch(`/upload/drive/v3/files?uploadType=multipart&fields=id`, {
-    method: 'POST',
-    headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
-    body,
-  });
-  return (await resp.json()).id;
+  const resp = await driveFetch(
+    `/upload/drive/v3/files?uploadType=multipart&fields=${FILE_FIELDS}`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+      body,
+    });
+  return await resp.json();
+}
+
+/* Overwrite the primary file's contents, keeping its id. */
+async function updateSyncFile(fileId, obj) {
+  const resp = await driveFetch(
+    `/upload/drive/v3/files/${fileId}?uploadType=media&fields=${FILE_FIELDS}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(obj),
+    });
+  return await resp.json();
+}
+
+async function readSyncFile(fileId) {
+  const resp = await driveFetch(`/drive/v3/files/${fileId}?alt=media`);
+  return await resp.json();
+}
+
+async function statSyncFile(folderId) {
+  const q = encodeURIComponent(
+    `name='${DRIVE_FILE_NAME}' and '${folderId}' in parents and trashed=false`
+  );
+  const resp = await driveFetch(
+    `/drive/v3/files?q=${q}&fields=files(${FILE_FIELDS})&spaces=drive`);
+  const data = await resp.json();
+  return (data.files && data.files[0]) || null;
 }
 
 async function downloadSyncFile() {
   const folderId = await findOrCreateFolder();
-  const file = await findSyncFile(folderId);
+  const file = await statSyncFile(folderId);
   if (!file) return null;
-  const resp = await driveFetch(`/drive/v3/files/${file.id}?alt=media`);
-  return await resp.json();
+  return await readSyncFile(file.id);
+}
+
+/* ---------- three-way merge ---------- */
+
+function stableStringify(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(v).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
+}
+function sameRecord(a, b) {
+  if (a === undefined && b === undefined) return true;
+  if (a === undefined || b === undefined) return false;
+  return stableStringify(a) === stableStringify(b);
+}
+
+/* Merge one id-keyed collection. `preferRemote` breaks true conflicts
+ * (both sides changed the same record differently since the last sync). */
+function mergeCollection(baseArr, localArr, remoteArr, keyName, preferRemote, stats) {
+  const index = (arr) => {
+    const m = new Map();
+    for (const it of (arr || [])) if (it && it[keyName] != null) m.set(it[keyName], it);
+    return m;
+  };
+  const base = index(baseArr), local = index(localArr), remote = index(remoteArr);
+  const ids = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
+  const out = [];
+  for (const id of ids) {
+    const b = base.get(id), l = local.get(id), r = remote.get(id);
+    if (sameRecord(l, r)) {                      // both sides agree
+      if (l !== undefined) out.push(l);
+      continue;
+    }
+    if (l === undefined) {
+      // Deleted locally. Honour the delete only if the remote didn't change
+      // it since the base; otherwise keep the remote edit (never lose data).
+      if (b !== undefined && sameRecord(b, r)) { stats.deleted++; continue; }
+      out.push(r); stats.fromRemote++; continue;
+    }
+    if (r === undefined) {
+      if (b !== undefined && sameRecord(b, l)) { stats.deleted++; continue; }
+      out.push(l); stats.fromLocal++; continue;
+    }
+    if (sameRecord(b, l)) { out.push(r); stats.fromRemote++; continue; }  // only remote changed
+    if (sameRecord(b, r)) { out.push(l); stats.fromLocal++; continue; }   // only local changed
+    stats.conflicts++;                                                    // both changed
+    out.push(preferRemote ? r : l);
+  }
+  return out;
+}
+
+/**
+ * Three-way merge of two whendidibk objects against the snapshot taken at
+ * the last successful sync. Additive by nature (events have unique ids), so
+ * in practice this is "union everything, and respect real deletions".
+ */
+function mergeBackups(base, local, remote, { preferRemote = false } = {}) {
+  const b = base || {};
+  const stats = { fromLocal: 0, fromRemote: 0, deleted: 0, conflicts: 0 };
+  const out = {
+    ...local,
+    topics:       mergeCollection(b.topics, local.topics, remote.topics, 'id', preferRemote, stats),
+    events:       mergeCollection(b.events, local.events, remote.events, 'id', preferRemote, stats),
+    measurements: mergeCollection(b.measurements, local.measurements, remote.measurements, 'id', preferRemote, stats),
+    pendtimes:    mergeCollection(b.pendtimes, local.pendtimes, remote.pendtimes, 'id', preferRemote, stats),
+    appdata:      mergeCollection(b.appdata, local.appdata, remote.appdata, 'name', preferRemote, stats),
+  };
+  // In-app settings are a single blob: last writer wins.
+  const localApp = local._wdapp, remoteApp = remote._wdapp;
+  if (localApp || remoteApp) {
+    if (!localApp) out._wdapp = remoteApp;
+    else if (!remoteApp) out._wdapp = localApp;
+    else if (sameRecord(localApp, remoteApp)) out._wdapp = localApp;
+    else {
+      out._wdapp = preferRemote ? remoteApp : localApp;
+      if (!sameRecord(b._wdapp, localApp) && !sameRecord(b._wdapp, remoteApp)) stats.conflicts++;
+    }
+  }
+  out.events.sort((a, c) => (a.topicid - c.topicid) || (c.time - a.time));
+  out.topics.sort((a, c) => (a.name || '').localeCompare(c.name || ''));
+  out.eventcount = out.events.length;
+  out.topiccount = out.topics.length;
+  out.version = local.version ?? remote.version ?? 4;
+  return { merged: out, stats };
 }
 
 /* ---------- public sync ops ---------- */
 
-async function syncUp({ interactive = false } = {}) {
+/**
+ * Two-way sync.
+ *
+ *   - No remote file            -> create it from local data.
+ *   - Remote unchanged since we
+ *     last synced                -> straight upload (fast-forward).
+ *   - Remote changed             -> download it, three-way merge against the
+ *                                   snapshot we stored at the last sync,
+ *                                   apply the merge locally, upload the result.
+ *
+ * True conflicts (the same record edited differently on both devices since
+ * the last sync) are resolved in favour of whichever side was touched most
+ * recently, and reported back to the caller so the UI can mention it.
+ */
+async function syncNow({ interactive = false, allowMerge = true, force = false } = {}) {
   const clientId = await getClientId();
   if (!clientId) throw new Error('NO_CLIENT_ID');
   if (!isOnline()) throw new Error('OFFLINE');
-  if (!wifiOk()) throw new Error('CELLULAR_BLOCKED');
+  if (!interactive && !wifiOk()) throw new Error('CELLULAR_BLOCKED');
   await (interactive ? getTokenInteractive() : getTokenSilent());
-  await uploadSyncFile();
-  await WDDB.setMeta('lastDriveSync', Date.now());
-  setStatus('ok', '☁ synced');
+
+  const folderId = await findOrCreateFolder();
+  const remoteStat = await statSyncFile(folderId);
+  const local = await WDIO.buildExportObject();
+
+  // ---- 1. nothing on Drive yet ----
+  if (!remoteStat) {
+    const created = await createSyncFile(folderId, local);
+    await rememberSyncPoint(created, local);
+    setStatus('ok', '☁ synced');
+    return { action: 'created', stats: null };
+  }
+
+  const known = (await WDDB.getMeta('driveRemoteMeta')) || {};
+  const base = await WDDB.getMeta('driveSyncBase');
+  const remoteUnchanged =
+    force ||
+    (known.fileId === remoteStat.id && known.modifiedTime === remoteStat.modifiedTime);
+
+  // ---- 2. remote is exactly what we last wrote: fast-forward ----
+  if (remoteUnchanged) {
+    await rotateVersions(folderId, remoteStat.id);
+    const updated = await updateSyncFile(remoteStat.id, local);
+    await rememberSyncPoint(updated, local);
+    setStatus('ok', '☁ synced');
+    return { action: 'uploaded', stats: null };
+  }
+
+  // ---- 3. remote moved on: merge ----
+  if (!allowMerge) throw new Error('REMOTE_CHANGED');
+  const remote = await readSyncFile(remoteStat.id);
+  const errs = WDIO.validateBackup(remote);
+  if (errs.length) throw new Error('INVALID_REMOTE: ' + errs[0]);
+
+  // Without a base snapshot we can't tell edits from deletions, so fall back
+  // to a purely additive union (base = empty) — nothing is ever lost.
+  const lastLocalChange = (await WDDB.getMeta('lastLocalChangeAt')) || 0;
+  const remoteTime = Date.parse(remoteStat.modifiedTime || 0) || 0;
+  const preferRemote = remoteTime > lastLocalChange;
+
+  const { merged, stats } = mergeBackups(base, local, remote, { preferRemote });
+  stats.hadBase = !!base;
+
+  const changedLocally =
+    merged.events.length !== (local.events || []).length ||
+    merged.topics.length !== (local.topics || []).length ||
+    stats.fromRemote > 0;
+
+  if (changedLocally) {
+    await WDIO.safetyBackup();
+    await WDDB.clearAll();
+    await WDIO.applyBackup(merged);
+  }
+  await rotateVersions(folderId, remoteStat.id);
+  const updated = await updateSyncFile(remoteStat.id, merged);
+  await rememberSyncPoint(updated, merged);
+  setStatus('ok', '☁ merged');
+  return { action: 'merged', stats, changedLocally };
 }
 
+/* Record what we just wrote so the next sync can detect remote edits. */
+async function rememberSyncPoint(fileMeta, obj) {
+  await WDDB.setMeta('driveRemoteMeta', {
+    fileId: fileMeta.id,
+    modifiedTime: fileMeta.modifiedTime,
+    md5Checksum: fileMeta.md5Checksum || null,
+  });
+  await WDDB.setMeta('driveSyncBase', obj);
+  await WDDB.setMeta('lastDriveSync', Date.now());
+}
+
+/* Upload-only (kept for the "Sync Now" button and older call sites). */
+async function syncUp(opts = {}) {
+  return syncNow(opts);
+}
+
+/* Explicit "throw away local, take what's on Drive". */
 async function syncDown({ interactive = true } = {}) {
   const clientId = await getClientId();
   if (!clientId) throw new Error('NO_CLIENT_ID');
   if (!isOnline()) throw new Error('OFFLINE');
   await (interactive ? getTokenInteractive() : getTokenSilent());
-  const obj = await downloadSyncFile();
-  if (!obj) throw new Error('NO_REMOTE_FILE');
+  const folderId = await findOrCreateFolder();
+  const stat = await statSyncFile(folderId);
+  if (!stat) throw new Error('NO_REMOTE_FILE');
+  const obj = await readSyncFile(stat.id);
   const errs = WDIO.validateBackup(obj);
   if (errs.length) throw new Error('INVALID_REMOTE: ' + errs[0]);
   await WDIO.safetyBackup();
   await WDIO.importReplace(obj);
-  await WDDB.setMeta('lastDriveSync', Date.now());
+  await rememberSyncPoint(stat, obj);
   setStatus('ok', '☁ restored');
   return obj;
 }
@@ -307,6 +483,9 @@ async function syncDown({ interactive = true } = {}) {
 /* ---------- auto-sync ---------- */
 
 function queueAutoSync(reason = 'change') {
+  // Always stamp the local change, even if auto-sync is off — the timestamp
+  // is what breaks conflict ties on the next manual sync.
+  WDDB.setMeta('lastLocalChangeAt', Date.now()).catch(() => {});
   if (!CFG().autoSyncOnChange) return;
   const debounce = Math.max(1000, Number(CFG().autoSyncDebounceMs) || 5000);
   if (_autoSyncTimer) clearTimeout(_autoSyncTimer);
@@ -314,11 +493,27 @@ function queueAutoSync(reason = 'change') {
   _autoSyncTimer = setTimeout(async () => {
     _autoSyncTimer = null;
     try {
-      await syncUp({ interactive: false });
+      const res = await syncNow({ interactive: false });
+      await afterSync(res);
     } catch (e) {
       handleAutoSyncFailure(e);
     }
   }, debounce);
+}
+
+/* A merge can rewrite local data (events pulled in from the other device),
+ * so refresh the UI when that happens. */
+async function afterSync(res) {
+  if (!res || res.action !== 'merged' || !res.changedLocally) return;
+  try {
+    await window.WDAPP?.reload?.();
+    window.WDAPP?.renderCurrent?.();
+    const s = res.stats || {};
+    const bits = [];
+    if (s.fromRemote) bits.push(`${s.fromRemote} pulled in`);
+    if (s.conflicts) bits.push(`${s.conflicts} conflict${s.conflicts === 1 ? '' : 's'} auto-resolved`);
+    window.WDAPP?.snack?.(`Merged with Drive${bits.length ? ': ' + bits.join(', ') : ''}`);
+  } catch (e) { console.warn('post-merge refresh failed', e); }
 }
 
 function handleAutoSyncFailure(e) {
@@ -338,9 +533,12 @@ async function startupSync() {
   if (!clientId) return;
   const last = await WDDB.getMeta('lastDriveSync', 0);
   const gap = Date.now() - (last || 0);
-  if (gap < 15 * 60 * 1000) return;  // synced recently
+  // Short gap only: sync is two-way now, so opening the app is how we find
+  // out about edits made on the other device.
+  if (gap < 2 * 60 * 1000) return;
   try {
-    await syncUp({ interactive: false });
+    const res = await syncNow({ interactive: false });
+    await afterSync(res);
   } catch (e) {
     handleAutoSyncFailure(e);
   }
@@ -369,11 +567,17 @@ function openSetupDialog(ctx) {
       <div class="body">
         ${cfgId ? `
           <p>✅ Drive sync is <strong>configured</strong> via <code>config.js</code>.</p>
+          <p style="font-size:13px;color:#666;">Sync is <strong>two-way</strong>: each sync
+          checks whether the file on Drive changed since your last sync and merges both
+          sides (a three-way merge against the last-synced snapshot). Deletions are
+          respected; if the same entry was edited on two devices, the most recently
+          touched device wins.</p>
           <ul>
             <li>Auto-sync on change: ${CFG().autoSyncOnChange ? 'on' : 'off'}</li>
             <li>Auto-sync at startup: ${CFG().autoSyncOnStartup ? 'on' : 'off'}</li>
             <li>Wi-Fi only: ${CFG().wifiOnly ? 'on' : 'off'} (current network: ${wifiLabel})</li>
             <li>Last sync: ${last ? new Date(last).toLocaleString() : 'never'}</li>
+            <li>Snapshots kept on Drive: ${DRIVE_MAX_VERSIONS}</li>
           </ul>
           <p style="font-size:13px;color:#666;">To change any of these, edit
           <code>js/config.js</code> and redeploy the app.</p>
@@ -383,20 +587,32 @@ function openSetupDialog(ctx) {
           Google OAuth Client ID, and redeploy. Detailed steps in the README.
           ${idbId ? '<br>(Legacy IDB Client ID found and will be used as a fallback.)' : ''}</p>
         `}
+        <p style="font-size:13px;color:#666;">Restore from Drive <em>replaces</em> everything on
+        this device with the Drive copy (a safety backup downloads first). Normal
+        <strong>Sync now</strong> merges instead.</p>
         <p style="font-size:13px;color:#666;">Scope used: <code>drive.file</code> — this app
         can only see / modify files it created (folder
         <code>${DRIVE_FOLDER_NAME}/${DRIVE_FILE_NAME}</code> in your Drive).</p>
       </div>
       <div class="actions">
         ${cfgId || idbId ? `<button class="btn secondary" id="driveSyncDown">Restore from Drive</button>` : ''}
-        ${cfgId || idbId ? `<button class="btn" id="driveSyncUp">Sync Now</button>` : '<button class="btn" data-close>OK</button>'}
+        ${cfgId || idbId ? `<button class="btn" id="driveSyncUp">Sync now</button>` : '<button class="btn" data-close>OK</button>'}
       </div>
     `);
     const up = document.getElementById('driveSyncUp');
     if (up) up.addEventListener('click', async () => {
       try {
-        await syncUp({ interactive: true });
-        closeModal(); snack('Synced up to Drive');
+        const res = await syncNow({ interactive: true });
+        if (res.action === 'merged' && res.changedLocally) {
+          await reload(); renderCurrent();
+          const st = res.stats || {};
+          closeModal();
+          snack(`Merged with Drive: ${st.fromRemote || 0} pulled in` +
+            (st.conflicts ? `, ${st.conflicts} conflict(s) auto-resolved` : ''));
+        } else {
+          closeModal();
+          snack(res.action === 'merged' ? 'Drive already up to date' : 'Synced to Drive');
+        }
       } catch (e) {
         snack('Sync failed: ' + e.message);
       }
@@ -427,7 +643,8 @@ if (typeof window !== 'undefined') {
 }
 
 window.WDDRIVE = {
-  syncUp, syncDown, openSetupDialog,
+  syncNow, syncUp, syncDown, openSetupDialog, afterSync,
+  mergeBackups, mergeCollection,
   queueAutoSync, startupSync,
   isOnWifi, wifiOk,
   hasClientId: async () => !!(await getClientId()),

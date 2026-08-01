@@ -1,6 +1,6 @@
 /* WhenDidI PWA - UI controller. Vanilla JS, single-page, 3 views. */
 
-const VIEWS = ['categories', 'recent', 'day', 'stats'];
+const VIEWS = ['categories', 'recent', 'day', 'stats', 'insights'];
 const state = {
   view: 'categories',
   topics: [],
@@ -11,6 +11,12 @@ const state = {
   topicKinds: {}, // topicId -> 'timeonly' | 'duration' | 'amount'
   topicMeta: {},  // topicId -> { emoji, color }
   quickBar: [],   // fixed, user-curated ordered list of topic ids for the quick-access bar
+  topicRoles: {}, // topicId -> 'bathroom' | 'meal' | 'blood' | 'accident' | ...
+  insightSettings: null,
+  insights: null,           // cached result of WDINSIGHTS.analyze()
+  insightsDirty: true,      // recompute on next Insights render
+  insightOutcome: 'goCount',
+  insightLag: 0,
   statsTopicId: null,
   statsPeriod: 'daily',
   chart: null,
@@ -148,13 +154,16 @@ function topicKind(topic) {
 /* ======== DATA LOADING ======== */
 
 async function reload() {
-  const [topics, events, measurements, favIds, topicKinds, topicMeta] = await Promise.all([
+  const [topics, events, measurements, favIds, topicKinds, topicMeta,
+         topicRoles, insightSettings] = await Promise.all([
     WDDB.getAll('topics'),
     WDDB.getAll('events'),
     WDDB.getAll('measurements'),
     WDDB.getFavoriteTopicIds(),
     WDDB.getAllTopicKinds(),
     WDDB.getAllTopicMeta(),
+    WDDB.getTopicRoles(),
+    WDDB.getInsightSettings(),
   ]);
   const savedOrder = (await WDDB.getMeta('topicOrder')) || [];
   const knownIds = new Set(topics.map((t) => t.id));
@@ -179,6 +188,9 @@ async function reload() {
   state.favorites = new Set(favIds);
   state.topicKinds = topicKinds || {};
   state.topicMeta = topicMeta || {};
+  state.topicRoles = topicRoles || {};
+  state.insightSettings = insightSettings;
+  state.insightsDirty = true;
   // Quick-access bar: keep only ids that still map to existing, non-archived topics.
   const savedQuick = (await WDDB.getMeta('quickBar')) || [];
   const validQuick = Array.isArray(savedQuick)
@@ -869,6 +881,455 @@ function drawHeatmap(events) {
   html += '</div>';
   html += `<div class="heatmap-legend">Less <span class="heatmap-cell level-0"></span><span class="heatmap-cell level-1"></span><span class="heatmap-cell level-2"></span><span class="heatmap-cell level-3"></span><span class="heatmap-cell level-4"></span> More · ${mat.total} total in window</div>`;
   root.innerHTML = html;
+}
+
+/* ======== INSIGHTS VIEW ======== */
+
+function insightsSettings() {
+  return state.insightSettings || {
+    cutoffHour: 4, windowDays: 7, insightWindow: 90,
+    alertsEnabled: false, alertOn: 'flare',
+  };
+}
+
+function hasBathroomRole() {
+  return Object.values(state.topicRoles || {}).includes('bathroom');
+}
+
+function computeInsights(force = false) {
+  if (!force && !state.insightsDirty && state.insights) return state.insights;
+  const s = insightsSettings();
+  state.insights = WDINSIGHTS.analyze({
+    events: state.events,
+    topics: state.topics,
+    roles: state.topicRoles,
+    kinds: state.topicKinds,
+    cutoffHour: s.cutoffHour,
+    windowDays: s.windowDays,
+    insightWindow: s.insightWindow,
+  });
+  state.insightsDirty = false;
+  return state.insights;
+}
+
+const STATUS_META = {
+  flare:        { icon: '🔴', title: 'Looks like a flare-up',      cls: 'flare' },
+  watch:        { icon: '🟠', title: 'Worse than usual — keep an eye on it', cls: 'watch' },
+  ok:           { icon: '🟢', title: 'Normal week',                cls: 'ok' },
+  better:       { icon: '🟢', title: 'Better than usual',          cls: 'ok' },
+  insufficient: { icon: '⚪', title: 'Not enough history yet',     cls: 'none' },
+  unknown:      { icon: '⚪', title: 'No baseline yet',            cls: 'none' },
+};
+
+function sigBadge(sig) {
+  if (!sig) return '';
+  const cls = sig.level === 'strong' ? 'sig-strong'
+    : sig.level === 'weak' ? 'sig-weak' : 'sig-none';
+  return `<span class="sig ${cls}">${escapeHtml(sig.label)}</span>`;
+}
+
+function renderInsights() {
+  destroyCharts();
+  const main = $('#main');
+  const N = WDINSIGHTS;
+
+  if (!state.topics.length) {
+    main.innerHTML = `${welcomeBannerHtml()}<div class="empty">Import data or add a topic first.</div>`;
+    bindWelcomeBanner();
+    return;
+  }
+  if (!hasBathroomRole()) {
+    main.innerHTML = `
+      <div class="setup-card">
+        <h3>One-time setup</h3>
+        <p>To answer questions like <em>“is this a flare-up?”</em> or <em>“does a late
+        dinner make the next day worse?”</em>, the app needs to know which of your
+        topics mean what.</p>
+        <p>Tag at least your main <strong>bathroom</strong> topic — plus meals, blood
+        and accidents if you track them.</p>
+        <button class="btn" id="goSetupRoles">Set up insights</button>
+      </div>`;
+    $('#goSetupRoles').addEventListener('click', openRolesSetup);
+    return;
+  }
+
+  const res = computeInsights();
+  const { status, meals, narrative, table } = res;
+  const s = insightsSettings();
+  const meta = STATUS_META[status.level] || STATUS_META.unknown;
+
+  const metricChips = status.metrics.map((m) => {
+    const arrow = m.worse ? '▲' : '▼';
+    const cls = m.elevated ? 'bad' : m.improved ? 'good' : '';
+    const pct = isFinite(m.pct) ? `${m.pct >= 0 ? '+' : ''}${Math.round(m.pct)}%` : '';
+    return `<div class="metric ${cls}">
+      <b>${N.fmtNum(m.current, m.digits)}<small>${escapeHtml(m.unit)}</small></b>
+      <span>${escapeHtml(m.label)}</span>
+      <em>usual ${N.fmtNum(m.baseline, m.digits)} · ${arrow} ${pct}</em>
+    </div>`;
+  }).join('');
+
+  const statusCard = `
+    <div class="status-card ${meta.cls}">
+      <div class="status-head"><span class="status-icon">${meta.icon}</span>
+        <div>
+          <h3>${escapeHtml(meta.title)}</h3>
+          <p class="muted-small">Last ${status.windowDays} days vs your typical
+          ${status.baselineDays ? `${status.baselineDays}-day` : ''} baseline</p>
+        </div>
+      </div>
+      <ul class="status-reasons">${status.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>
+      ${metricChips ? `<div class="metric-row">${metricChips}</div>` : ''}
+      ${status.percentile != null ? `<p class="muted-small">This week ranks higher than
+        <strong>${status.percentile}%</strong> of all weeks on record
+        (${status.windowTotal} trips; worst ever was ${status.worstWindowTotal}).</p>` : ''}
+      <div class="status-actions">
+        <button class="btn secondary small" id="insAlerts">${s.alertsEnabled ? '🔔 Alerts on' : '🔕 Turn on alerts'}</button>
+        <button class="btn secondary small" id="insSetup">⚙️ Topics &amp; settings</button>
+      </div>
+    </div>`;
+
+  const insightItems = narrative.slice(0, 12).map((n) => `
+    <li class="insight ${n.kind === 'test' ? 'is-test' : ''}">
+      <span>${escapeHtml(n.text)}</span>
+      ${n.sig ? sigBadge(n.sig) : ''}
+    </li>`).join('');
+
+  main.innerHTML = `
+    ${statusCard}
+
+    <div class="stats-section">
+      <h3>Trips per day (last 120 days)</h3>
+      <div class="chart-wrap"><canvas id="chartInsTrend"></canvas></div>
+    </div>
+
+    <div class="stats-section">
+      <h3>What stands out (last ${s.insightWindow} days)</h3>
+      ${insightItems
+        ? `<ul class="insight-list">${insightItems}</ul>`
+        : `<p class="muted-small">Not enough data yet — keep logging.</p>`}
+      <p class="muted-small">“Significant” means it survived a false-discovery
+      correction across every combination tested, and passed both a parametric
+      and a rank-based test. Correlation still isn’t causation.</p>
+    </div>
+
+    ${renderMealSection(meals, table)}
+
+    <div class="stats-section">
+      <h3>What moves the needle</h3>
+      <div class="stats-bar ins-controls">
+        <select id="insOutcome">${res.outcomes.map((o) =>
+          `<option value="${o.key}" ${o.key === state.insightOutcome ? 'selected' : ''}>${escapeHtml(o.label)}</option>`
+        ).join('')}</select>
+        <select id="insLag">
+          <option value="0" ${state.insightLag === 0 ? 'selected' : ''}>same day</option>
+          <option value="1" ${state.insightLag === 1 ? 'selected' : ''}>next day</option>
+        </select>
+      </div>
+      ${renderExplorer(res)}
+    </div>
+  `;
+
+  $('#insAlerts').addEventListener('click', openAlertsDialog);
+  $('#insSetup').addEventListener('click', openRolesSetup);
+  $('#insOutcome').addEventListener('change', (e) => {
+    state.insightOutcome = e.target.value; renderInsights();
+  });
+  $('#insLag').addEventListener('change', (e) => {
+    state.insightLag = Number(e.target.value); renderInsights();
+  });
+  drawInsightsTrend(table);
+}
+
+function renderMealSection(meals, table) {
+  if (!table.hasMeals) {
+    return `<div class="stats-section">
+      <h3>Meal timing</h3>
+      <p class="muted-small">Tag a topic as <strong>Meal / food</strong> in
+      ⚙️ Topics &amp; settings to test whether first- or last-meal timing
+      affects your day.</p></div>`;
+  }
+  if (!meals.length) {
+    return `<div class="stats-section">
+      <h3>Meal timing</h3>
+      <p class="muted-small">Not enough overlapping meal + bathroom days yet.</p></div>`;
+  }
+  const N = WDINSIGHTS;
+  const verdict = (q, p) => {
+    if (isFinite(q)) {
+      if (q < 0.05) return { txt: 'Yes', cls: 'sig-strong' };
+      if (q < 0.15) return { txt: 'Maybe', cls: 'sig-weak' };
+      return { txt: 'No clear effect', cls: 'sig-none' };
+    }
+    // Too few days for the corrected panel — judge on the raw p, conservatively.
+    if (!isFinite(p)) return { txt: 'Not enough data', cls: 'sig-none' };
+    if (p < 0.01) return { txt: 'Maybe (few days)', cls: 'sig-weak' };
+    return { txt: 'No clear effect', cls: 'sig-none' };
+  };
+  const groups = {};
+  for (const m of meals) {
+    if (!isFinite(m.p)) continue;               // nothing testable
+    if (m.earlyMean === 0 && m.lateMean === 0) continue;  // never happens
+    (groups[m.predictor] = groups[m.predictor] || []).push(m);
+  }
+  const cards = Object.entries(groups).map(([pred, rows]) => {
+    const body = rows.map((r) => {
+      const v = verdict(r.q, r.p);
+      const isBinary = r.outcomeKind === 'binary';
+      const fmtV = (x) => (isBinary ? `${Math.round(x * 100)}% of days` : N.fmtNum(x, 1));
+      const dir = r.delta > 0 ? 'more' : 'less';
+      const pTxt = r.p < 0.0001 ? 'p&lt;0.0001' : `p=${N.fmtNum(r.p, 4)}`;
+      const qTxt = !isFinite(r.q) ? '' : (r.q < 0.001 ? ' · q&lt;0.001' : ` · q=${N.fmtNum(r.q, 3)}`);
+      return `<div class="meal-row">
+        <div class="meal-q">
+          <strong>${escapeHtml(r.outcome)}</strong>
+          <span class="muted-small">${r.lag === 1 ? 'next day' : 'same day'} · n=${r.n}</span>
+        </div>
+        <div class="meal-v">
+          <span class="sig ${v.cls}">${v.txt}</span>
+          <span class="muted-small">${escapeHtml(r.lateLabel)}: ${fmtV(r.lateMean)}
+          vs ${escapeHtml(r.earlyLabel)}: ${fmtV(r.earlyMean)}
+          ${isFinite(r.pct) && Math.abs(r.pct) >= 1 ? `(${r.pct >= 0 ? '+' : ''}${Math.round(r.pct)}% ${dir})` : ''}</span>
+          <span class="muted-small">${pTxt}${qTxt}</span>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="meal-card"><h4>Does a later <em>${escapeHtml(pred.toLowerCase())}</em> change…</h4>${body}</div>`;
+  }).join('');
+
+  return `<div class="stats-section">
+    <h3>Meal timing</h3>
+    <p class="muted-small">Compares your latest third of days against your earliest
+    third for each meal time.</p>
+    ${cards}
+  </div>`;
+}
+
+function renderExplorer(res) {
+  const N = WDINSIGHTS;
+  const outcomeKey = res.outcomes.find((o) => o.key === state.insightOutcome)
+    ? state.insightOutcome
+    : (res.outcomes[0]?.key || 'goCount');
+  state.insightOutcome = outcomeKey;
+  const rows = res.tests
+    .filter((t) => t.outcomeKey === outcomeKey && t.lag === state.insightLag)
+    .sort((a, b) => a.p - b.p)
+    .slice(0, 15);
+  if (!rows.length) {
+    return `<p class="muted-small">No predictor had enough overlapping days
+      (need ${20}+) for this combination.</p>`;
+  }
+  const body = rows.map((t) => {
+    const sig = N.significanceLabel(t);
+    const cls = sig.level === 'strong' ? 'sig-strong' : sig.level === 'weak' ? 'sig-weak' : 'sig-none';
+    let effect;
+    if (!t.groupMode) {
+      effect = `r=${N.fmtNum(t.r, 2)}`;
+    } else {
+      const delta = t.meanA - t.meanB;
+      const sign = delta > 0 ? '+' : '';
+      // When the *predictor* is what differs between groups, show its unit.
+      const unit = t.groupMode === 'outcome'
+        ? (t.predictorType === 'time' ? ' min' : t.predictorType === 'hours' ? 'h' : '')
+        : (t.outcomeUnit === ' min' ? ' min' : '');
+      effect = `${sign}${N.fmtNum(delta, 1)}${unit}`;
+    }
+    return `<tr class="${cls}">
+      <td>${escapeHtml(t.predictorLabel)}</td>
+      <td class="num">${escapeHtml(effect)}</td>
+      <td class="num">${t.n}</td>
+      <td class="num">${t.p < 0.0001 ? '&lt;0.0001' : N.fmtNum(t.p, 4)}</td>
+      <td class="num">${!isFinite(t.q) ? '—' : t.q < 0.001 ? '&lt;0.001' : N.fmtNum(t.q, 3)}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="table-wrap"><table class="ins-table">
+    <thead><tr><th>Predictor</th><th class="num">Effect</th><th class="num">n</th>
+    <th class="num">p</th><th class="num">q</th></tr></thead>
+    <tbody>${body}</tbody></table></div>
+    <p class="muted-small">Rows are green when they survive FDR correction (q&lt;0.05),
+    amber when suggestive (q&lt;0.15). “Effect” is r for numeric predictors, or the
+    difference in means for yes/no predictors.</p>`;
+}
+
+function drawInsightsTrend(table) {
+  const canvas = $('#chartInsTrend');
+  if (!canvas) return;
+  const days = table.days.slice(-120);
+  if (days.length < 5) return;
+  const labels = days.map((r) => `${r.date.getMonth() + 1}/${r.date.getDate()}`);
+  const counts = days.map((r) => r.goCount);
+  const roll = WDINSIGHTS.rolling(counts, 7);
+  const baseline = WDINSIGHTS.median(
+    table.days.slice(-97, -7).map((r) => r.goCount)
+  );
+  state.charts.insTrend = new Chart(canvas, {
+    data: {
+      labels,
+      datasets: [
+        { type: 'bar', label: 'trips', data: counts, backgroundColor: '#cfd8dc', order: 3 },
+        { type: 'line', label: '7-day avg', data: roll, borderColor: '#8a5a2b',
+          borderWidth: 2, pointRadius: 0, tension: 0.3, order: 1 },
+        ...(isFinite(baseline) ? [{
+          type: 'line', label: 'baseline', data: labels.map(() => baseline),
+          borderColor: '#76c98b', borderWidth: 1, borderDash: [5, 4],
+          pointRadius: 0, order: 2,
+        }] : []),
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: true, labels: { boxWidth: 10, font: { size: 10 } } } },
+      scales: {
+        x: { ticks: { maxTicksLimit: 8, font: { size: 9 } } },
+        y: { beginAtZero: true, ticks: { precision: 0 } },
+      },
+    },
+  });
+}
+
+/* ---- role setup ---- */
+
+function openRolesSetup() {
+  const roleOpts = (cur) =>
+    ['<option value="">— none —</option>']
+      .concat(WDINSIGHTS.ROLES.map((r) =>
+        `<option value="${r.key}" ${cur === r.key ? 'selected' : ''}>${r.icon} ${escapeHtml(r.label)}</option>`))
+      .join('');
+  const topics = state.topics.filter((t) => !t.archived);
+  const rows = topics.map((t) => `
+    <div class="role-row">
+      <div class="role-name">${escapeHtml(topicEmoji(t))} ${escapeHtml(t.name)}</div>
+      <select data-role-topic="${t.id}">${roleOpts(state.topicRoles[t.id] || '')}</select>
+    </div>`).join('');
+  const s = insightsSettings();
+  const hourOpts = [0, 1, 2, 3, 4, 5, 6].map((h) =>
+    `<option value="${h}" ${s.cutoffHour === h ? 'selected' : ''}>${h}:00</option>`).join('');
+
+  openModal(`
+    <header><button class="icon-btn" data-close>←</button><div class="title">Insights setup</div></header>
+    <div class="body">
+      <p class="muted-small">Tell the app what each topic means so it can test the
+      right things. Only <strong>Bathroom trip</strong> is required.</p>
+      ${rows}
+      <div class="role-row" style="margin-top:14px;">
+        <div class="role-name">Day starts at<br>
+          <span class="muted-small">A 2am trip counts toward the night before.</span></div>
+        <select id="insCutoff">${hourOpts}</select>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn secondary" data-close>Cancel</button>
+      <button class="btn" id="saveRoles">Save</button>
+    </div>
+  `);
+  $('#saveRoles').addEventListener('click', async () => {
+    const map = {};
+    $$('[data-role-topic]').forEach((sel) => {
+      if (sel.value) map[Number(sel.dataset.roleTopic)] = sel.value;
+    });
+    await WDDB.setTopicRoles(map);
+    state.topicRoles = map;
+    const cutoffHour = Number($('#insCutoff').value);
+    state.insightSettings = await WDDB.setInsightSettings({ cutoffHour });
+    state.insightsDirty = true;
+    closeModal();
+    snack('Insights settings saved');
+    setView('insights');
+  });
+}
+
+/* ---- alerts ---- */
+
+function openAlertsDialog() {
+  const s = insightsSettings();
+  const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
+  openModal(`
+    <header><button class="icon-btn" data-close>←</button><div class="title">Flare-up alerts</div></header>
+    <div class="body">
+      <p>Get a notification when your recent week looks worse than your own
+      baseline — more trips, more time, or blood / accidents above your normal rate.</p>
+      <label class="row-toggle">
+        <input type="checkbox" id="alertsOn" ${s.alertsEnabled ? 'checked' : ''} />
+        <span>Enable flare-up alerts</span>
+      </label>
+      <label class="row-toggle">
+        <span>Alert me when status is</span>
+        <select id="alertOn">
+          <option value="flare" ${s.alertOn === 'flare' ? 'selected' : ''}>flare only</option>
+          <option value="watch" ${s.alertOn === 'watch' ? 'selected' : ''}>watch or worse</option>
+        </select>
+      </label>
+      <p class="muted-small">Notification permission: <strong>${perm}</strong>.
+      The check runs whenever you open the app (at most once every
+      ${s.alertCooldownHours || 20} hours). A web app can’t reliably wake itself in
+      the background, so this is a when-you-open-it nudge, not a background monitor.</p>
+      ${s.lastAlertAt ? `<p class="muted-small">Last alert: ${fmtDateLong(s.lastAlertAt)} ${fmtTime(s.lastAlertAt)}</p>` : ''}
+    </div>
+    <div class="actions">
+      <button class="btn secondary" id="alertTest">Test now</button>
+      <button class="btn" id="alertSave">Save</button>
+    </div>
+  `);
+  $('#alertSave').addEventListener('click', async () => {
+    const enabled = $('#alertsOn').checked;
+    if (enabled && 'Notification' in window && Notification.permission === 'default') {
+      try { await Notification.requestPermission(); } catch (_) {}
+    }
+    state.insightSettings = await WDDB.setInsightSettings({
+      alertsEnabled: enabled,
+      alertOn: $('#alertOn').value,
+    });
+    closeModal();
+    snack(enabled ? 'Flare alerts on' : 'Flare alerts off');
+    if (state.view === 'insights') renderInsights();
+  });
+  $('#alertTest').addEventListener('click', async () => {
+    const res = computeInsights(true);
+    await showFlareNotification(res.status, true);
+    snack(`Current status: ${res.status.level}`);
+  });
+}
+
+async function showFlareNotification(status, isTest = false) {
+  const meta = STATUS_META[status.level] || STATUS_META.unknown;
+  const body = status.reasons.slice(0, 3).join('\n');
+  const title = isTest ? `WhenDidI: ${meta.title}` : meta.title;
+  try {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      const reg = await navigator.serviceWorker?.getRegistration?.();
+      if (reg?.showNotification) {
+        await reg.showNotification(title, { body, tag: 'whendidi-flare', icon: 'icons/icon-192.png' });
+      } else {
+        new Notification(title, { body, tag: 'whendidi-flare' });
+      }
+      return true;
+    }
+  } catch (e) { console.warn('notification failed', e); }
+  if (isTest) snack('Notifications not permitted — showing in-app only');
+  return false;
+}
+
+/* Runs at startup: if the current window looks bad and we haven't nagged
+ * recently, fire a notification + in-app snackbar. */
+async function checkFlareAlert() {
+  const s = insightsSettings();
+  if (!s.alertsEnabled) return;
+  if (!hasBathroomRole()) return;
+  const cooldown = (s.alertCooldownHours || 20) * 3600000;
+  if (s.lastAlertAt && Date.now() - s.lastAlertAt < cooldown) return;
+  let res;
+  try { res = computeInsights(true); } catch (e) { console.warn(e); return; }
+  const level = res.status.level;
+  const trigger = s.alertOn === 'watch'
+    ? (level === 'watch' || level === 'flare')
+    : level === 'flare';
+  if (!trigger) return;
+  await showFlareNotification(res.status);
+  snack(`${STATUS_META[level].icon} ${STATUS_META[level].title} — see Insights`);
+  state.insightSettings = await WDDB.setInsightSettings({
+    lastAlertAt: Date.now(), lastAlertLevel: level,
+  });
 }
 
 /* ======== ADD / EDIT EVENT MODAL ======== */
@@ -1588,8 +2049,15 @@ function openWipe() {
       await WDDB.seedDefaults();
       closeModal();
       await reload();
-      snack('All data wiped');
-      queueAutoSync('wipe');
+      // A wipe must overwrite Drive rather than merge, otherwise the next
+      // sync would helpfully restore everything we just deleted.
+      let msg = 'All data wiped';
+      try {
+        await window.WDDRIVE?.syncNow?.({ interactive: false, force: true });
+      } catch (e) {
+        if (e && e.message !== 'NO_CLIENT_ID') msg += ' (Drive copy unchanged)';
+      }
+      snack(msg);
       renderCurrent();
     },
     'Wipe everything'
@@ -1612,6 +2080,7 @@ function renderCurrent() {
   else if (state.view === 'recent') renderRecent();
   else if (state.view === 'day') renderDay();
   else if (state.view === 'stats') renderStats();
+  else if (state.view === 'insights') renderInsights();
 }
 
 /* ======== MODAL / SNACKBAR / DRAWER ======== */
@@ -1788,6 +2257,7 @@ function escapeHtml(s) {
 
 /* ======== AUTO-SYNC (calls into drive.js if configured) ======== */
 function queueAutoSync(reason = 'change') {
+  state.insightsDirty = true;   // data changed -> recompute insights lazily
   if (window.WDDRIVE?.queueAutoSync) {
     window.WDDRIVE.queueAutoSync(reason);
   }
@@ -1853,8 +2323,13 @@ async function init() {
     e.stopPropagation();
     if (!window.WDDRIVE) return;
     try {
-      await window.WDDRIVE.syncUp({ interactive: true });
-      snack('Synced');
+      const res = await window.WDDRIVE.syncNow({ interactive: true });
+      if (res?.action === 'merged' && res.changedLocally) {
+        await reload(); renderCurrent();
+        snack(`Merged with Drive: ${res.stats?.fromRemote || 0} pulled in`);
+      } else {
+        snack('Synced');
+      }
     } catch (err) {
       snack('Sync failed: ' + err.message);
     }
@@ -1869,6 +2344,8 @@ async function init() {
   $('#navBackup').addEventListener('click', () => { closeDrawer(); doSafetyBackup(); });
   $('#navTopics').addEventListener('click', () => { closeDrawer(); openTopicsManager(); });
   $('#navQuickBar').addEventListener('click', () => { closeDrawer(); openQuickBarManager(); });
+  $('#navRoles').addEventListener('click', () => { closeDrawer(); openRolesSetup(); });
+  $('#navAlerts').addEventListener('click', () => { closeDrawer(); openAlertsDialog(); });
   $('#navDrive').addEventListener('click', () => { closeDrawer(); openDrive(); });
   $('#navAbout').addEventListener('click', () => { closeDrawer(); openAbout(); });
   $('#navStorage').addEventListener('click', () => { closeDrawer(); openStorageStatus(); });
@@ -1892,6 +2369,9 @@ async function init() {
   if (window.WDDRIVE?.startupSync) {
     try { await window.WDDRIVE.startupSync(); } catch (_) {}
   }
+
+  // Flare-up check (opt-in, throttled).
+  try { await checkFlareAlert(); } catch (e) { console.warn(e); }
 }
 
 window.addEventListener('DOMContentLoaded', init);

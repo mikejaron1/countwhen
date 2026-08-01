@@ -6,7 +6,38 @@ const REQUIRED_KEYS = ['topics', 'events'];
 const KNOWN_TOP_KEYS = new Set([
   'version', 'saveddatelong', 'saveddate', 'eventcount', 'topiccount',
   'measurements', 'pendtimes', 'topics', 'events', 'appdata',
+  '_wdapp',
 ]);
+
+/* In-app settings that live in the `meta` store rather than in the original
+ * backup schema. They ride along in a `_wdapp` key so a Drive round-trip (or
+ * a manual export/import) keeps topic colors, kinds, roles and the
+ * quick-access bar. The original Android app ignores unknown keys. */
+const APP_META_KEYS = [
+  'topicKinds', 'topicMeta', 'topicOrder', 'quickBar',
+  'topicRoles', 'insightSettings',
+];
+
+async function buildAppMeta() {
+  const out = {};
+  for (const k of APP_META_KEYS) {
+    const v = await WDDB.getMeta(k);
+    if (v != null) out[k] = v;
+  }
+  const favs = await WDDB.getAll('favorites');
+  if (favs.length) out.favorites = favs;
+  return out;
+}
+
+async function applyAppMeta(app) {
+  if (!app || typeof app !== 'object') return;
+  for (const k of APP_META_KEYS) {
+    if (app[k] != null) await WDDB.setMeta(k, app[k]);
+  }
+  if (Array.isArray(app.favorites) && app.favorites.length) {
+    await WDDB.putMany('favorites', app.favorites);
+  }
+}
 
 function formatSavedDate(d) {
   const months = ['Jan','Feb','Mar','Apr','May','Jun',
@@ -139,6 +170,7 @@ async function importMerge(obj) {
     if (add.length) await WDDB.putMany('appdata', add);
   }
 
+  if (obj._wdapp) await applyAppMeta(obj._wdapp);
   await preserveUnknownKeys(obj);
 }
 
@@ -157,6 +189,7 @@ async function applyBackup(obj) {
   if (Array.isArray(obj.events)) await WDDB.putMany('events', obj.events);
   if (Array.isArray(obj.appdata)) await WDDB.putMany('appdata', obj.appdata);
 
+  await applyAppMeta(obj._wdapp);
   await preserveUnknownKeys(obj);
   await WDDB.setMeta('lastImport', Date.now());
   await WDDB.setMeta('originalVersion', obj.version ?? 4);
@@ -194,6 +227,7 @@ async function buildExportObject() {
   pendtimes.sort((a, b) => a.id - b.id);
 
   const version = await WDDB.getMeta('originalVersion', 4);
+  const appMeta = await buildAppMeta();
   const out = {
     version,
     saveddatelong: now.getTime(),
@@ -205,6 +239,7 @@ async function buildExportObject() {
     topics,
     events,
     appdata,
+    _wdapp: appMeta,
   };
 
   const extras = await WDDB.getMeta('extraTopKeys', {});
@@ -323,6 +358,10 @@ async function safetyBackup() {
 }
 
 window.WDIO = {
+  APP_META_KEYS,
+  buildAppMeta,
+  applyAppMeta,
+  applyBackup,
   validateBackup,
   summarize,
   importReplace,
