@@ -414,7 +414,8 @@ body {
   flex: 1;
   overflow-y: auto;
 }
-.drawer .panel nav button {
+.drawer .panel nav button,
+.drawer .panel nav a.drawer-link {
   display: block;
   width: 100%;
   text-align: left;
@@ -426,7 +427,12 @@ body {
   cursor: pointer;
   color: var(--ink);
 }
-.drawer .panel nav button:active { background: var(--tan-bg); }
+.drawer .panel nav a.drawer-link {
+  box-sizing: border-box;
+  text-decoration: none;
+}
+.drawer .panel nav button:active,
+.drawer .panel nav a.drawer-link:active { background: var(--tan-bg); }
 .drawer .panel nav .section {
   font-size: 11px;
   color: var(--ink-soft);
