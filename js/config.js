@@ -1,11 +1,11 @@
-/* WhenDidI - configuration.
+/* CountWhen - configuration.
  * Edit this file once and redeploy.
  *
  * To enable Google Drive sync:
  *   1. Create a Google OAuth Client ID (Web application) in Google
  *      Cloud Console — see README for the 6-step walkthrough.
  *   2. Paste it as `driveClientId` below.
- *   3. Save, redeploy (drag webapp/ back onto Netlify, or git push).
+ *   3. Save, then run ./deploy.sh to publish.
  *   4. Reload the app on your phone — Drive sync now works.
  *
  * Everything else has sensible defaults; leave it alone unless you
@@ -15,7 +15,7 @@
 /* App version — BUMP THIS on every change so you can confirm which
  * build is actually running on your device. Shown at the bottom of
  * the ☰ menu. Keep it in sync with CACHE_VERSION in sw.js. */
-window.WD_VERSION = 'v6.1 · 2026-08-09';
+window.WD_VERSION = 'v7.0 · CountWhen · 2026-08-11';
 
 window.WD_CONFIG = {
   // Google OAuth 2.0 Client ID (Web application). Looks like:

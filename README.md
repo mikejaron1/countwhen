@@ -1,17 +1,28 @@
-# WhenDidI (PWA replacement)
+# CountWhen
 
-A self-hosted, offline-first Progressive Web App that replaces the
-discontinued **WhenDidI – Event Tracker** Android app (SJM Apps, last
-updated 2018). Imports and exports the exact same `whendidibk.json`
-backup format, so your years of history come along for the ride.
+**Count what happens, know when.**
 
-> Built specifically as a drop-in replacement for a Pixel 10 Pro user
-> whose original install no longer works. Should be just as useful
-> for anyone in the same boat.
+A self-hosted, offline-first Progressive Web App for tracking how often
+something happens and how long it's been since the last time — then
+telling you what actually moves those numbers.
+
+Log anything you want to keep a count of (symptoms, meds, water, habits,
+chores, moods), see time-since-last at a glance, and let the built-in
+statistics engine surface real, FDR-corrected correlations rather than
+pretty charts.
+
+Everything lives on your device (IndexedDB) and, optionally, in your own
+Google Drive. There is no server, no account, and no analytics.
+
+> **Migrating from WhenDidI?** CountWhen reads and writes the exact
+> `whendidibk.json` backup format used by the discontinued
+> *WhenDidI – Event Tracker* Android app (SJM Apps, last updated 2018),
+> so years of existing history import cleanly. See
+> [Data format](#data-format).
 
 ## Live URL
 
-**<https://mikejaron1.github.io/whendidi-pwa/>**
+**<https://mikejaron1.github.io/countwhen/>**
 
 Open in Chrome on your phone, tap ⋮ → **Install app**. Done.
 
@@ -20,7 +31,7 @@ Open in Chrome on your phone, tap ⋮ → **Install app**. Done.
 This repo auto-deploys to GitHub Pages on every push to `main`.
 
 ```sh
-cd ~/projects/whendidi-pwa
+cd ~/projects/countwhen
 # (make edits)
 ./deploy.sh "what changed"
 # Wait ~30-60s for Pages to rebuild, then reload the app on the phone.
@@ -33,7 +44,7 @@ No drag-and-drop, no console clicks. Pages handles the rest.
 ### Logging
 
 - **Categories** — full topic list with time-since-last + last-event
-  date, just like the original. Big blue ADD button per row. **Long-
+  date, just like the original. Big amber ADD button per row. **Long-
   press a card** to drag it into a new order; the order is saved.
   Tap a card to edit/archive/delete the topic. **+ New topic** button
   at the end of the list.
@@ -118,7 +129,7 @@ finding.
 
 ### Step 1 — Open the URL in Chrome
 
-<https://mikejaron1.github.io/whendidi-pwa/>
+<https://mikejaron1.github.io/countwhen/>
 
 ### Step 2 — Install on the phone
 
@@ -141,7 +152,7 @@ finding.
 The simplest dev loop:
 
 ```sh
-cd ~/projects/whendidi-pwa
+cd ~/projects/countwhen
 python3 -m http.server 8000
 ```
 
@@ -187,13 +198,13 @@ this up once:
 9. Save the file, then deploy:
 
    ```sh
-   cd ~/projects/whendidi-pwa
+   cd ~/projects/countwhen
    ./deploy.sh "enable drive sync"
    ```
 
    (Or commit + push manually.)
 10. Reload the app on your phone. The first time it syncs you'll see
-    Google's "unverified app" warning — tap *Advanced → Go to WhenDidI
+    Google's "unverified app" warning — tap *Advanced → Go to CountWhen
     (unsafe)* (it's *your* Cloud project, talking to *your* Drive).
 
 That's it — you'll never need to touch the OAuth setup again. The app
@@ -244,12 +255,16 @@ Other behaviour:
   device gets your setup too. The key is ignored by the original app.
 
 Scope used: `drive.file` — the app can only see / modify files it
-creates. The sync file lives at `WhenDidI/whendidibk.json` in your
-Drive. Nothing else in your Drive is visible to the app.
+creates. The sync file lives at `CountWhen/whendidibk.json` in your
+Drive. Nothing else in your Drive is visible to the app. (If you're
+upgrading from the old app, an existing `WhenDidI` folder is renamed
+to `CountWhen` in place, so file IDs and version history survive.)
 
 ## Data format
 
-100% compatible with the original `whendidibk.json`. Top-level keys:
+CountWhen stores and exchanges data as `whendidibk.json` — the same
+format used by the original WhenDidI app, kept byte-compatible so
+backups move both ways. Top-level keys:
 
 ```jsonc
 {

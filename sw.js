@@ -1,9 +1,9 @@
-/* WhenDidI - Service Worker.
+/* CountWhen - Service Worker.
  * Versioned cache for app shell. Network bypassed for user JSON files.
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'whendidi-v6.1-2026-08-09';
+const CACHE_VERSION = 'countwhen-v7.0-2026-08-11';
 
 const SHELL = [
   './',

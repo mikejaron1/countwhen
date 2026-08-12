@@ -1,4 +1,4 @@
-/* WhenDidI - Import / Export
+/* CountWhen - Import / Export
  * Round-trips the original whendidibk.json format byte-compatibly.
  */
 
@@ -340,7 +340,7 @@ async function exportToCsv(filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = filename || 'whendidi-events.csv';
+  a.download = filename || 'countwhen-events.csv';
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

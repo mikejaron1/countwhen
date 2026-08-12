@@ -1,18 +1,26 @@
 {
-  "id": "/whendidi-pwa/",
-  "name": "WhenDidI — Event Tracker",
-  "short_name": "WhenDidI",
-  "description": "Event tracker — log when things happen and review your history. Offline-first.",
+  "id": "/countwhen/",
+  "name": "CountWhen — Event Tracker",
+  "short_name": "CountWhen",
+  "description": "Count what happens, know when. Log events in one tap and spot the patterns in your history. Offline-first.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
-  "display_override": ["standalone", "minimal-ui"],
+  "display_override": [
+    "standalone",
+    "minimal-ui"
+  ],
   "orientation": "portrait",
   "lang": "en-US",
   "dir": "ltr",
-  "categories": ["health", "lifestyle", "productivity", "utilities"],
-  "background_color": "#fafafa",
-  "theme_color": "#5a3a1c",
+  "categories": [
+    "health",
+    "lifestyle",
+    "productivity",
+    "utilities"
+  ],
+  "background_color": "#f4f6fb",
+  "theme_color": "#161c30",
   "icons": [
     {
       "src": "icons/icon-192.png",

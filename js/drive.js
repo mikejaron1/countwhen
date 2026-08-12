@@ -1,4 +1,4 @@
-/* WhenDidI - Google Drive sync (optional).
+/* CountWhen - Google Drive sync (optional).
  *
  * Configuration lives in js/config.js — set window.WD_CONFIG.driveClientId
  * to your OAuth Client ID and the rest is automatic:
@@ -11,7 +11,12 @@
  */
 
 const DRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
-const DRIVE_FOLDER_NAME = 'WhenDidI';
+const DRIVE_FOLDER_NAME = 'CountWhen';
+/* Installs that synced before the CountWhen rebrand have their backups in a
+ * folder called 'WhenDidI'. We rename that folder in place rather than
+ * creating a new one, so existing file IDs (and the version history inside)
+ * are preserved. */
+const DRIVE_LEGACY_FOLDER_NAME = 'WhenDidI';
 const DRIVE_FILE_NAME = 'whendidibk.json';
 const DRIVE_MAX_VERSIONS = 5; // rotated snapshots
 
@@ -148,12 +153,33 @@ async function driveFetch(path, opts = {}) {
 }
 
 async function findOrCreateFolder() {
-  const q = encodeURIComponent(
-    `mimeType='application/vnd.google-apps.folder' and name='${DRIVE_FOLDER_NAME}' and trashed=false`
-  );
-  const resp = await driveFetch(`/drive/v3/files?q=${q}&fields=files(id,name)&spaces=drive`);
-  const data = await resp.json();
-  if (data.files && data.files.length) return data.files[0].id;
+  const findByName = async (name) => {
+    const q = encodeURIComponent(
+      `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`
+    );
+    const resp = await driveFetch(`/drive/v3/files?q=${q}&fields=files(id,name)&spaces=drive`);
+    const data = await resp.json();
+    return (data.files && data.files[0]) || null;
+  };
+
+  const current = await findByName(DRIVE_FOLDER_NAME);
+  if (current) return current.id;
+
+  // Pre-rebrand folder: rename in place so the existing backup and its
+  // version history carry over instead of being orphaned.
+  const legacy = await findByName(DRIVE_LEGACY_FOLDER_NAME);
+  if (legacy) {
+    try {
+      await driveFetch(`/drive/v3/files/${legacy.id}?fields=id`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: DRIVE_FOLDER_NAME }),
+      });
+    } catch (e) {
+      console.warn('Could not rename legacy Drive folder; using it as-is.', e);
+    }
+    return legacy.id;
+  }
 
   const createResp = await driveFetch('/drive/v3/files?fields=id', {
     method: 'POST',
@@ -227,7 +253,7 @@ const FILE_FIELDS = 'id,name,modifiedTime,md5Checksum,size';
 
 async function createSyncFile(folderId, obj) {
   const json = JSON.stringify(obj);
-  const boundary = '-------whendidi-boundary-' + Math.random().toString(36).slice(2);
+  const boundary = '-------countwhen-boundary-' + Math.random().toString(36).slice(2);
   const metadata = { name: DRIVE_FILE_NAME, parents: [folderId], mimeType: 'application/json' };
   const body =
     `--${boundary}\r\n` +

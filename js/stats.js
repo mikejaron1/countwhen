@@ -1,4 +1,4 @@
-/* WhenDidI - Statistics aggregation
+/* CountWhen - Statistics aggregation
  * Buckets events by day / week (Mon-start) / month for a single topic.
  * Plus intervals, time-of-day, day-of-week, calendar heatmap, and
  * cross-topic correlations.

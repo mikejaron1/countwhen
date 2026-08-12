@@ -1,4 +1,4 @@
-/* WhenDidI PWA - UI controller. Vanilla JS, single-page, 3 views. */
+/* CountWhen - UI controller. Vanilla JS, single-page, 3 views. */
 
 const VIEWS = ['categories', 'recent', 'day', 'stats', 'insights'];
 const state = {
@@ -801,6 +801,22 @@ function renderStats() {
   drawHeatmap(events);
 }
 
+/* Chart.js theming — follows the app's light/dark tokens so axis labels
+ * and gridlines stay readable in both schemes. */
+const CHART = {
+  primary:  '#ff7a2f',
+  violet:   '#6b5bd6',
+  teal:     '#12b3a6',
+  neutral:  '#94a3b8',
+  baseline: '#17a673',
+};
+function applyChartTheme() {
+  if (typeof Chart === 'undefined') return;
+  const dark = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+  Chart.defaults.color = dark ? '#a2abc2' : '#5f6880';
+  Chart.defaults.borderColor = dark ? '#2a3247' : '#e4e8f2';
+}
+
 function drawOverTime(events, topic) {
   const canvas = $('#chartOverTime');
   if (!canvas) return;
@@ -809,9 +825,10 @@ function drawOverTime(events, topic) {
   const slice = rows.slice(0, cutoff).reverse();
   const labels = slice.map((r) => WDSTATS.labelFor(state.statsPeriod, r.bucket));
   const counts = slice.map((r) => r.count);
+  applyChartTheme();
   state.charts.overTime = new Chart(canvas, {
     type: 'bar',
-    data: { labels, datasets: [{ label: 'count', data: counts, backgroundColor: '#6fa8c4' }] },
+    data: { labels, datasets: [{ label: 'count', data: counts, backgroundColor: CHART.primary, borderRadius: 4 }] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -826,9 +843,10 @@ function drawTimeOfDay(events) {
   if (!canvas) return;
   const buckets = WDSTATS.timeOfDay(events);
   const labels = buckets.map((_, i) => `${i}`);
+  applyChartTheme();
   state.charts.tod = new Chart(canvas, {
     type: 'bar',
-    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: '#8a5a2b' }] },
+    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: CHART.violet, borderRadius: 4 }] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -843,9 +861,10 @@ function drawDayOfWeek(events) {
   if (!canvas) return;
   const buckets = WDSTATS.dayOfWeek(events);
   const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  applyChartTheme();
   state.charts.dow = new Chart(canvas, {
     type: 'bar',
-    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: '#e2a920' }] },
+    data: { labels, datasets: [{ label: 'count', data: buckets, backgroundColor: CHART.teal, borderRadius: 4 }] },
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -1162,16 +1181,17 @@ function drawInsightsTrend(table) {
   const baseline = WDINSIGHTS.median(
     table.days.slice(-97, -7).map((r) => r.goCount)
   );
+  applyChartTheme();
   state.charts.insTrend = new Chart(canvas, {
     data: {
       labels,
       datasets: [
-        { type: 'bar', label: 'trips', data: counts, backgroundColor: '#cfd8dc', order: 3 },
-        { type: 'line', label: '7-day avg', data: roll, borderColor: '#8a5a2b',
+        { type: 'bar', label: 'trips', data: counts, backgroundColor: CHART.neutral, borderRadius: 3, order: 3 },
+        { type: 'line', label: '7-day avg', data: roll, borderColor: CHART.primary,
           borderWidth: 2, pointRadius: 0, tension: 0.3, order: 1 },
         ...(isFinite(baseline) ? [{
           type: 'line', label: 'baseline', data: labels.map(() => baseline),
-          borderColor: '#76c98b', borderWidth: 1, borderDash: [5, 4],
+          borderColor: CHART.baseline, borderWidth: 1, borderDash: [5, 4],
           pointRadius: 0, order: 2,
         }] : []),
       ],
@@ -1294,14 +1314,14 @@ function openAlertsDialog() {
 async function showFlareNotification(status, isTest = false) {
   const meta = STATUS_META[status.level] || STATUS_META.unknown;
   const body = status.reasons.slice(0, 3).join('\n');
-  const title = isTest ? `WhenDidI: ${meta.title}` : meta.title;
+  const title = isTest ? `CountWhen: ${meta.title}` : meta.title;
   try {
     if ('Notification' in window && Notification.permission === 'granted') {
       const reg = await navigator.serviceWorker?.getRegistration?.();
       if (reg?.showNotification) {
-        await reg.showNotification(title, { body, tag: 'whendidi-flare', icon: 'icons/icon-192.png' });
+        await reg.showNotification(title, { body, tag: 'countwhen-flare', icon: 'icons/icon-192.png' });
       } else {
-        new Notification(title, { body, tag: 'whendidi-flare' });
+        new Notification(title, { body, tag: 'countwhen-flare' });
       }
       return true;
     }
@@ -1909,7 +1929,7 @@ function triggerImport() {
         openModal(`
           <header><button class="icon-btn" data-close>←</button><div class="title">Import errors</div></header>
           <div class="body">
-            <p>The file doesn't look like a WhenDidI backup:</p>
+            <p>The file doesn't look like a CountWhen backup:</p>
             <ul>${errs.slice(0, 10).map((m) => `<li>${escapeHtml(m)}</li>`).join('')}</ul>
             ${errs.length > 10 ? `<p>(+${errs.length-10} more)</p>` : ''}
           </div>
@@ -1977,7 +1997,7 @@ async function doExportCsv() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}`;
-  await WDIO.exportToCsv(`whendidi-events-${stamp}.csv`);
+  await WDIO.exportToCsv(`countwhen-events-${stamp}.csv`);
   snack('Exported CSV');
 }
 
@@ -1996,11 +2016,12 @@ function openAbout() {
   openModal(`
     <header><button class="icon-btn" data-close>←</button><div class="title">About</div></header>
     <div class="body">
-      <p><strong>WhenDidI</strong> (PWA replacement)</p>
-      <p>An offline-first event tracker that mirrors the original WhenDidI Android app
-      (SJM Apps, ~2012–2018), with byte-compatible <code>whendidibk.json</code> import/export.</p>
+      <p><strong>CountWhen</strong> — count what happens, know when.</p>
+      <p>An offline-first event tracker. Log a moment in one tap, then look back
+      across days, weeks, and months to spot the patterns you'd otherwise miss.</p>
       <p>All data lives only on this device in IndexedDB. Use Export JSON or Google Drive sync
-      to back it up.</p>
+      to back it up. Imports and exports the <code>whendidibk.json</code> format, so history
+      from older trackers comes across intact.</p>
     </div>
     <div class="actions"><button class="btn" data-close>OK</button></div>
   `);
@@ -2144,18 +2165,18 @@ function snack(msg, opts = {}) {
 }
 
 /* ======== TOPIC META (emoji + color) ======== */
-const DEFAULT_TOPIC_COLOR = '#8a5a2b';
+const DEFAULT_TOPIC_COLOR = '#ff7a2f';
 const COLOR_SWATCHES = [
-  '#8a5a2b', // brown (default)
-  '#6fa8c4', // blue
-  '#76c98b', // green
-  '#e2a920', // gold
-  '#b94343', // red
-  '#9b59b6', // purple
-  '#e67e22', // orange
-  '#34495e', // slate
-  '#16a085', // teal
-  '#e91e63', // pink
+  '#ff7a2f', // amber (default)
+  '#12b3a6', // teal
+  '#6b5bd6', // violet
+  '#3b82f6', // blue
+  '#17a673', // green
+  '#f5a524', // gold
+  '#e5484d', // red
+  '#ec4899', // pink
+  '#0ea5e9', // sky
+  '#64748b', // slate
 ];
 
 function topicMeta(topic) {

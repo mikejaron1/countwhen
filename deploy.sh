@@ -2,7 +2,7 @@
 # Push pending changes to GitHub. GitHub Pages auto-rebuilds.
 # Usage: ./deploy.sh "your commit message"
 #
-# After this finishes, reload the WhenDidI app on your phone — the
+# After this finishes, reload the CountWhen app on your phone — the
 # service worker will pull the new code on next launch (a 2nd reload
 # may be needed if the SW upgrade takes one cycle to activate).
 
@@ -24,4 +24,4 @@ git push
 
 echo ""
 echo "Pushed. GitHub Pages will rebuild in ~30–60 seconds."
-echo "URL: https://mikejaron1.github.io/whendidi-pwa/"
+echo "URL: https://mikejaron1.github.io/countwhen/"
