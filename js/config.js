@@ -15,7 +15,7 @@
 /* App version — BUMP THIS on every change so you can confirm which
  * build is actually running on your device. Shown at the bottom of
  * the ☰ menu. Keep it in sync with CACHE_VERSION in sw.js. */
-window.CW_VERSION = 'v7.0 · CountWhen · 2026-08-11';
+window.CW_VERSION = 'v7.0.1 · CountWhen · 2026-08-12';
 
 window.CW_CONFIG = {
   // Google OAuth 2.0 Client ID (Web application). Looks like:

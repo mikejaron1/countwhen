@@ -93,6 +93,7 @@ function reqToPromise(req) {
  * a replace-import so a Drive restore doesn't disconnect Drive. */
 const DEVICE_META_KEYS = [
   'driveClientId', 'driveSyncBase', 'driveRemoteMeta',
+  'driveLegacyCleanupAt', 'driveLegacyCleanupDone',
   'lastDriveSync', 'lastLocalChangeAt', 'lastFlareAlert',
 ];
 

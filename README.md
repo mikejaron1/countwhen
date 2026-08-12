@@ -168,6 +168,16 @@ python3 -m http.server 8000 --bind 0.0.0.0
 Then on the phone: `http://<your-mac-IP>:8000`. (Service worker
 *won't* register over LAN HTTP though — install needs HTTPS.)
 
+Two Node smoke tests run without a browser:
+
+```sh
+node smoke-test.js <path-to-backup.json>   # import → DB → export round-trip
+node drive-smoke.js                        # Drive snapshot rotation + legacy cleanup
+```
+
+`drive-smoke.js` runs `js/drive.js` against an in-memory fake of the
+Drive v3 API, so it needs no credentials and touches no real files.
+
 ## Optional: Google Drive sync
 
 Manual export/import via the Android share sheet to Drive works with
@@ -248,8 +258,15 @@ Other behaviour:
   it *replaces* everything on this device with the Drive copy, after
   downloading a safety backup. Use it for a fresh device or a bad
   mistake — day to day, plain sync is what you want.
-- Rolling snapshots (`countwhen-1.json`, `-2.json`, …) are kept
-  beside the live file so an older copy is always recoverable.
+- Rolling snapshots (`countwhen-1.json`, `-2.json`, … up to 5) are kept
+  beside the live file so an older copy is always recoverable. So the
+  Drive folder normally holds up to six similar-looking files: that's
+  expected. A snapshot is only cut when the live file's contents
+  actually changed *and* the newest snapshot is at least 12h old, so the
+  five slots reach back ~2.5 days at worst instead of piling up five
+  near-identical copies from one busy afternoon. (Drive also keeps its
+  own 30-day revision history on `countwhen.json` itself, which covers
+  the "undo the last few minutes" case.)
 - In-app settings (topic colours, emoji, kinds, insight roles, quick
   bar) ride along inside the backup under a `_countwhen` key, so a new
   device gets your setup too. Readers that don't know the key ignore it.
@@ -258,7 +275,11 @@ Scope used: `drive.file` — the app can only see / modify files it
 creates. The sync file lives at `CountWhen/countwhen.json` in your
 Drive. Nothing else in your Drive is visible to the app. Backups made
 under an earlier name are renamed in place on first sync, so their Drive
-file IDs and revision history carry over instead of being orphaned.
+file IDs and revision history carry over instead of being orphaned. If a
+device had already created the new folder, the leftover old files and
+folder can't be renamed into place — a once-a-day sweep moves the
+orphans over and sends true duplicates to the Drive trash (recoverable).
+A leftover old folder is only trashed once it's empty.
 
 ## Data format
 

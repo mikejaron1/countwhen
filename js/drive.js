@@ -26,6 +26,17 @@ const LEGACY_SNAPSHOT_NAME = (i) => `whendidibk-${i}.json`;
 
 const DRIVE_MAX_VERSIONS = 5; // rotated snapshots
 
+/* Minimum age of the newest snapshot before another one is cut.
+ *
+ * The five slots are only useful if they span time. Without a gap they hold
+ * the last five *changed* states, which on a busy logging day is five copies
+ * from the same hour — plenty of redundancy for a mistake caught immediately
+ * (which Drive's own 30-day revision history on the primary file already
+ * covers) and no help at all for a bad delete noticed next week. At 12h the
+ * same five files reach back two and a half days at worst, and typically
+ * much further. */
+const DRIVE_MIN_SNAPSHOT_GAP_MS = 12 * 60 * 60 * 1000;
+
 /* Top-level key carrying CountWhen's own settings inside a backup, plus the
  * name it used before the rebrand (still read so older files merge cleanly). */
 const APP_META_KEY = '_countwhen';
@@ -207,7 +218,8 @@ async function findFileInFolder(folderId, name) {
   const q = encodeURIComponent(
     `name='${name}' and '${folderId}' in parents and trashed=false`
   );
-  const resp = await driveFetch(`/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime)&spaces=drive`);
+  const resp = await driveFetch(
+    `/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime,md5Checksum)&spaces=drive`);
   const data = await resp.json();
   return (data.files && data.files[0]) || null;
 }
@@ -225,14 +237,32 @@ async function deleteDriveFile(id) {
   await driveFetch(`/drive/v3/files/${id}`, { method: 'DELETE' });
 }
 
+/* Recoverable removal, used for legacy leftovers so a mistake is undoable
+ * from the Drive trash. Rotation overflow still hard-deletes. */
+async function trashDriveFile(id) {
+  await driveFetch(`/drive/v3/files/${id}?fields=id`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ trashed: true }),
+  });
+}
+
 /* Keep up to DRIVE_MAX_VERSIONS historical snapshots alongside the primary
  * file, WITHOUT touching the primary file's id. The primary file is updated in
  * place so its Drive `modifiedTime` can be used for conflict detection.
  * Snapshots left over from the previous name are picked up by the legacy
  * lookup and rotate into the current naming scheme.
+ *
+ * Rotation is skipped when the primary file's contents are byte-identical to
+ * the newest snapshot (Drive's md5Checksum), and when that snapshot is younger
+ * than DRIVE_MIN_SNAPSHOT_GAP_MS: auto-sync fires after every save, so without
+ * both checks a single busy afternoon would push five near-identical copies
+ * through the ring and discard the older history that is actually worth
+ * keeping.
+ *
  * Best-effort: any failure here is non-fatal.
  */
-async function rotateVersions(folderId, currentFileId) {
+async function rotateVersions(folderId, currentFileId, currentMd5 = null) {
   try {
     if (!currentFileId) return;
     const existing = [];
@@ -242,6 +272,14 @@ async function rotateVersions(folderId, currentFileId) {
       if (f) existing.push({ idx: i, file: f });
     }
     existing.sort((a, b) => a.idx - b.idx);
+
+    const newest = existing.length && existing[0].idx === 1 ? existing[0].file : null;
+    if (newest) {
+      if (currentMd5 && newest.md5Checksum === currentMd5) return;
+      const age = Date.now() - (Date.parse(newest.modifiedTime) || 0);
+      if (age < DRIVE_MIN_SNAPSHOT_GAP_MS) return;
+    }
+
     // Shift from the highest index down so we never collide with a name.
     for (let i = existing.length - 1; i >= 0; i--) {
       const slot = existing[i];
@@ -256,6 +294,81 @@ async function rotateVersions(folderId, currentFileId) {
     await copyDriveFile(currentFileId, SNAPSHOT_NAME(1), [folderId]);
   } catch (e) {
     console.warn('drive version rotation failed:', e?.message || e);
+  }
+}
+
+/* Sweep up pre-rebrand artifacts the in-place renames can't reach.
+ *
+ * `statSyncFile` / `rotateVersions` only rename a legacy file when the
+ * equivalent current-name file is absent; when both exist (two devices
+ * upgrading at different times) the legacy copy is skipped forever and shows
+ * up as a duplicate. Same for the legacy folder, which `findOrCreateFolder`
+ * leaves untouched if a CountWhen folder already exists.
+ *
+ * Duplicates are trashed (recoverable), orphans are renamed into the current
+ * scheme, and the legacy folder is only trashed once it holds nothing this app
+ * can see. Best-effort: any failure here is non-fatal.
+ */
+async function cleanupLegacyArtifacts(folderId) {
+  let found = 0;
+  try {
+    const pairs = [[DRIVE_LEGACY_FILE_NAME, DRIVE_FILE_NAME]];
+    for (let i = 1; i <= DRIVE_MAX_VERSIONS; i++) {
+      pairs.push([LEGACY_SNAPSHOT_NAME(i), SNAPSHOT_NAME(i)]);
+    }
+    for (const [legacyName, currentName] of pairs) {
+      const legacy = await findFileInFolder(folderId, legacyName);
+      if (!legacy) continue;
+      found++;
+      const current = await findFileInFolder(folderId, currentName);
+      if (current) await trashDriveFile(legacy.id);
+      else await renameDriveFile(legacy.id, currentName);
+    }
+
+    // Legacy snapshots past the current retention window have no counterpart
+    // to rotate into, so drop them outright.
+    for (let i = DRIVE_MAX_VERSIONS + 1; i <= DRIVE_MAX_VERSIONS + 5; i++) {
+      const stale = await findFileInFolder(folderId, LEGACY_SNAPSHOT_NAME(i));
+      if (stale) { found++; await trashDriveFile(stale.id); }
+    }
+
+    const folderQ = encodeURIComponent(
+      `mimeType='application/vnd.google-apps.folder' and ` +
+      `name='${DRIVE_LEGACY_FOLDER_NAME}' and trashed=false`
+    );
+    const folderResp = await driveFetch(
+      `/drive/v3/files?q=${folderQ}&fields=files(id)&spaces=drive`);
+    const legacyFolders = (await folderResp.json()).files || [];
+    for (const f of legacyFolders) {
+      if (f.id === folderId) continue;
+      found++;
+      const childQ = encodeURIComponent(`'${f.id}' in parents and trashed=false`);
+      const childResp = await driveFetch(
+        `/drive/v3/files?q=${childQ}&fields=files(id)&pageSize=1&spaces=drive`);
+      const children = (await childResp.json()).files || [];
+      // Anything still inside is data we'd rather strand than destroy.
+      if (!children.length) await trashDriveFile(f.id);
+    }
+    return { found, complete: true };
+  } catch (e) {
+    console.warn('drive legacy cleanup failed:', e?.message || e);
+    return { found, complete: false };
+  }
+}
+
+/* The sweep costs a handful of requests and only ever has work to do on an
+ * install carried over from the old name, so run it at most once a day and
+ * stop entirely after a clean pass finds nothing left to migrate. */
+async function maybeCleanupLegacyArtifacts(folderId) {
+  try {
+    if (await CWDB.getMeta('driveLegacyCleanupDone')) return;
+    const last = Number(await CWDB.getMeta('driveLegacyCleanupAt')) || 0;
+    if (Date.now() - last < 24 * 60 * 60 * 1000) return;
+    await CWDB.setMeta('driveLegacyCleanupAt', Date.now());
+    const { found, complete } = await cleanupLegacyArtifacts(folderId);
+    if (complete && !found) await CWDB.setMeta('driveLegacyCleanupDone', true);
+  } catch (e) {
+    console.warn('drive legacy cleanup skipped:', e?.message || e);
   }
 }
 
@@ -473,9 +586,10 @@ async function syncNow({ interactive = false, allowMerge = true, force = false }
 
   // ---- 2. remote is exactly what we last wrote: fast-forward ----
   if (remoteUnchanged) {
-    await rotateVersions(folderId, remoteStat.id);
+    await rotateVersions(folderId, remoteStat.id, remoteStat.md5Checksum);
     const updated = await updateSyncFile(remoteStat.id, local);
     await rememberSyncPoint(updated, local);
+    await maybeCleanupLegacyArtifacts(folderId);
     setStatus('ok', '☁ synced');
     return { action: 'uploaded', stats: null };
   }
@@ -505,9 +619,10 @@ async function syncNow({ interactive = false, allowMerge = true, force = false }
     await CWDB.clearAll();
     await CWIO.applyBackup(merged);
   }
-  await rotateVersions(folderId, remoteStat.id);
+  await rotateVersions(folderId, remoteStat.id, remoteStat.md5Checksum);
   const updated = await updateSyncFile(remoteStat.id, merged);
   await rememberSyncPoint(updated, merged);
+  await maybeCleanupLegacyArtifacts(folderId);
   setStatus('ok', '☁ merged');
   return { action: 'merged', stats, changedLocally };
 }
