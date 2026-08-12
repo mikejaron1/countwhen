@@ -1,18 +1,28 @@
 /* CountWhen - Import / Export
- * Round-trips the original whendidibk.json format byte-compatibly.
+ * Round-trips the shared JSON backup schema byte-compatibly, so backups
+ * written by older trackers using the same schema import without loss.
  */
 
 const REQUIRED_KEYS = ['topics', 'events'];
+
+/* Top-level key holding CountWhen's own settings. Backups written before the
+ * rename used LEGACY_APP_META_TOP_KEY; we read either and always write the
+ * current one. */
+const APP_META_TOP_KEY = '_countwhen';
+const LEGACY_APP_META_TOP_KEY = '_wdapp';
+
+const readAppMeta = (obj) => obj?.[APP_META_TOP_KEY] || obj?.[LEGACY_APP_META_TOP_KEY];
+
 const KNOWN_TOP_KEYS = new Set([
   'version', 'saveddatelong', 'saveddate', 'eventcount', 'topiccount',
   'measurements', 'pendtimes', 'topics', 'events', 'appdata',
-  '_wdapp',
+  APP_META_TOP_KEY, LEGACY_APP_META_TOP_KEY,
 ]);
 
-/* In-app settings that live in the `meta` store rather than in the original
- * backup schema. They ride along in a `_wdapp` key so a Drive round-trip (or
- * a manual export/import) keeps topic colors, kinds, roles and the
- * quick-access bar. The original Android app ignores unknown keys. */
+/* In-app settings that live in the `meta` store rather than in the shared
+ * backup schema. They ride along in a single extra top-level key so a Drive
+ * round-trip (or a manual export/import) keeps topic colors, kinds, roles and
+ * the quick-access bar. Readers that don't know the key ignore it. */
 const APP_META_KEYS = [
   'topicKinds', 'topicMeta', 'topicOrder', 'quickBar',
   'topicRoles', 'insightSettings',
@@ -21,10 +31,10 @@ const APP_META_KEYS = [
 async function buildAppMeta() {
   const out = {};
   for (const k of APP_META_KEYS) {
-    const v = await WDDB.getMeta(k);
+    const v = await CWDB.getMeta(k);
     if (v != null) out[k] = v;
   }
-  const favs = await WDDB.getAll('favorites');
+  const favs = await CWDB.getAll('favorites');
   if (favs.length) out.favorites = favs;
   return out;
 }
@@ -32,10 +42,10 @@ async function buildAppMeta() {
 async function applyAppMeta(app) {
   if (!app || typeof app !== 'object') return;
   for (const k of APP_META_KEYS) {
-    if (app[k] != null) await WDDB.setMeta(k, app[k]);
+    if (app[k] != null) await CWDB.setMeta(k, app[k]);
   }
   if (Array.isArray(app.favorites) && app.favorites.length) {
-    await WDDB.putMany('favorites', app.favorites);
+    await CWDB.putMany('favorites', app.favorites);
   }
 }
 
@@ -93,7 +103,7 @@ function summarize(obj) {
  * Preserves unknown top-level keys in meta.extraKeys.
  */
 async function importReplace(obj) {
-  await WDDB.clearAll();
+  await CWDB.clearAll();
   await applyBackup(obj);
 }
 
@@ -106,7 +116,7 @@ async function importReplace(obj) {
  */
 async function importMerge(obj) {
   // existing topics
-  const existingTopics = await WDDB.getAll('topics');
+  const existingTopics = await CWDB.getAll('topics');
   const existingByName = new Map(
     existingTopics.map((t) => [t.name.toLowerCase(), t]));
   const existingIds = new Set(existingTopics.map((t) => t.id));
@@ -128,10 +138,10 @@ async function importMerge(obj) {
       existingByName.set(key, newTopic);
     }
   }
-  if (topicsToWrite.length) await WDDB.putMany('topics', topicsToWrite);
+  if (topicsToWrite.length) await CWDB.putMany('topics', topicsToWrite);
 
   // existing events: build a dedupe set by topicid|time
-  const existingEvents = await WDDB.getAll('events');
+  const existingEvents = await CWDB.getAll('events');
   const existingEventIds = new Set(existingEvents.map((e) => e.id));
   const existingEventKeys = new Set(
     existingEvents.map((e) => `${e.topicid}|${e.time}|${e.qant}`));
@@ -148,51 +158,52 @@ async function importMerge(obj) {
     existingEventKeys.add(key);
     eventsToWrite.push({ ...e, id: finalId, topicid: mappedTopic });
   }
-  if (eventsToWrite.length) await WDDB.putMany('events', eventsToWrite);
+  if (eventsToWrite.length) await CWDB.putMany('events', eventsToWrite);
 
   // Merge measurements / pendtimes / appdata by id/name; existing wins.
   if (Array.isArray(obj.measurements)) {
-    const existing = await WDDB.getAll('measurements');
+    const existing = await CWDB.getAll('measurements');
     const have = new Set(existing.map((m) => m.id));
     const add = obj.measurements.filter((m) => !have.has(m.id));
-    if (add.length) await WDDB.putMany('measurements', add);
+    if (add.length) await CWDB.putMany('measurements', add);
   }
   if (Array.isArray(obj.pendtimes)) {
-    const existing = await WDDB.getAll('pendtimes');
+    const existing = await CWDB.getAll('pendtimes');
     const have = new Set(existing.map((p) => p.id));
     const add = obj.pendtimes.filter((p) => !have.has(p.id));
-    if (add.length) await WDDB.putMany('pendtimes', add);
+    if (add.length) await CWDB.putMany('pendtimes', add);
   }
   if (Array.isArray(obj.appdata)) {
-    const existing = await WDDB.getAll('appdata');
+    const existing = await CWDB.getAll('appdata');
     const have = new Set(existing.map((a) => a.name));
     const add = obj.appdata.filter((a) => !have.has(a.name));
-    if (add.length) await WDDB.putMany('appdata', add);
+    if (add.length) await CWDB.putMany('appdata', add);
   }
 
-  if (obj._wdapp) await applyAppMeta(obj._wdapp);
+  const appMeta = readAppMeta(obj);
+  if (appMeta) await applyAppMeta(appMeta);
   await preserveUnknownKeys(obj);
 }
 
 async function applyBackup(obj) {
   if (Array.isArray(obj.measurements) && obj.measurements.length) {
-    await WDDB.putMany('measurements', obj.measurements);
+    await CWDB.putMany('measurements', obj.measurements);
   } else {
-    await WDDB.putMany('measurements', window.WDDB_DEFAULT_MEASUREMENTS);
+    await CWDB.putMany('measurements', window.CWDB_DEFAULT_MEASUREMENTS);
   }
   if (Array.isArray(obj.pendtimes) && obj.pendtimes.length) {
-    await WDDB.putMany('pendtimes', obj.pendtimes);
+    await CWDB.putMany('pendtimes', obj.pendtimes);
   } else {
-    await WDDB.putMany('pendtimes', window.WDDB_DEFAULT_PENDTIMES);
+    await CWDB.putMany('pendtimes', window.CWDB_DEFAULT_PENDTIMES);
   }
-  if (Array.isArray(obj.topics)) await WDDB.putMany('topics', obj.topics);
-  if (Array.isArray(obj.events)) await WDDB.putMany('events', obj.events);
-  if (Array.isArray(obj.appdata)) await WDDB.putMany('appdata', obj.appdata);
+  if (Array.isArray(obj.topics)) await CWDB.putMany('topics', obj.topics);
+  if (Array.isArray(obj.events)) await CWDB.putMany('events', obj.events);
+  if (Array.isArray(obj.appdata)) await CWDB.putMany('appdata', obj.appdata);
 
-  await applyAppMeta(obj._wdapp);
+  await applyAppMeta(readAppMeta(obj));
   await preserveUnknownKeys(obj);
-  await WDDB.setMeta('lastImport', Date.now());
-  await WDDB.setMeta('originalVersion', obj.version ?? 4);
+  await CWDB.setMeta('lastImport', Date.now());
+  await CWDB.setMeta('originalVersion', obj.version ?? 4);
 }
 
 async function preserveUnknownKeys(obj) {
@@ -201,18 +212,18 @@ async function preserveUnknownKeys(obj) {
     if (!KNOWN_TOP_KEYS.has(k)) extras[k] = obj[k];
   }
   if (Object.keys(extras).length) {
-    await WDDB.setMeta('extraTopKeys', extras);
+    await CWDB.setMeta('extraTopKeys', extras);
   }
 }
 
 async function buildExportObject() {
   const now = new Date();
   const [measurements, pendtimes, topics, events, appdata] = await Promise.all([
-    WDDB.getAll('measurements'),
-    WDDB.getAll('pendtimes'),
-    WDDB.getAll('topics'),
-    WDDB.getAll('events'),
-    WDDB.getAll('appdata'),
+    CWDB.getAll('measurements'),
+    CWDB.getAll('pendtimes'),
+    CWDB.getAll('topics'),
+    CWDB.getAll('events'),
+    CWDB.getAll('appdata'),
   ]);
 
   // sort topics by name to match the original layout
@@ -226,7 +237,7 @@ async function buildExportObject() {
   });
   pendtimes.sort((a, b) => a.id - b.id);
 
-  const version = await WDDB.getMeta('originalVersion', 4);
+  const version = await CWDB.getMeta('originalVersion', 4);
   const appMeta = await buildAppMeta();
   const out = {
     version,
@@ -239,10 +250,10 @@ async function buildExportObject() {
     topics,
     events,
     appdata,
-    _wdapp: appMeta,
+    [APP_META_TOP_KEY]: appMeta,
   };
 
-  const extras = await WDDB.getMeta('extraTopKeys', {});
+  const extras = await CWDB.getMeta('extraTopKeys', {});
   for (const [k, v] of Object.entries(extras)) {
     if (!(k in out)) out[k] = v;
   }
@@ -264,9 +275,9 @@ function downloadJSON(filename, obj) {
 
 async function exportToFile(filename) {
   const obj = await buildExportObject();
-  const name = filename || `whendidibk.json`;
+  const name = filename || `countwhen-backup.json`;
   downloadJSON(name, obj);
-  await WDDB.setMeta('lastExport', Date.now());
+  await CWDB.setMeta('lastExport', Date.now());
 }
 
 function csvEscape(s) {
@@ -278,9 +289,9 @@ function csvEscape(s) {
 
 async function exportToCsv(filename) {
   const [topics, events, measurements] = await Promise.all([
-    WDDB.getAll('topics'),
-    WDDB.getAll('events'),
-    WDDB.getAll('measurements'),
+    CWDB.getAll('topics'),
+    CWDB.getAll('events'),
+    CWDB.getAll('measurements'),
   ]);
   const topicById = new Map(topics.map((t) => [t.id, t]));
   const measById = new Map(measurements.map((m) => [m.id, m]));
@@ -348,16 +359,16 @@ async function exportToCsv(filename) {
 }
 
 async function safetyBackup() {
-  const events = await WDDB.getAll('events');
+  const events = await CWDB.getAll('events');
   if (!events.length) return; // nothing to back up
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-` +
                 `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  await exportToFile(`whendidibk-backup-${stamp}.json`);
+  await exportToFile(`countwhen-backup-${stamp}.json`);
 }
 
-window.WDIO = {
+window.CWIO = {
   APP_META_KEYS,
   buildAppMeta,
   applyAppMeta,

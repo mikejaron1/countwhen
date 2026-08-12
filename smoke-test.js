@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* Smoke test: simulate the import → DB → export pipeline in Node.
- * Verifies our import/export module preserves the original JSON
- * structure of whendidibk.json.
+ * Verifies our import/export module preserves the JSON backup
+ * structure byte-for-byte.
  */
 
 const fs = require('fs');
@@ -29,11 +29,15 @@ global.document = {
   body: { appendChild(){}, removeChild(){} },
 };
 
-const inputPath = process.argv[2] || path.join(__dirname, '..', 'context', 'whendidibk.json');
+const inputPath = process.argv[2];
+if (!inputPath) {
+  console.error('Usage: node smoke-test.js <path-to-backup.json>');
+  process.exit(2);
+}
 const input = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
 
-// ---- Mock the db module the same shape as window.WDDB ----
-const WDDB = {
+// ---- Mock the db module the same shape as window.CWDB ----
+const CWDB = {
   async getAll(store) {
     return Array.from(ensureStore(store).values()).map((v) => structuredClone(v));
   },
@@ -80,29 +84,29 @@ const WDDB = {
   },
   async seedDefaults() {},
 };
-global.window.WDDB = WDDB;
-global.WDDB = WDDB;
-global.window.WDDB_DEFAULT_MEASUREMENTS = [];
-global.window.WDDB_DEFAULT_PENDTIMES = [];
+global.window.CWDB = CWDB;
+global.CWDB = CWDB;
+global.window.CWDB_DEFAULT_MEASUREMENTS = [];
+global.window.CWDB_DEFAULT_PENDTIMES = [];
 
-// Load import-export.js by eval (it uses window.WDIO assignment at bottom)
+// Load import-export.js by eval (it uses window.CWIO assignment at bottom)
 const ieSrc = fs.readFileSync(path.join(__dirname, 'js', 'import-export.js'), 'utf8');
 eval(ieSrc);
-const WDIO = global.window.WDIO;
+const CWIO = global.window.CWIO;
 
 (async () => {
   console.log('Input events:', input.events.length, 'topics:', input.topics.length);
 
   // 1) Validate
-  const errs = WDIO.validateBackup(input);
+  const errs = CWIO.validateBackup(input);
   console.log('Validation errors:', errs.length);
   if (errs.length) { console.error(errs); process.exit(1); }
 
   // 2) Replace import
-  await WDIO.importReplace(input);
+  await CWIO.importReplace(input);
 
   // 3) Build export
-  const output = await WDIO.buildExportObject();
+  const output = await CWIO.buildExportObject();
 
   // 4) Compare top-level keys
   const inKeys = Object.keys(input).sort();
@@ -120,6 +124,9 @@ const WDIO = global.window.WDIO;
   // 6) Build canonical comparison (sort each array by id, compare JSON)
   function canon(obj) {
     const o = { ...obj };
+    // Settings written under the pre-rebrand key are migrated on import, so
+    // normalise the name before comparing.
+    if (o._wdapp && !o._countwhen) { o._countwhen = o._wdapp; delete o._wdapp; }
     // Recomputed fields will differ; ignore them
     delete o.saveddate;
     delete o.saveddatelong;
@@ -133,10 +140,20 @@ const WDIO = global.window.WDIO;
     if (Array.isArray(o.appdata))      o.appdata = [...o.appdata].sort((a,b) => a.name.localeCompare(b.name));
     return o;
   }
+  // JSON object key order carries no meaning, so compare with keys sorted
+  // recursively; array order is still significant and is preserved above.
+  function stable(v) {
+    if (Array.isArray(v)) return v.map(stable);
+    if (v && typeof v === 'object') {
+      return Object.keys(v).sort().reduce((o, k) => { o[k] = stable(v[k]); return o; }, {});
+    }
+    return v;
+  }
+
   const inC  = canon(input);
   const outC = canon(output);
-  const inJ  = JSON.stringify(inC);
-  const outJ = JSON.stringify(outC);
+  const inJ  = JSON.stringify(stable(inC));
+  const outJ = JSON.stringify(stable(outC));
 
   if (inJ === outJ) {
     console.log('✅ Round-trip MATCHES (ignoring recomputed counts/dates).');

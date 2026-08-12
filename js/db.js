@@ -234,7 +234,7 @@ const db = {
     return all.map((f) => f.topicid);
   },
 
-  /* Topic kinds: in-app metadata only. Not exported in whendidibk.json.
+  /* Topic kinds: in-app metadata only. Not part of the shared backup schema.
    *   'timeonly' — log a timestamp; qant defaults to 60, no input shown
    *   'duration' — log a hh:mm duration (msureid 10/11/12)
    *   'amount'   — log a numeric amount in the topic's measurement unit
@@ -286,7 +286,7 @@ const db = {
 
   /* Health-insight topic roles: maps a topic to a semantic role the
    * insights engine understands (bathroom / meal / blood / accident /
-   * sleep / med / trigger). In-app only, not part of whendidibk.json. */
+   * sleep / med / trigger). In-app only, not part of the backup schema. */
   async getTopicRoles() {
     return (await this.getMeta('topicRoles')) || {};
   },
@@ -339,6 +339,6 @@ const db = {
   },
 };
 
-window.WDDB = db;
-window.WDDB_DEFAULT_MEASUREMENTS = DEFAULT_MEASUREMENTS;
-window.WDDB_DEFAULT_PENDTIMES = DEFAULT_PENDTIMES;
+window.CWDB = db;
+window.CWDB_DEFAULT_MEASUREMENTS = DEFAULT_MEASUREMENTS;
+window.CWDB_DEFAULT_PENDTIMES = DEFAULT_PENDTIMES;

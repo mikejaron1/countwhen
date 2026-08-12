@@ -1118,7 +1118,7 @@ function rolling(values, window) {
   return out;
 }
 
-window.WDINSIGHTS = {
+window.CWINSIGHTS = {
   ROLES, ROLE_KEYS, OUTCOMES,
   analyze, buildDaily, buildPredictors, availableOutcomes, runTests,
   baselineStatus, mealTimingAnalysis, descriptiveInsights, describeTest,

@@ -251,7 +251,7 @@ function fmtIntervalShort(ms) {
   return `${mths.toFixed(1)}mo`;
 }
 
-window.WDSTATS = {
+window.CWSTATS = {
   aggregate, labelFor,
   startOfDay, startOfWeek, startOfMonth,
   intervals, intervalStats,

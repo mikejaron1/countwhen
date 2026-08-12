@@ -1,6 +1,6 @@
 /* CountWhen - Google Drive sync (optional).
  *
- * Configuration lives in js/config.js — set window.WD_CONFIG.driveClientId
+ * Configuration lives in js/config.js — set window.CW_CONFIG.driveClientId
  * to your OAuth Client ID and the rest is automatic:
  *
  *   - Silent token request on startup (if last sync > 15 min ago)
@@ -12,15 +12,26 @@
 
 const DRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
 const DRIVE_FOLDER_NAME = 'CountWhen';
-/* Installs that synced before the CountWhen rebrand have their backups in a
- * folder called 'WhenDidI'. We rename that folder in place rather than
- * creating a new one, so existing file IDs (and the version history inside)
- * are preserved. */
+const DRIVE_FILE_NAME = 'countwhen.json';
+const SNAPSHOT_NAME = (i) => `countwhen-${i}.json`;
+
+/* Installs that synced under the app's previous name keep their backups under
+ * the names below. Both the folder and the files are renamed in place rather
+ * than recreated, so existing Drive file IDs — and the revision history
+ * attached to them — survive the rebrand instead of being orphaned. These
+ * three strings are load-bearing: removing them strands that data. */
 const DRIVE_LEGACY_FOLDER_NAME = 'WhenDidI';
-const DRIVE_FILE_NAME = 'whendidibk.json';
+const DRIVE_LEGACY_FILE_NAME = 'whendidibk.json';
+const LEGACY_SNAPSHOT_NAME = (i) => `whendidibk-${i}.json`;
+
 const DRIVE_MAX_VERSIONS = 5; // rotated snapshots
 
-const CFG = () => window.WD_CONFIG || {};
+/* Top-level key carrying CountWhen's own settings inside a backup, plus the
+ * name it used before the rebrand (still read so older files merge cleanly). */
+const APP_META_KEY = '_countwhen';
+const LEGACY_APP_META_KEY = '_wdapp';
+
+const CFG = () => window.CW_CONFIG || {};
 
 let _gisLoaded = false;
 let _tokenClient = null;
@@ -54,7 +65,7 @@ function getClientId() {
   // previously-saved IDB value for backward compatibility.
   const fromCfg = (CFG().driveClientId || '').trim();
   if (fromCfg) return Promise.resolve(fromCfg);
-  return WDDB.getMeta('driveClientId').then((v) => (v || '').trim());
+  return CWDB.getMeta('driveClientId').then((v) => (v || '').trim());
 }
 
 function isOnline() {
@@ -214,9 +225,11 @@ async function deleteDriveFile(id) {
   await driveFetch(`/drive/v3/files/${id}`, { method: 'DELETE' });
 }
 
-/* Keep up to DRIVE_MAX_VERSIONS historical snapshots as whendidibk-N.json,
- * WITHOUT touching the primary file's id. The primary file is updated in
+/* Keep up to DRIVE_MAX_VERSIONS historical snapshots alongside the primary
+ * file, WITHOUT touching the primary file's id. The primary file is updated in
  * place so its Drive `modifiedTime` can be used for conflict detection.
+ * Snapshots left over from the previous name are picked up by the legacy
+ * lookup and rotate into the current naming scheme.
  * Best-effort: any failure here is non-fatal.
  */
 async function rotateVersions(folderId, currentFileId) {
@@ -224,7 +237,8 @@ async function rotateVersions(folderId, currentFileId) {
     if (!currentFileId) return;
     const existing = [];
     for (let i = 1; i <= DRIVE_MAX_VERSIONS + 2; i++) {
-      const f = await findFileInFolder(folderId, `whendidibk-${i}.json`);
+      const f = (await findFileInFolder(folderId, SNAPSHOT_NAME(i)))
+             || (await findFileInFolder(folderId, LEGACY_SNAPSHOT_NAME(i)));
       if (f) existing.push({ idx: i, file: f });
     }
     existing.sort((a, b) => a.idx - b.idx);
@@ -235,15 +249,11 @@ async function rotateVersions(folderId, currentFileId) {
       if (newIdx > DRIVE_MAX_VERSIONS) {
         await deleteDriveFile(slot.file.id);
       } else {
-        await driveFetch(`/drive/v3/files/${slot.file.id}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: `whendidibk-${newIdx}.json` }),
-        });
+        await renameDriveFile(slot.file.id, SNAPSHOT_NAME(newIdx));
       }
     }
     // Snapshot the current contents as -1 (a copy, so the id stays stable).
-    await copyDriveFile(currentFileId, 'whendidibk-1.json', [folderId]);
+    await copyDriveFile(currentFileId, SNAPSHOT_NAME(1), [folderId]);
   } catch (e) {
     console.warn('drive version rotation failed:', e?.message || e);
   }
@@ -288,14 +298,41 @@ async function readSyncFile(fileId) {
   return await resp.json();
 }
 
+async function renameDriveFile(fileId, name) {
+  await driveFetch(`/drive/v3/files/${fileId}?fields=id`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+}
+
 async function statSyncFile(folderId) {
-  const q = encodeURIComponent(
-    `name='${DRIVE_FILE_NAME}' and '${folderId}' in parents and trashed=false`
-  );
-  const resp = await driveFetch(
-    `/drive/v3/files?q=${q}&fields=files(${FILE_FIELDS})&spaces=drive`);
-  const data = await resp.json();
-  return (data.files && data.files[0]) || null;
+  const lookup = async (name) => {
+    const q = encodeURIComponent(
+      `name='${name}' and '${folderId}' in parents and trashed=false`
+    );
+    const resp = await driveFetch(
+      `/drive/v3/files?q=${q}&fields=files(${FILE_FIELDS})&spaces=drive`);
+    const data = await resp.json();
+    return (data.files && data.files[0]) || null;
+  };
+
+  const current = await lookup(DRIVE_FILE_NAME);
+  if (current) return current;
+
+  // Pre-rebrand sync file: rename in place so its id and revision history
+  // carry over. If the rename fails we still sync against the legacy file.
+  const legacy = await lookup(DRIVE_LEGACY_FILE_NAME);
+  if (legacy) {
+    try {
+      await renameDriveFile(legacy.id, DRIVE_FILE_NAME);
+      legacy.name = DRIVE_FILE_NAME;
+    } catch (e) {
+      console.warn('Could not rename legacy Drive sync file; using it as-is.', e);
+    }
+    return legacy;
+  }
+  return null;
 }
 
 async function downloadSyncFile() {
@@ -355,7 +392,7 @@ function mergeCollection(baseArr, localArr, remoteArr, keyName, preferRemote, st
 }
 
 /**
- * Three-way merge of two whendidibk objects against the snapshot taken at
+ * Three-way merge of two backup objects against the snapshot taken at
  * the last successful sync. Additive by nature (events have unique ids), so
  * in practice this is "union everything, and respect real deletions".
  */
@@ -370,15 +407,19 @@ function mergeBackups(base, local, remote, { preferRemote = false } = {}) {
     pendtimes:    mergeCollection(b.pendtimes, local.pendtimes, remote.pendtimes, 'id', preferRemote, stats),
     appdata:      mergeCollection(b.appdata, local.appdata, remote.appdata, 'name', preferRemote, stats),
   };
-  // In-app settings are a single blob: last writer wins.
-  const localApp = local._wdapp, remoteApp = remote._wdapp;
+  // In-app settings are a single blob: last writer wins. Either side may still
+  // carry the pre-rebrand key; we read both and always write the current one.
+  const readApp = (o) => o?.[APP_META_KEY] || o?.[LEGACY_APP_META_KEY];
+  const localApp = readApp(local), remoteApp = readApp(remote);
+  delete out[LEGACY_APP_META_KEY];
   if (localApp || remoteApp) {
-    if (!localApp) out._wdapp = remoteApp;
-    else if (!remoteApp) out._wdapp = localApp;
-    else if (sameRecord(localApp, remoteApp)) out._wdapp = localApp;
+    if (!localApp) out[APP_META_KEY] = remoteApp;
+    else if (!remoteApp) out[APP_META_KEY] = localApp;
+    else if (sameRecord(localApp, remoteApp)) out[APP_META_KEY] = localApp;
     else {
-      out._wdapp = preferRemote ? remoteApp : localApp;
-      if (!sameRecord(b._wdapp, localApp) && !sameRecord(b._wdapp, remoteApp)) stats.conflicts++;
+      out[APP_META_KEY] = preferRemote ? remoteApp : localApp;
+      const baseApp = readApp(b);
+      if (!sameRecord(baseApp, localApp) && !sameRecord(baseApp, remoteApp)) stats.conflicts++;
     }
   }
   out.events.sort((a, c) => (a.topicid - c.topicid) || (c.time - a.time));
@@ -414,7 +455,7 @@ async function syncNow({ interactive = false, allowMerge = true, force = false }
 
   const folderId = await findOrCreateFolder();
   const remoteStat = await statSyncFile(folderId);
-  const local = await WDIO.buildExportObject();
+  const local = await CWIO.buildExportObject();
 
   // ---- 1. nothing on Drive yet ----
   if (!remoteStat) {
@@ -424,8 +465,8 @@ async function syncNow({ interactive = false, allowMerge = true, force = false }
     return { action: 'created', stats: null };
   }
 
-  const known = (await WDDB.getMeta('driveRemoteMeta')) || {};
-  const base = await WDDB.getMeta('driveSyncBase');
+  const known = (await CWDB.getMeta('driveRemoteMeta')) || {};
+  const base = await CWDB.getMeta('driveSyncBase');
   const remoteUnchanged =
     force ||
     (known.fileId === remoteStat.id && known.modifiedTime === remoteStat.modifiedTime);
@@ -442,12 +483,12 @@ async function syncNow({ interactive = false, allowMerge = true, force = false }
   // ---- 3. remote moved on: merge ----
   if (!allowMerge) throw new Error('REMOTE_CHANGED');
   const remote = await readSyncFile(remoteStat.id);
-  const errs = WDIO.validateBackup(remote);
+  const errs = CWIO.validateBackup(remote);
   if (errs.length) throw new Error('INVALID_REMOTE: ' + errs[0]);
 
   // Without a base snapshot we can't tell edits from deletions, so fall back
   // to a purely additive union (base = empty) — nothing is ever lost.
-  const lastLocalChange = (await WDDB.getMeta('lastLocalChangeAt')) || 0;
+  const lastLocalChange = (await CWDB.getMeta('lastLocalChangeAt')) || 0;
   const remoteTime = Date.parse(remoteStat.modifiedTime || 0) || 0;
   const preferRemote = remoteTime > lastLocalChange;
 
@@ -460,9 +501,9 @@ async function syncNow({ interactive = false, allowMerge = true, force = false }
     stats.fromRemote > 0;
 
   if (changedLocally) {
-    await WDIO.safetyBackup();
-    await WDDB.clearAll();
-    await WDIO.applyBackup(merged);
+    await CWIO.safetyBackup();
+    await CWDB.clearAll();
+    await CWIO.applyBackup(merged);
   }
   await rotateVersions(folderId, remoteStat.id);
   const updated = await updateSyncFile(remoteStat.id, merged);
@@ -473,13 +514,13 @@ async function syncNow({ interactive = false, allowMerge = true, force = false }
 
 /* Record what we just wrote so the next sync can detect remote edits. */
 async function rememberSyncPoint(fileMeta, obj) {
-  await WDDB.setMeta('driveRemoteMeta', {
+  await CWDB.setMeta('driveRemoteMeta', {
     fileId: fileMeta.id,
     modifiedTime: fileMeta.modifiedTime,
     md5Checksum: fileMeta.md5Checksum || null,
   });
-  await WDDB.setMeta('driveSyncBase', obj);
-  await WDDB.setMeta('lastDriveSync', Date.now());
+  await CWDB.setMeta('driveSyncBase', obj);
+  await CWDB.setMeta('lastDriveSync', Date.now());
 }
 
 /* Upload-only (kept for the "Sync Now" button and older call sites). */
@@ -497,10 +538,10 @@ async function syncDown({ interactive = true } = {}) {
   const stat = await statSyncFile(folderId);
   if (!stat) throw new Error('NO_REMOTE_FILE');
   const obj = await readSyncFile(stat.id);
-  const errs = WDIO.validateBackup(obj);
+  const errs = CWIO.validateBackup(obj);
   if (errs.length) throw new Error('INVALID_REMOTE: ' + errs[0]);
-  await WDIO.safetyBackup();
-  await WDIO.importReplace(obj);
+  await CWIO.safetyBackup();
+  await CWIO.importReplace(obj);
   await rememberSyncPoint(stat, obj);
   setStatus('ok', '☁ restored');
   return obj;
@@ -511,7 +552,7 @@ async function syncDown({ interactive = true } = {}) {
 function queueAutoSync(reason = 'change') {
   // Always stamp the local change, even if auto-sync is off — the timestamp
   // is what breaks conflict ties on the next manual sync.
-  WDDB.setMeta('lastLocalChangeAt', Date.now()).catch(() => {});
+  CWDB.setMeta('lastLocalChangeAt', Date.now()).catch(() => {});
   if (!CFG().autoSyncOnChange) return;
   const debounce = Math.max(1000, Number(CFG().autoSyncDebounceMs) || 5000);
   if (_autoSyncTimer) clearTimeout(_autoSyncTimer);
@@ -532,13 +573,13 @@ function queueAutoSync(reason = 'change') {
 async function afterSync(res) {
   if (!res || res.action !== 'merged' || !res.changedLocally) return;
   try {
-    await window.WDAPP?.reload?.();
-    window.WDAPP?.renderCurrent?.();
+    await window.CWAPP?.reload?.();
+    window.CWAPP?.renderCurrent?.();
     const s = res.stats || {};
     const bits = [];
     if (s.fromRemote) bits.push(`${s.fromRemote} pulled in`);
     if (s.conflicts) bits.push(`${s.conflicts} conflict${s.conflicts === 1 ? '' : 's'} auto-resolved`);
-    window.WDAPP?.snack?.(`Merged with Drive${bits.length ? ': ' + bits.join(', ') : ''}`);
+    window.CWAPP?.snack?.(`Merged with Drive${bits.length ? ': ' + bits.join(', ') : ''}`);
   } catch (e) { console.warn('post-merge refresh failed', e); }
 }
 
@@ -557,7 +598,7 @@ async function startupSync() {
   if (!CFG().autoSyncOnStartup) return;
   const clientId = await getClientId();
   if (!clientId) return;
-  const last = await WDDB.getMeta('lastDriveSync', 0);
+  const last = await CWDB.getMeta('lastDriveSync', 0);
   const gap = Date.now() - (last || 0);
   // Short gap only: sync is two-way now, so opening the app is how we find
   // out about edits made on the other device.
@@ -574,7 +615,7 @@ async function disconnect() {
   _accessToken = null;
   _tokenExpiry = 0;
   // Note: we don't wipe config.js (file-based) — only the IDB fallback.
-  await WDDB.setMeta('driveClientId', null);
+  await CWDB.setMeta('driveClientId', null);
 }
 
 /* ---------- in-app dialog ---------- */
@@ -583,8 +624,8 @@ function openSetupDialog(ctx) {
   const { openModal, closeModal, snack, reload, renderCurrent } = ctx;
   (async () => {
     const cfgId = (CFG().driveClientId || '').trim();
-    const idbId = await WDDB.getMeta('driveClientId', '');
-    const last = await WDDB.getMeta('lastDriveSync', 0);
+    const idbId = await CWDB.getMeta('driveClientId', '');
+    const last = await CWDB.getMeta('lastDriveSync', 0);
     const wifiState = isOnWifi();
     const wifiLabel = wifiState === true ? 'Wi-Fi' : wifiState === false ? 'Cellular' : 'Unknown';
 
@@ -668,7 +709,7 @@ if (typeof window !== 'undefined') {
   });
 }
 
-window.WDDRIVE = {
+window.CWDRIVE = {
   syncNow, syncUp, syncDown, openSetupDialog, afterSync,
   mergeBackups, mergeCollection,
   queueAutoSync, startupSync,

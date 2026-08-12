@@ -14,10 +14,9 @@ pretty charts.
 Everything lives on your device (IndexedDB) and, optionally, in your own
 Google Drive. There is no server, no account, and no analytics.
 
-> **Migrating from WhenDidI?** CountWhen reads and writes the exact
-> `whendidibk.json` backup format used by the discontinued
-> *WhenDidI – Event Tracker* Android app (SJM Apps, last updated 2018),
-> so years of existing history import cleanly. See
+> **Coming from another tracker?** CountWhen imports the widely used
+> flat JSON event-backup schema (topics + events + measurements), so an
+> existing export loads without conversion. See
 > [Data format](#data-format).
 
 ## Live URL
@@ -44,7 +43,7 @@ No drag-and-drop, no console clicks. Pages handles the rest.
 ### Logging
 
 - **Categories** — full topic list with time-since-last + last-event
-  date, just like the original. Big amber ADD button per row. **Long-
+  date. Big amber ADD button per row. **Long-
   press a card** to drag it into a new order; the order is saved.
   Tap a card to edit/archive/delete the topic. **+ New topic** button
   at the end of the list.
@@ -112,7 +111,8 @@ finding.
 
 ### Data
 
-- **Import / Export JSON** — byte-compatible with the original format.
+- **Import / Export JSON** — round-trips the interchange format
+  byte-for-byte, so nothing is lost on a re-import.
   Import preview shows topic / event counts + date range; choose
   *Replace* (with auto-downloaded safety backup) or *Merge*
   (deduplicates by event id).
@@ -140,7 +140,7 @@ finding.
 
 ### Step 3 — Import your old data
 
-1. Copy your `whendidibk.json` to your phone (email it, Drive it,
+1. Copy your JSON backup to your phone (email it, Drive it,
    USB, whatever).
 2. Open the app → ☰ menu → **Import JSON** → pick the file.
 3. Review the preview (topic + event counts + date range).
@@ -248,23 +248,23 @@ Other behaviour:
   it *replaces* everything on this device with the Drive copy, after
   downloading a safety backup. Use it for a fresh device or a bad
   mistake — day to day, plain sync is what you want.
-- Rolling snapshots (`whendidibk-1.json`, `-2.json`, …) are kept
+- Rolling snapshots (`countwhen-1.json`, `-2.json`, …) are kept
   beside the live file so an older copy is always recoverable.
 - In-app settings (topic colours, emoji, kinds, insight roles, quick
-  bar) ride along inside the backup under a `_wdapp` key, so a new
-  device gets your setup too. The key is ignored by the original app.
+  bar) ride along inside the backup under a `_countwhen` key, so a new
+  device gets your setup too. Readers that don't know the key ignore it.
 
 Scope used: `drive.file` — the app can only see / modify files it
-creates. The sync file lives at `CountWhen/whendidibk.json` in your
-Drive. Nothing else in your Drive is visible to the app. (If you're
-upgrading from the old app, an existing `WhenDidI` folder is renamed
-to `CountWhen` in place, so file IDs and version history survive.)
+creates. The sync file lives at `CountWhen/countwhen.json` in your
+Drive. Nothing else in your Drive is visible to the app. Backups made
+under an earlier name are renamed in place on first sync, so their Drive
+file IDs and revision history carry over instead of being orphaned.
 
 ## Data format
 
-CountWhen stores and exchanges data as `whendidibk.json` — the same
-format used by the original WhenDidI app, kept byte-compatible so
-backups move both ways. Top-level keys:
+CountWhen reads and writes a flat JSON document (`countwhen.json`).
+The schema is shared with other trackers built on it, and unknown keys
+survive a round-trip, so backups move both ways. Top-level keys:
 
 ```jsonc
 {
@@ -282,9 +282,9 @@ backups move both ways. Top-level keys:
 ```
 
 Any extra top-level keys we don't recognize are preserved verbatim on
-export. This app adds one of its own, `_wdapp`, holding in-app-only
+export. This app adds one of its own, `_countwhen`, holding in-app-only
 settings (topic emoji / colour / kind, insight roles, quick-access
-bar). The original app ignores unknown keys, so backups stay
+bar). Other readers ignore unknown keys, so backups stay
 interchangeable. New IDs are allocated as `max(existing) + 1`. `qant` is
 stored exactly as given — display formatting is driven by the topic's
 referenced measurement (`msureid` → `measurements[*]`).
@@ -312,9 +312,9 @@ referenced measurement (`msureid` → `measurements[*]`).
   not a diagnosis. It is not medical advice.
 - Merge conflicts are resolved automatically (most-recently-touched
   device wins) — there's no interactive "pick a side" UI.
-- The original app's "Quick Links" preset *values* (e.g., "1 glass
-  of water = 8 oz") aren't migrated; you can long-press a Quick
-  Links tile to enter a custom amount.
+- Preset quick-add *values* from imported backups (e.g., "1 glass
+  of water = 8 oz") aren't carried over; long-press a quick-access
+  chip to enter a custom amount.
 
 ## License
 

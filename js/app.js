@@ -13,7 +13,7 @@ const state = {
   quickBar: [],   // fixed, user-curated ordered list of topic ids for the quick-access bar
   topicRoles: {}, // topicId -> 'bathroom' | 'meal' | 'blood' | 'accident' | ...
   insightSettings: null,
-  insights: null,           // cached result of WDINSIGHTS.analyze()
+  insights: null,           // cached result of CWINSIGHTS.analyze()
   insightsDirty: true,      // recompute on next Insights render
   insightOutcome: 'goCount',
   insightLag: 0,
@@ -156,16 +156,16 @@ function topicKind(topic) {
 async function reload() {
   const [topics, events, measurements, favIds, topicKinds, topicMeta,
          topicRoles, insightSettings] = await Promise.all([
-    WDDB.getAll('topics'),
-    WDDB.getAll('events'),
-    WDDB.getAll('measurements'),
-    WDDB.getFavoriteTopicIds(),
-    WDDB.getAllTopicKinds(),
-    WDDB.getAllTopicMeta(),
-    WDDB.getTopicRoles(),
-    WDDB.getInsightSettings(),
+    CWDB.getAll('topics'),
+    CWDB.getAll('events'),
+    CWDB.getAll('measurements'),
+    CWDB.getFavoriteTopicIds(),
+    CWDB.getAllTopicKinds(),
+    CWDB.getAllTopicMeta(),
+    CWDB.getTopicRoles(),
+    CWDB.getInsightSettings(),
   ]);
-  const savedOrder = (await WDDB.getMeta('topicOrder')) || [];
+  const savedOrder = (await CWDB.getMeta('topicOrder')) || [];
   const knownIds = new Set(topics.map((t) => t.id));
   const orderedKnown = savedOrder.filter((id) => knownIds.has(id));
   const orderedSet = new Set(orderedKnown);
@@ -178,7 +178,7 @@ async function reload() {
     finalOrder.length !== savedOrder.length ||
     finalOrder.some((id, i) => savedOrder[i] !== id);
   if (orderChanged) {
-    await WDDB.setMeta('topicOrder', finalOrder);
+    await CWDB.setMeta('topicOrder', finalOrder);
   }
   state.topicOrder = finalOrder;
   const byId = new Map(topics.map((t) => [t.id, t]));
@@ -192,7 +192,7 @@ async function reload() {
   state.insightSettings = insightSettings;
   state.insightsDirty = true;
   // Quick-access bar: keep only ids that still map to existing, non-archived topics.
-  const savedQuick = (await WDDB.getMeta('quickBar')) || [];
+  const savedQuick = (await CWDB.getMeta('quickBar')) || [];
   const validQuick = Array.isArray(savedQuick)
     ? savedQuick.filter((id) => {
         const t = byId.get(id);
@@ -207,7 +207,7 @@ async function reload() {
 
 async function saveTopicOrder(orderIds) {
   state.topicOrder = orderIds.slice();
-  await WDDB.setMeta('topicOrder', state.topicOrder);
+  await CWDB.setMeta('topicOrder', state.topicOrder);
   // re-sort in-memory state.topics to match
   const byId = new Map(state.topics.map((t) => [t.id, t]));
   state.topics = orderIds.map((id) => byId.get(id)).filter(Boolean);
@@ -232,7 +232,7 @@ function lastEventForTopic(topicid) {
 function welcomeBannerHtml() {
   return `
     <div class="banner">
-      <span>👋 Welcome! Import your existing <code>whendidibk.json</code> to load your data, or start fresh by adding topics.</span>
+      <span>👋 Welcome! Import an existing JSON backup to load your data, or start fresh by adding topics.</span>
       <button class="btn" id="welcomeImport">Import…</button>
     </div>
   `;
@@ -481,14 +481,14 @@ function renderRecent() {
   }
   if (f.tag) {
     const tag = f.tag.toLowerCase();
-    filtered = filtered.filter((e) => WDSTATS.tagSet(e.note || '').has(tag));
+    filtered = filtered.filter((e) => CWSTATS.tagSet(e.note || '').has(tag));
   }
   const sorted = filtered.slice().sort((a, b) => b.time - a.time);
 
   // Build the filter bar
   const topicOpts = `<option value="">All topics</option>` +
     state.topics.map((t) => `<option value="${t.id}" ${String(t.id)===f.topic?'selected':''}>${escapeHtml(t.name)}</option>`).join('');
-  const tags = WDSTATS.allTagsFromEvents(state.events).slice(0, 12);
+  const tags = CWSTATS.allTagsFromEvents(state.events).slice(0, 12);
   const tagBar = tags.length ? `
     <div class="recent-tag-row">
       <button class="tag-filter-chip ${!f.tag?'active':''}" data-tag-filter="">all</button>
@@ -579,7 +579,7 @@ function renderDay() {
     bindWelcomeBanner();
     return;
   }
-  if (!state.dayDate) state.dayDate = WDSTATS.startOfDay(Date.now());
+  if (!state.dayDate) state.dayDate = CWSTATS.startOfDay(Date.now());
   const day = state.dayDate;
   const nextDay = day + 86400000;
   const events = state.events
@@ -601,8 +601,8 @@ function renderDay() {
 
   const dateStr = fmtDateLong(day);
   const dow = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][new Date(day).getDay()];
-  const isToday = day === WDSTATS.startOfDay(Date.now());
-  const todayLabel = isToday ? 'Today' : (day === WDSTATS.startOfDay(Date.now() - 86400000) ? 'Yesterday' : '');
+  const isToday = day === CWSTATS.startOfDay(Date.now());
+  const todayLabel = isToday ? 'Today' : (day === CWSTATS.startOfDay(Date.now() - 86400000) ? 'Yesterday' : '');
 
   // Chronological list
   const chronoHtml = events.map((e) => {
@@ -668,7 +668,7 @@ function renderDay() {
     renderDay();
   });
   $('#dayNext').addEventListener('click', () => {
-    state.dayDate = Math.min(state.dayDate + 86400000, WDSTATS.startOfDay(Date.now()));
+    state.dayDate = Math.min(state.dayDate + 86400000, CWSTATS.startOfDay(Date.now()));
     renderDay();
   });
   $('#dayPick').addEventListener('change', (e) => {
@@ -720,27 +720,27 @@ function renderStats() {
   const topOpts = topics.map((t) => `<option value="${t.id}" ${t.id===topic.id?'selected':''}>${escapeHtml(t.name)}</option>`).join('');
 
   // Interval stats
-  const iv = WDSTATS.intervalStats(events);
+  const iv = CWSTATS.intervalStats(events);
   const intervalSummary = iv ? `
     <div class="stats-cards">
       <div><b>${events.length.toLocaleString()}</b><span>events</span></div>
-      <div><b>${WDSTATS.fmtIntervalShort(iv.avg)}</b><span>avg interval</span></div>
-      <div><b>${WDSTATS.fmtIntervalShort(iv.median)}</b><span>median</span></div>
-      <div><b>${WDSTATS.fmtIntervalShort(iv.min)}</b><span>min</span></div>
-      <div><b>${WDSTATS.fmtIntervalShort(iv.max)}</b><span>max</span></div>
-      <div><b>${WDSTATS.fmtIntervalShort(iv.last)}</b><span>since last</span></div>
+      <div><b>${CWSTATS.fmtIntervalShort(iv.avg)}</b><span>avg interval</span></div>
+      <div><b>${CWSTATS.fmtIntervalShort(iv.median)}</b><span>median</span></div>
+      <div><b>${CWSTATS.fmtIntervalShort(iv.min)}</b><span>min</span></div>
+      <div><b>${CWSTATS.fmtIntervalShort(iv.max)}</b><span>max</span></div>
+      <div><b>${CWSTATS.fmtIntervalShort(iv.last)}</b><span>since last</span></div>
       ${isMeasurable ? `<div><b>${escapeHtml(totalQantStr)}</b><span>total</span></div>` : ''}
     </div>` : `<div class="stats-cards"><div><b>${events.length}</b><span>events</span></div></div>`;
 
   // Cross-topic correlations
-  const correlations = WDSTATS.correlations(state.events, topic.id, 24 * 3600 * 1000);
+  const correlations = CWSTATS.correlations(state.events, topic.id, 24 * 3600 * 1000);
   const corrRows = correlations.slice(0, 8).map((c) => {
     const other = state.topics.find((t) => t.id === c.otherTopicId);
     if (!other) return '';
     const dir = c.avgOffsetMs < 0 ? 'before' : 'after';
     return `<div class="corr-row">
       <div><strong>${escapeHtml(other.name)}</strong></div>
-      <div><span class="muted">avg</span> ${WDSTATS.fmtIntervalShort(Math.abs(c.avgOffsetMs))} <span class="muted">${dir}</span> (n=${c.sampleCount})</div>
+      <div><span class="muted">avg</span> ${CWSTATS.fmtIntervalShort(Math.abs(c.avgOffsetMs))} <span class="muted">${dir}</span> (n=${c.sampleCount})</div>
     </div>`;
   }).join('');
 
@@ -820,10 +820,10 @@ function applyChartTheme() {
 function drawOverTime(events, topic) {
   const canvas = $('#chartOverTime');
   if (!canvas) return;
-  const rows = WDSTATS.aggregate(events, state.statsPeriod);
+  const rows = CWSTATS.aggregate(events, state.statsPeriod);
   const cutoff = { daily: 30, weekly: 12, monthly: 12 }[state.statsPeriod];
   const slice = rows.slice(0, cutoff).reverse();
-  const labels = slice.map((r) => WDSTATS.labelFor(state.statsPeriod, r.bucket));
+  const labels = slice.map((r) => CWSTATS.labelFor(state.statsPeriod, r.bucket));
   const counts = slice.map((r) => r.count);
   applyChartTheme();
   state.charts.overTime = new Chart(canvas, {
@@ -841,7 +841,7 @@ function drawOverTime(events, topic) {
 function drawTimeOfDay(events) {
   const canvas = $('#chartTOD');
   if (!canvas) return;
-  const buckets = WDSTATS.timeOfDay(events);
+  const buckets = CWSTATS.timeOfDay(events);
   const labels = buckets.map((_, i) => `${i}`);
   applyChartTheme();
   state.charts.tod = new Chart(canvas, {
@@ -859,7 +859,7 @@ function drawTimeOfDay(events) {
 function drawDayOfWeek(events) {
   const canvas = $('#chartDOW');
   if (!canvas) return;
-  const buckets = WDSTATS.dayOfWeek(events);
+  const buckets = CWSTATS.dayOfWeek(events);
   const labels = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
   applyChartTheme();
   state.charts.dow = new Chart(canvas, {
@@ -877,7 +877,7 @@ function drawDayOfWeek(events) {
 function drawHeatmap(events) {
   const root = $('#heatmap');
   if (!root) return;
-  const mat = WDSTATS.calendarMatrix(events, 26);
+  const mat = CWSTATS.calendarMatrix(events, 26);
   const maxC = Math.max(1, mat.maxCount);
   const heatLevel = (c) => {
     if (c === 0) return 0;
@@ -918,7 +918,7 @@ function hasBathroomRole() {
 function computeInsights(force = false) {
   if (!force && !state.insightsDirty && state.insights) return state.insights;
   const s = insightsSettings();
-  state.insights = WDINSIGHTS.analyze({
+  state.insights = CWINSIGHTS.analyze({
     events: state.events,
     topics: state.topics,
     roles: state.topicRoles,
@@ -950,7 +950,7 @@ function sigBadge(sig) {
 function renderInsights() {
   destroyCharts();
   const main = $('#main');
-  const N = WDINSIGHTS;
+  const N = CWINSIGHTS;
 
   if (!state.topics.length) {
     main.innerHTML = `${welcomeBannerHtml()}<div class="empty">Import data or add a topic first.</div>`;
@@ -1073,7 +1073,7 @@ function renderMealSection(meals, table) {
       <h3>Meal timing</h3>
       <p class="muted-small">Not enough overlapping meal + bathroom days yet.</p></div>`;
   }
-  const N = WDINSIGHTS;
+  const N = CWINSIGHTS;
   const verdict = (q, p) => {
     if (isFinite(q)) {
       if (q < 0.05) return { txt: 'Yes', cls: 'sig-strong' };
@@ -1125,7 +1125,7 @@ function renderMealSection(meals, table) {
 }
 
 function renderExplorer(res) {
-  const N = WDINSIGHTS;
+  const N = CWINSIGHTS;
   const outcomeKey = res.outcomes.find((o) => o.key === state.insightOutcome)
     ? state.insightOutcome
     : (res.outcomes[0]?.key || 'goCount');
@@ -1177,8 +1177,8 @@ function drawInsightsTrend(table) {
   if (days.length < 5) return;
   const labels = days.map((r) => `${r.date.getMonth() + 1}/${r.date.getDate()}`);
   const counts = days.map((r) => r.goCount);
-  const roll = WDINSIGHTS.rolling(counts, 7);
-  const baseline = WDINSIGHTS.median(
+  const roll = CWINSIGHTS.rolling(counts, 7);
+  const baseline = CWINSIGHTS.median(
     table.days.slice(-97, -7).map((r) => r.goCount)
   );
   applyChartTheme();
@@ -1213,7 +1213,7 @@ function drawInsightsTrend(table) {
 function openRolesSetup() {
   const roleOpts = (cur) =>
     ['<option value="">— none —</option>']
-      .concat(WDINSIGHTS.ROLES.map((r) =>
+      .concat(CWINSIGHTS.ROLES.map((r) =>
         `<option value="${r.key}" ${cur === r.key ? 'selected' : ''}>${r.icon} ${escapeHtml(r.label)}</option>`))
       .join('');
   const topics = state.topics.filter((t) => !t.archived);
@@ -1248,10 +1248,10 @@ function openRolesSetup() {
     $$('[data-role-topic]').forEach((sel) => {
       if (sel.value) map[Number(sel.dataset.roleTopic)] = sel.value;
     });
-    await WDDB.setTopicRoles(map);
+    await CWDB.setTopicRoles(map);
     state.topicRoles = map;
     const cutoffHour = Number($('#insCutoff').value);
-    state.insightSettings = await WDDB.setInsightSettings({ cutoffHour });
+    state.insightSettings = await CWDB.setInsightSettings({ cutoffHour });
     state.insightsDirty = true;
     closeModal();
     snack('Insights settings saved');
@@ -1296,7 +1296,7 @@ function openAlertsDialog() {
     if (enabled && 'Notification' in window && Notification.permission === 'default') {
       try { await Notification.requestPermission(); } catch (_) {}
     }
-    state.insightSettings = await WDDB.setInsightSettings({
+    state.insightSettings = await CWDB.setInsightSettings({
       alertsEnabled: enabled,
       alertOn: $('#alertOn').value,
     });
@@ -1347,7 +1347,7 @@ async function checkFlareAlert() {
   if (!trigger) return;
   await showFlareNotification(res.status);
   snack(`${STATUS_META[level].icon} ${STATUS_META[level].title} — see Insights`);
-  state.insightSettings = await WDDB.setInsightSettings({
+  state.insightSettings = await CWDB.setInsightSettings({
     lastAlertAt: Date.now(), lastAlertLevel: level,
   });
 }
@@ -1356,15 +1356,15 @@ async function checkFlareAlert() {
 
 async function logNow(topic) {
   const now = Date.now();
-  const id = await WDDB.nextId('events');
+  const id = await CWDB.nextId('events');
   const m = state.measurements.find((m) => m.id === topic.msureid);
   const defaultQant = (m && m.type === 3) ? 60 : 0;
   const ev = { id, cost: 0, qant: defaultQant, time: now, topicid: topic.id, note: '' };
-  await WDDB.put('events', ev);
+  await CWDB.put('events', ev);
   state.events.push(ev);
   snack(`Logged ${topic.name}`, {
     undo: async () => {
-      await WDDB.delete('events', id);
+      await CWDB.delete('events', id);
       state.events = state.events.filter((e) => e.id !== id);
       snack('Undone');
       queueAutoSync('undoLog');
@@ -1412,7 +1412,7 @@ function openAddEvent(topic, existing = null) {
   }
 
   // Build a sorted list of tag suggestions from existing notes
-  const tagSuggest = WDSTATS.allTagsFromEvents(state.events).slice(0, 12);
+  const tagSuggest = CWSTATS.allTagsFromEvents(state.events).slice(0, 12);
   const tagChipsHtml = tagSuggest.length ? `
     <div class="tag-suggest">
       ${tagSuggest.map((t) => `<button type="button" class="tag-suggest-chip" data-tag="${escapeHtml(t.tag)}">#${escapeHtml(t.tag)}</button>`).join('')}
@@ -1526,13 +1526,13 @@ function openAddEvent(topic, existing = null) {
     if (existing) {
       const prev = { ...existing };
       const updated = { ...existing, qant, cost: severity, time, note };
-      await WDDB.put('events', updated);
+      await CWDB.put('events', updated);
       const idx = state.events.findIndex((e) => e.id === existing.id);
       if (idx >= 0) state.events[idx] = updated;
       closeModal();
       snack('Event updated', {
         undo: async () => {
-          await WDDB.put('events', prev);
+          await CWDB.put('events', prev);
           const j = state.events.findIndex((e) => e.id === prev.id);
           if (j >= 0) state.events[j] = prev;
           queueAutoSync('undoEdit');
@@ -1541,14 +1541,14 @@ function openAddEvent(topic, existing = null) {
         },
       });
     } else {
-      const id = await WDDB.nextId('events');
+      const id = await CWDB.nextId('events');
       const ev = { id, cost: severity, qant, time, topicid: topic.id, note };
-      await WDDB.put('events', ev);
+      await CWDB.put('events', ev);
       state.events.push(ev);
       closeModal();
       snack(`Logged ${topic.name}`, {
         undo: async () => {
-          await WDDB.delete('events', id);
+          await CWDB.delete('events', id);
           state.events = state.events.filter((e) => e.id !== id);
           queueAutoSync('undoLog');
           renderCurrent();
@@ -1564,12 +1564,12 @@ function openAddEvent(topic, existing = null) {
     $('#dialogDelete').addEventListener('click', () => {
       openConfirm('Delete this event?', 'This cannot be undone via the snackbar — only via re-add.', async () => {
         const removed = { ...existing };
-        await WDDB.delete('events', existing.id);
+        await CWDB.delete('events', existing.id);
         state.events = state.events.filter((e) => e.id !== existing.id);
         closeModal();
         snack('Event deleted', {
           undo: async () => {
-            await WDDB.put('events', removed);
+            await CWDB.put('events', removed);
             state.events.push(removed);
             queueAutoSync('undoDelete');
             renderCurrent();
@@ -1701,20 +1701,20 @@ function openTopicEdit(existing) {
         name, desc, msureid,
         archived: $('#topicArchived')?.checked || false,
       };
-      await WDDB.put('topics', updated);
-      await WDDB.setTopicKind(existing.id, kind);
+      await CWDB.put('topics', updated);
+      await CWDB.setTopicKind(existing.id, kind);
       savedTopicId = existing.id;
     } else {
-      const id = await WDDB.nextId('topics');
+      const id = await CWDB.nextId('topics');
       const t = { id, name, desc, msureid, optype: 1, type: 1, archived: false };
-      await WDDB.put('topics', t);
-      const order = (await WDDB.getMeta('topicOrder')) || [];
+      await CWDB.put('topics', t);
+      const order = (await CWDB.getMeta('topicOrder')) || [];
       order.push(id);
-      await WDDB.setMeta('topicOrder', order);
-      await WDDB.setTopicKind(id, kind);
+      await CWDB.setMeta('topicOrder', order);
+      await CWDB.setTopicKind(id, kind);
       savedTopicId = id;
     }
-    await WDDB.setTopicMeta(savedTopicId, { emoji, color: selectedColor });
+    await CWDB.setTopicMeta(savedTopicId, { emoji, color: selectedColor });
     closeModal();
     await reload();
     snack('Saved');
@@ -1730,13 +1730,13 @@ function openTopicEdit(existing) {
         `This will permanently delete the topic AND all ${evCount.toLocaleString()} of its event${evCount === 1 ? '' : 's'}. This cannot be undone. Consider Archive instead if you just want to hide it.`,
         async () => {
           const evs = state.events.filter((e) => e.topicid === existing.id);
-          for (const e of evs) await WDDB.delete('events', e.id);
-          await WDDB.delete('topics', existing.id);
-          await WDDB.setTopicKind(existing.id, null);
-          await WDDB.setTopicMeta(existing.id, null);
-          await WDDB.setFavorite(existing.id, false);
-          const order = (await WDDB.getMeta('topicOrder')) || [];
-          await WDDB.setMeta('topicOrder', order.filter((x) => x !== existing.id));
+          for (const e of evs) await CWDB.delete('events', e.id);
+          await CWDB.delete('topics', existing.id);
+          await CWDB.setTopicKind(existing.id, null);
+          await CWDB.setTopicMeta(existing.id, null);
+          await CWDB.setFavorite(existing.id, false);
+          const order = (await CWDB.getMeta('topicOrder')) || [];
+          await CWDB.setMeta('topicOrder', order.filter((x) => x !== existing.id));
           closeModal();
           await reload();
           snack(`Deleted "${existing.name}" and ${evCount.toLocaleString()} event${evCount === 1 ? '' : 's'}`);
@@ -1823,7 +1823,7 @@ async function moveTopic(id, delta) {
 
 async function saveQuickBar(ids) {
   state.quickBar = ids.slice();
-  await WDDB.setQuickBar(state.quickBar);
+  await CWDB.setQuickBar(state.quickBar);
   queueAutoSync();
   renderCurrent();
 }
@@ -1924,7 +1924,7 @@ function triggerImport() {
     try {
       const text = await file.text();
       const obj = JSON.parse(text);
-      const errs = WDIO.validateBackup(obj);
+      const errs = CWIO.validateBackup(obj);
       if (errs.length) {
         openModal(`
           <header><button class="icon-btn" data-close>←</button><div class="title">Import errors</div></header>
@@ -1937,7 +1937,7 @@ function triggerImport() {
         `);
         return;
       }
-      const sum = WDIO.summarize(obj);
+      const sum = CWIO.summarize(obj);
       const dateRange = sum.events
         ? `${sum.minTime ? fmtDateLong(sum.minTime) : '?'} → ${sum.maxTime ? fmtDateLong(sum.maxTime) : '?'}`
         : '(none)';
@@ -1965,7 +1965,7 @@ function triggerImport() {
         </div>
       `);
       $('#impMerge').addEventListener('click', async () => {
-        await WDIO.importMerge(obj);
+        await CWIO.importMerge(obj);
         closeModal();
         await reload();
         snack(`Merged ${sum.events.toLocaleString()} events`);
@@ -1973,8 +1973,8 @@ function triggerImport() {
         renderCurrent();
       });
       $('#impReplace').addEventListener('click', async () => {
-        await WDIO.safetyBackup();
-        await WDIO.importReplace(obj);
+        await CWIO.safetyBackup();
+        await CWIO.importReplace(obj);
         closeModal();
         await reload();
         snack(`Loaded ${sum.events.toLocaleString()} events`);
@@ -1989,27 +1989,27 @@ function triggerImport() {
 }
 
 async function doExport() {
-  await WDIO.exportToFile('whendidibk.json');
-  snack('Exported whendidibk.json');
+  await CWIO.exportToFile('countwhen-backup.json');
+  snack('Exported countwhen-backup.json');
 }
 
 async function doExportCsv() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}`;
-  await WDIO.exportToCsv(`countwhen-events-${stamp}.csv`);
+  await CWIO.exportToCsv(`countwhen-events-${stamp}.csv`);
   snack('Exported CSV');
 }
 
 async function doSafetyBackup() {
-  await WDIO.safetyBackup();
+  await CWIO.safetyBackup();
   snack('Safety backup downloaded');
 }
 
 /* ======== MENU ACTIONS ======== */
 
 function openDrive() {
-  WDDRIVE.openSetupDialog({ openModal, closeModal, snack, reload, renderCurrent });
+  CWDRIVE.openSetupDialog({ openModal, closeModal, snack, reload, renderCurrent });
 }
 
 function openAbout() {
@@ -2020,7 +2020,7 @@ function openAbout() {
       <p>An offline-first event tracker. Log a moment in one tap, then look back
       across days, weeks, and months to spot the patterns you'd otherwise miss.</p>
       <p>All data lives only on this device in IndexedDB. Use Export JSON or Google Drive sync
-      to back it up. Imports and exports the <code>whendidibk.json</code> format, so history
+      to back it up. Imports and exports a plain JSON backup, so history
       from older trackers comes across intact.</p>
     </div>
     <div class="actions"><button class="btn" data-close>OK</button></div>
@@ -2034,9 +2034,9 @@ async function openStorageStatus() {
     if (navigator.storage?.persisted) persisted = await navigator.storage.persisted();
     if (navigator.storage?.estimate) quota = await navigator.storage.estimate();
   } catch (e) {}
-  const lastImport = await WDDB.getMeta('lastImport');
-  const lastExport = await WDDB.getMeta('lastExport');
-  const lastDrive = await WDDB.getMeta('lastDriveSync');
+  const lastImport = await CWDB.getMeta('lastImport');
+  const lastExport = await CWDB.getMeta('lastExport');
+  const lastDrive = await CWDB.getMeta('lastDriveSync');
 
   openModal(`
     <header><button class="icon-btn" data-close>←</button><div class="title">Storage status</div></header>
@@ -2065,16 +2065,16 @@ function openWipe() {
     'Wipe all local data?',
     `This deletes all ${state.events.length.toLocaleString()} events and ${state.topics.length} topics from this device. A safety backup will be downloaded first.`,
     async () => {
-      await WDIO.safetyBackup();
-      await WDDB.clearAll();
-      await WDDB.seedDefaults();
+      await CWIO.safetyBackup();
+      await CWDB.clearAll();
+      await CWDB.seedDefaults();
       closeModal();
       await reload();
       // A wipe must overwrite Drive rather than merge, otherwise the next
       // sync would helpfully restore everything we just deleted.
       let msg = 'All data wiped';
       try {
-        await window.WDDRIVE?.syncNow?.({ interactive: false, force: true });
+        await window.CWDRIVE?.syncNow?.({ interactive: false, force: true });
       } catch (e) {
         if (e && e.message !== 'NO_CLIENT_ID') msg += ' (Drive copy unchanged)';
       }
@@ -2192,7 +2192,7 @@ function topicColor(topic) {
 /* ======== TAG / SEVERITY / NOTE RENDERING ======== */
 function renderNoteWithTags(note) {
   if (!note) return '';
-  const tags = WDSTATS.parseTags(note);
+  const tags = CWSTATS.parseTags(note);
   if (!tags.length) return escapeHtml(note);
   let out = '';
   let cursor = 0;
@@ -2237,7 +2237,7 @@ let _expectingPop = 0;
 function pushOverlayState(kind) {
   _overlayStack.push(kind);
   try {
-    history.pushState({ wd_overlay: kind, n: _overlayStack.length }, '');
+    history.pushState({ cw_overlay: kind, n: _overlayStack.length }, '');
   } catch (_) { /* private mode etc. */ }
 }
 
@@ -2246,7 +2246,7 @@ function popOverlayState(kind) {
   const top = _overlayStack[_overlayStack.length - 1];
   if (top !== kind) return;
   _overlayStack.pop();
-  if (history.state?.wd_overlay) {
+  if (history.state?.cw_overlay) {
     _expectingPop++;
     try { history.back(); } catch (_) { _expectingPop--; }
   }
@@ -2279,8 +2279,8 @@ function escapeHtml(s) {
 /* ======== AUTO-SYNC (calls into drive.js if configured) ======== */
 function queueAutoSync(reason = 'change') {
   state.insightsDirty = true;   // data changed -> recompute insights lazily
-  if (window.WDDRIVE?.queueAutoSync) {
-    window.WDDRIVE.queueAutoSync(reason);
+  if (window.CWDRIVE?.queueAutoSync) {
+    window.CWDRIVE.queueAutoSync(reason);
   }
 }
 
@@ -2320,7 +2320,7 @@ function openTopicPicker() {
 
 async function init() {
   try {
-    await WDDB.seedDefaults();
+    await CWDB.seedDefaults();
   } catch (e) { console.error(e); }
 
   // request persistent storage early
@@ -2342,9 +2342,9 @@ async function init() {
   $('#fab').addEventListener('click', openTopicPicker);
   $('#syncPill').addEventListener('click', async (e) => {
     e.stopPropagation();
-    if (!window.WDDRIVE) return;
+    if (!window.CWDRIVE) return;
     try {
-      const res = await window.WDDRIVE.syncNow({ interactive: true });
+      const res = await window.CWDRIVE.syncNow({ interactive: true });
       if (res?.action === 'merged' && res.changedLocally) {
         await reload(); renderCurrent();
         snack(`Merged with Drive: ${res.stats?.fromRemote || 0} pulled in`);
@@ -2372,7 +2372,7 @@ async function init() {
   $('#navStorage').addEventListener('click', () => { closeDrawer(); openStorageStatus(); });
   $('#navWipe').addEventListener('click', () => { closeDrawer(); openWipe(); });
   const drawerVersionEl = $('#drawerVersion');
-  if (drawerVersionEl) drawerVersionEl.textContent = window.WD_VERSION || '';
+  if (drawerVersionEl) drawerVersionEl.textContent = window.CW_VERSION || '';
 
   // Back-gesture handler: close overlays instead of exiting the PWA
   window.addEventListener('popstate', handlePopState);
@@ -2387,8 +2387,8 @@ async function init() {
   setView('categories');
 
   // Attempt a silent startup sync if Drive is configured.
-  if (window.WDDRIVE?.startupSync) {
-    try { await window.WDDRIVE.startupSync(); } catch (_) {}
+  if (window.CWDRIVE?.startupSync) {
+    try { await window.CWDRIVE.startupSync(); } catch (_) {}
   }
 
   // Flare-up check (opt-in, throttled).
@@ -2398,7 +2398,7 @@ async function init() {
 window.addEventListener('DOMContentLoaded', init);
 // Exposed for inline onclick in empty states + drive.js callbacks
 window.openTopicEdit = openTopicEdit;
-window.WDAPP = {
+window.CWAPP = {
   reload,
   renderCurrent,
   snack,
