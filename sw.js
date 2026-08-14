@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'countwhen-v7.1.0-2026-08-12';
+const CACHE_VERSION = 'countwhen-v7.2.0-2026-08-14';
 
 const SHELL = [
   './',
@@ -16,6 +16,7 @@ const SHELL = [
   './js/import-export.js',
   './js/stats.js',
   './js/insights.js',
+  './js/goals.js',
   './js/drive.js',
   './js/app.js',
   './vendor/chart.umd.min.js',

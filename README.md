@@ -27,8 +27,9 @@ Open in Chrome on your phone, tap ⋮ → **Install app**. Done.
 
 On a fresh install you pick a starting point — 🩺 **Symptom Tracker**,
 🥤 **Daily Habits**, 🏋️ **Fitness & Health**, or 🛠️ **Custom** (blank).
-A preset just seeds a handful of topics with sensible insight roles;
-rename, delete or add to them freely. Restoring a backup skips it.
+A preset just seeds a handful of topics with sensible insight roles
+and starter goals; rename, delete or add to them freely. Restoring a
+backup skips it.
 
 ## Update workflow (for the dev)
 
@@ -72,7 +73,47 @@ No drag-and-drop, no console clicks. Pages handles the rest.
   answering "what actually happened on Tuesday?".
 - **Statistics** — daily / weekly / monthly counts (and sums for
   measured topics like ounces / gallons) with a bar chart.
+- **Goals & streaks** — see below.
 - **Insights** — see below.
+
+### Goals & streaks (v7.2)
+
+Insights explain *variance* — what makes a number move. Habits ask a
+different question: *am I keeping it up?* A goal answers that one.
+
+Set a goal on any topic (⚙️ in the topic editor, the 🎯 button, or by
+tapping a streak chip):
+
+- **at least N per day / week** — build something. Workouts, water,
+  pages read, meds taken.
+- **at most N per day / week** — limit something. Cigarettes, coffees,
+  takeaways, slip-ups. *At most 0 per day* is the classic
+  quit-something counter.
+
+The unit follows the topic type: times for a time-only topic, minutes
+for a duration, the measurement's unit for an amount.
+
+Your current streak shows as a chip on the home screen, and the
+Statistics tab adds a full panel — current streak, best ever, the
+completion rate over the last 30 periods, and a dot per period so a
+run of misses is visible without reading a number.
+
+Three rules are worth knowing, because they're what make a streak
+honest:
+
+- **Days you logged nothing still count.** *At most 0* is met exactly
+  on the days you logged nothing, so periods are built by walking the
+  calendar, not by grouping your events.
+- **Today is treated asymmetrically.** An *at least* goal you haven't
+  hit yet is still winnable, so it shows as pending and doesn't break
+  the streak. An *at most* goal you've already blown is broken now.
+- **A streak can't predate its goal.** It starts from whichever came
+  first: the day you set the goal, or your first logged event. Without
+  that, *at most 0* would claim a streak running back to the dawn of
+  time.
+
+Days roll over at 4am (configurable), same as everywhere else, so a
+2am log counts toward the night before.
 
 ### Insights (v7)
 
@@ -183,15 +224,16 @@ python3 -m http.server 8000 --bind 0.0.0.0
 Then on the phone: `http://<your-mac-IP>:8000`. (Service worker
 *won't* register over LAN HTTP though — install needs HTTPS.)
 
-Four Node smoke tests run without a browser:
+Five Node smoke tests run without a browser:
 
 ```sh
 npm install                                # dev-only: jsdom + fake-indexeddb
-npm test                                   # insights + drive + ui
+npm test                                   # insights + goals + drive + ui
 
 node insights-smoke.js                     # statistics engine + role migration
+node goals-smoke.js                        # streak rules and edge cases
 node drive-smoke.js                        # Drive snapshot rotation + legacy cleanup
-node ui-smoke.js                           # onboarding, every tab, role editor
+node ui-smoke.js                           # onboarding, every tab, goal + role editors
 node smoke-test.js <path-to-backup.json>   # import → DB → export round-trip
 ```
 
@@ -201,6 +243,8 @@ exists only so the tests can run.
 - `insights-smoke.js` plants a known cause in synthetic data and checks
   the engine recovers it, in both directions, and that legacy role
   strings still migrate.
+- `goals-smoke.js` pins the streak rules: zero days, the asymmetry of
+  today, clamping, weekly aggregation and the day cutoff.
 - `drive-smoke.js` runs `js/drive.js` against an in-memory fake of the
   Drive v3 API, so it needs no credentials and touches no real files.
 - `ui-smoke.js` loads the real `index.html` and app scripts in jsdom

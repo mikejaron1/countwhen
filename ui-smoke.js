@@ -44,9 +44,15 @@ const load = (rel) => {
     errors.push(`load ${rel}: ${e.stack}`);
   }
 };
-['js/config.js', 'js/db.js', 'js/stats.js', 'js/insights.js', 'js/drive.js', 'js/app.js']
-  .filter((f) => fs.existsSync(path.join(ROOT, f)))
-  .forEach(load);
+
+/* Take the script list straight from index.html, in order, so adding a module
+ * to the app can never silently leave it untested. */
+const scripts = [...fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8')
+  .matchAll(/<script[^>]*src="(?!https?:)([^"]+)"/g)]
+  .map((m) => m[1].replace(/^\.\//, ''))
+  .filter((f) => !f.startsWith('vendor/'));   // Chart.js is stubbed; jsdom has no canvas
+if (!scripts.includes('js/app.js')) throw new Error('no app scripts found in index.html');
+scripts.forEach(load);
 
 (async () => {
   const D = w.CWDB;
@@ -72,19 +78,28 @@ const load = (rel) => {
   assert(Object.values(norm).some((r) => r.role === 'focus'), 'preset must define a focus');
   assert(await w.eval('needsOnboarding()') === false, 'onboarding should not repeat');
 
-  // 3. Seed ~200 days of events with a planted next-day effect, then render.
+  // 3. Seed ~200 days of events with a planted effect, then render.
+  //    Every event is anchored to a fixed hour of its *logical* day (the app
+  //    rolls days over at 4am) so the run is identical whatever time of day
+  //    the suite happens to be executed at.
   const byName = Object.fromEntries(topics.map((t) => [t.name, t.id]));
   let eid = 1;
   const evs = [];
-  const now = Date.now();
+  const at = (daysAgo, hour) => {
+    const d = new Date();
+    d.setHours(hour, 0, 0, 0);
+    d.setDate(d.getDate() - daysAgo);
+    return d.getTime();
+  };
   for (let d = 200; d >= 0; d--) {
-    const day = now - d * 86400000;
     const lateMeal = d % 3 === 0;
-    evs.push({ id: eid++, topicid: byName['Meal'], time: day - (lateMeal ? 0 : 9) * 3600000, qant: 0, cost: 0 });
+    evs.push({ id: eid++, topicid: byName['Meal'], time: at(d, lateMeal ? 21 : 9), qant: 0, cost: 0 });
     const n = lateMeal ? 4 : 1;
-    for (let i = 0; i < n; i++) evs.push({ id: eid++, topicid: byName['Symptom'], time: day + i * 1800000, qant: 0, cost: 0 });
-    evs.push({ id: eid++, topicid: byName['Sleep'], time: day - 12 * 3600000, qant: 25200, cost: 0 });
-    if (d % 17 === 0) evs.push({ id: eid++, topicid: byName['Bad day'], time: day, qant: 0, cost: 0 });
+    for (let i = 0; i < n; i++) {
+      evs.push({ id: eid++, topicid: byName['Symptom'], time: at(d, 12) + i * 1800000, qant: 0, cost: 0 });
+    }
+    evs.push({ id: eid++, topicid: byName['Sleep'], time: at(d, 22), qant: 25200, cost: 0 });
+    if (d % 17 === 0) evs.push({ id: eid++, topicid: byName['Bad day'], time: at(d, 13), qant: 0, cost: 0 });
   }
   await D.putMany('events', evs);
   await w.eval('reload()');
@@ -105,7 +120,53 @@ const load = (rel) => {
   assert(!/bathroom|trips|flare-up|poop/i.test(ins), 'domain vocabulary leaked into the UI');
   ok('insights renders the full analysis with the user\'s own vocabulary');
 
-  // 5. The dialogs all open without throwing.
+  // 5. Goals: the streak chip appears on the home screen and the editor
+  //    round-trips. The symptom preset ships an "at most 0 per day" goal.
+  const goals = await D.getTopicGoals();
+  assert(Object.keys(goals).length >= 1, 'preset should seed at least one goal');
+  w.eval(`setView('categories')`);
+  const home = w.document.querySelector('#main').innerHTML;
+  assert(/goal-chip/.test(home), 'no streak chip rendered on the home screen');
+  ok('preset goals render a streak chip on the home screen');
+
+  w.eval(`setView('stats')`);
+  const symptomId = byName['Symptom'];
+  const topicSel = w.document.querySelector('#statsTopic');
+  topicSel.value = String(symptomId);
+  topicSel.dispatchEvent(new w.Event('change'));
+  const statsHtml = w.document.querySelector('#main').innerHTML;
+  assert(/goal-section/.test(statsHtml), 'stats is missing the goal panel');
+  assert(/goal-dot/.test(statsHtml), 'stats is missing the period dots');
+  ok('stats renders the goal panel');
+
+  // The Symptom topic is logged every day, so an "at most 0/day" goal is blown.
+  const symptomGoal = w.eval(`JSON.stringify(goalFor({ id: ${symptomId} }))`);
+  const parsed = JSON.parse(symptomGoal);
+  assert(parsed && parsed.current === 0, 'a daily-logged topic cannot hold an "at most 0" streak');
+  ok('streak math reflects the seeded history');
+
+  // 6. The goal editor round-trips through the DB and moves the streak.
+  //    Sleep is logged every single day, so "at least 1 per day" must show a
+  //    long streak the moment the goal is saved.
+  w.eval(`setView('stats')`);
+  const sleepSel = w.document.querySelector('#statsTopic');
+  sleepSel.value = String(byName['Sleep']);
+  sleepSel.dispatchEvent(new w.Event('change'));
+  w.document.querySelector('#editGoal').dispatchEvent(new w.Event('click'));
+  w.document.querySelector('#goalCmp').value = 'gte';
+  w.document.querySelector('#goalTarget').value = '1';
+  w.document.querySelector('#goalPeriod').value = 'day';
+  w.document.querySelector('#goalSave').dispatchEvent(new w.Event('click'));
+  await new Promise((r) => setTimeout(r, 80));
+  const savedGoal = (await D.getTopicGoals())[byName['Sleep']];
+  assert(savedGoal && savedGoal.cmp === 'gte' && savedGoal.target === 1,
+    'goal editor did not persist: ' + JSON.stringify(savedGoal));
+  assert(savedGoal.metric === 'minutes', 'a duration topic should measure minutes');
+  const sleepRes = JSON.parse(w.eval(`JSON.stringify(goalFor({ id: ${byName['Sleep']} }))`));
+  assert(sleepRes.current > 100, `expected a long streak, got ${sleepRes.current}`);
+  ok('goal editor saves and the streak updates immediately');
+
+  // 7. The dialogs all open without throwing.
   for (const fn of ['openRolesSetup()', 'openAlertsDialog()']) {
     w.eval(fn);
     assert(w.document.querySelector('#modalRoot .dialog'), `${fn} did not open`);
@@ -113,7 +174,7 @@ const load = (rel) => {
     ok(`${fn} opens`);
   }
 
-  // 6. Saving roles round-trips the new dir/timing fields.
+  // 8. Saving roles round-trips the new dir/timing fields.
   w.eval('openRolesSetup()');
   const sel = w.document.querySelector(`[data-role-topic="${byName['Symptom']}"]`);
   sel.value = 'focus';

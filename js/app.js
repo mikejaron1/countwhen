@@ -12,6 +12,7 @@ const state = {
   topicMeta: {},  // topicId -> { emoji, color }
   quickBar: [],   // fixed, user-curated ordered list of topic ids for the quick-access bar
   topicRoles: {}, // topicId -> { role: 'focus'|'marker'|'influence', dir, timing }
+  topicGoals: {}, // topicId -> { metric, cmp, target, period, since }
   insightSettings: null,
   insights: null,           // cached result of CWINSIGHTS.analyze()
   insightsDirty: true,      // recompute on next Insights render
@@ -155,7 +156,7 @@ function topicKind(topic) {
 
 async function reload() {
   const [topics, events, measurements, favIds, topicKinds, topicMeta,
-         topicRoles, insightSettings] = await Promise.all([
+         topicRoles, insightSettings, topicGoals] = await Promise.all([
     CWDB.getAll('topics'),
     CWDB.getAll('events'),
     CWDB.getAll('measurements'),
@@ -164,6 +165,7 @@ async function reload() {
     CWDB.getAllTopicMeta(),
     CWDB.getTopicRoles(),
     CWDB.getInsightSettings(),
+    CWDB.getTopicGoals(),
   ]);
   const savedOrder = (await CWDB.getMeta('topicOrder')) || [];
   const knownIds = new Set(topics.map((t) => t.id));
@@ -189,6 +191,7 @@ async function reload() {
   state.topicKinds = topicKinds || {};
   state.topicMeta = topicMeta || {};
   state.topicRoles = topicRoles || {};
+  state.topicGoals = topicGoals || {};
   state.insightSettings = insightSettings;
   state.insightsDirty = true;
   // Quick-access bar: keep only ids that still map to existing, non-archived topics.
@@ -216,6 +219,24 @@ async function saveTopicOrder(orderIds) {
     if (!orderIds.includes(t.id)) state.topics.push(t);
   }
   queueAutoSync();
+}
+
+/* Evaluates a topic's goal against its events, or null when it has none.
+ * Deliberately stateless — it reads live state.events every time, so a freshly
+ * logged event moves the streak immediately with no cache to invalidate. */
+function goalFor(topic) {
+  const goal = topic && state.topicGoals?.[topic.id];
+  if (!goal) return null;
+  return CWGOALS.evaluate({
+    events: state.events.filter((e) => e.topicid === topic.id),
+    goal,
+    kind: topicKind(topic),
+    cutoffHour: insightsSettings().cutoffHour,
+  });
+}
+
+function topicMeasurement(topic) {
+  return state.measurements.find((m) => m.id === topic?.msureid) || null;
 }
 
 function lastEventForTopic(topicid) {
@@ -319,6 +340,7 @@ function renderCategories() {
           <div class="name">${emoji ? `<span class="card-emoji">${escapeHtml(emoji)}</span>` : ''}${escapeHtml(t.name)}</div>
           ${t.desc ? `<div class="desc">${escapeHtml(t.desc)}</div>` : ''}
           <div class="last">${lastLine}</div>
+          ${goalChipHtml(t)}
         </div>
         <div class="actions">
           <button class="add-btn" data-add="${t.id}">ADD</button>
@@ -352,11 +374,51 @@ function renderCategories() {
     });
   });
 
+  $$('[data-goal]').forEach((chip) => {
+    chip.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = Number(e.currentTarget.dataset.goal);
+      const topic = state.topics.find((t) => t.id === id);
+      if (topic) openGoalEdit(topic);
+    });
+  });
+
   attachReorder($('#categoriesList'), (newOrderIds) => {
     saveTopicOrder(newOrderIds);
   });
 
   $('#addTopicBtn').addEventListener('click', () => openTopicEdit(null));
+}
+
+/* Compact streak chip shown under a topic on the home screen. This is the
+ * habit-tracking payoff, so it has to read at a glance: the streak number,
+ * and whether today is already safe, still open, or blown. */
+function goalChipHtml(topic) {
+  const res = goalFor(topic);
+  if (!res) return '';
+  const g = res.goal;
+  const m = topicMeasurement(topic);
+  const unit = CWGOALS.PERIODS.find((p) => p.key === g.period);
+  const noun = res.current === 1 ? unit.label : unit.plural;
+
+  let cls, icon, text;
+  if (g.cmp === 'lte' && !res.met) {
+    cls = 'miss'; icon = '⚠️';
+    text = `Over limit — ${escapeHtml(CWGOALS.fmtValue(res.value, g, m))} (max ${escapeHtml(CWGOALS.fmtValue(g.target, g, m))})`;
+  } else if (res.pending) {
+    cls = 'open'; icon = '⭕';
+    const left = CWGOALS.fmtValue(res.remaining, g, m);
+    text = res.current
+      ? `${res.current} ${noun} · ${escapeHtml(left)} to go`
+      : `${escapeHtml(left)} to go ${g.period === 'day' ? 'today' : 'this week'}`;
+  } else {
+    cls = res.current >= 3 ? 'hot' : 'ok';
+    icon = res.current >= 3 ? '🔥' : '✅';
+    text = res.current
+      ? `${res.current} ${noun}${g.cmp === 'lte' ? ' within limit' : ' in a row'}`
+      : 'Goal met';
+  }
+  return `<button class="goal-chip ${cls}" data-goal="${topic.id}"><span>${icon}</span>${text}</button>`;
 }
 
 /* Long-press to drag, pointermove to reorder live. */
@@ -745,6 +807,7 @@ function renderStats() {
   }).join('');
 
   main.innerHTML = `
+    ${renderGoalSection(topic)}
     <div class="period-tabs" id="periodTabs" role="tablist">
       <button class="tab" data-period="daily"   aria-selected="${state.statsPeriod==='daily'}">Daily</button>
       <button class="tab" data-period="weekly"  aria-selected="${state.statsPeriod==='weekly'}">Weekly</button>
@@ -793,12 +856,58 @@ function renderStats() {
     state.statsTopicId = Number(e.target.value);
     renderStats();
   });
+  $('#editGoal')?.addEventListener('click', () => openGoalEdit(topic));
 
   // Render charts
   drawOverTime(events, topic);
   drawTimeOfDay(events);
   drawDayOfWeek(events);
   drawHeatmap(events);
+}
+
+/* Full goal panel for the selected topic: the streak, how it compares to the
+ * best run, and a dot per recent period so a pattern of misses is visible
+ * without reading any numbers. */
+function renderGoalSection(topic) {
+  const res = goalFor(topic);
+  const m = topicMeasurement(topic);
+  if (!res) {
+    return `<div class="stats-section goal-section">
+      <h3>Goal</h3>
+      <p class="muted-small">No goal set for <em>${escapeHtml(topic.name)}</em>.
+      Set one to track a streak — “at least 1 per day” to build a habit, or
+      “at most 0 per day” to break one.</p>
+      <button class="btn secondary small" id="editGoal">Set a goal</button>
+    </div>`;
+  }
+  const g = res.goal;
+  const unit = CWGOALS.PERIODS.find((p) => p.key === g.period);
+  const dots = res.periods.slice(-30).map((p) => {
+    const cls = p.pending ? 'pending' : p.met ? 'met' : 'miss';
+    const when = p.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    const label = `${when}: ${CWGOALS.fmtValue(p.value, g, m)}`;
+    return `<span class="goal-dot ${cls}" title="${escapeHtml(label)}"></span>`;
+  }).join('');
+
+  const rate = res.rate == null ? '—' : `${Math.round(res.rate * 100)}%`;
+  const nounNow = res.current === 1 ? unit.label : unit.plural;
+  const nounBest = res.best === 1 ? unit.label : unit.plural;
+
+  return `<div class="stats-section goal-section">
+    <h3>Goal</h3>
+    <p class="goal-headline">${escapeHtml(CWGOALS.streakLine(res, m))}</p>
+    <p class="muted-small">${escapeHtml(CWGOALS.describeGoal(g, m))} ·
+      currently ${escapeHtml(CWGOALS.fmtValue(res.value, g, m))}
+      ${g.period === 'day' ? 'today' : 'this week'}</p>
+    <div class="stats-cards goal-cards">
+      <div><b>${res.current}</b><span>current ${nounNow}</span></div>
+      <div><b>${res.best}</b><span>best ${nounBest}</span></div>
+      <div><b>${rate}</b><span>last ${res.totalRecent} ${res.totalRecent === 1 ? unit.label : unit.plural}</span></div>
+      <div><b>${res.metRecent}</b><span>met</span></div>
+    </div>
+    <div class="goal-dots">${dots}</div>
+    <button class="btn secondary small" id="editGoal">Edit goal</button>
+  </div>`;
 }
 
 /* Chart.js theming — follows the app's light/dark tokens so axis labels
@@ -1324,6 +1433,95 @@ function openRolesSetup() {
   });
 }
 
+/* ---- goal editor ---- */
+
+function openGoalEdit(topic) {
+  const kind = topicKind(topic);
+  const m = topicMeasurement(topic);
+  const existing = CWGOALS.normalizeGoal(state.topicGoals?.[topic.id], kind);
+  const g = existing || CWGOALS.suggestGoal(kind);
+  const unit = CWGOALS.unitLabel(g, m);
+  const unitWord = unit === '×' ? 'times' : unit;
+
+  openModal(`
+    <header><button class="icon-btn" data-close>←</button>
+      <div class="title">Goal · ${escapeHtml(topic.name)}</div></header>
+    <div class="body">
+      <p class="muted-small">A goal turns this topic into a streak. Use
+      <strong>at least</strong> to build a habit, or <strong>at most</strong> to
+      keep a lid on one — “at most 0 per day” is the classic quit-something
+      counter.</p>
+      <div class="goal-form">
+        <select id="goalCmp">
+          ${CWGOALS.CMPS.map((c) =>
+            `<option value="${c.key}" ${g.cmp === c.key ? 'selected' : ''}>${escapeHtml(c.label)}</option>`).join('')}
+        </select>
+        <input id="goalTarget" type="number" inputmode="decimal" min="0" step="any"
+               value="${g.target}" />
+        <span class="goal-unit">${escapeHtml(unitWord)}</span>
+        <span class="goal-per">per</span>
+        <select id="goalPeriod">
+          ${CWGOALS.PERIODS.map((p) =>
+            `<option value="${p.key}" ${g.period === p.key ? 'selected' : ''}>${escapeHtml(p.label)}</option>`).join('')}
+        </select>
+      </div>
+      <p class="muted-small" id="goalPreview"></p>
+    </div>
+    <div class="actions">
+      ${existing ? `<button class="btn danger" id="goalRemove">Remove</button>` : ''}
+      <button class="btn secondary" data-close>Cancel</button>
+      <button class="btn" id="goalSave">Save</button>
+    </div>
+  `);
+
+  const read = () => ({
+    metric: g.metric,
+    cmp: $('#goalCmp').value,
+    target: Number($('#goalTarget').value),
+    period: $('#goalPeriod').value,
+    since: existing ? existing.since : Date.now(),
+  });
+
+  const preview = () => {
+    const draft = CWGOALS.normalizeGoal(read(), kind);
+    const el = $('#goalPreview');
+    if (!draft) {
+      el.textContent = '“At least 0” would always pass — enter a target above zero.';
+      return;
+    }
+    const res = CWGOALS.evaluate({
+      events: state.events.filter((e) => e.topicid === topic.id),
+      goal: draft, kind, cutoffHour: insightsSettings().cutoffHour,
+    });
+    el.textContent = `${CWGOALS.describeGoal(draft, m)} — on your history so far, `
+      + `that's ${CWGOALS.streakLine(res, m).toLowerCase()}`;
+  };
+
+  ['#goalCmp', '#goalTarget', '#goalPeriod'].forEach((sel) => {
+    $(sel).addEventListener('input', preview);
+    $(sel).addEventListener('change', preview);
+  });
+  preview();
+
+  $('#goalSave').addEventListener('click', async () => {
+    const draft = CWGOALS.normalizeGoal(read(), kind);
+    if (!draft) { snack('Enter a target above zero'); return; }
+    state.topicGoals = await CWDB.setTopicGoal(topic.id, draft);
+    closeModal();
+    snack('Goal saved');
+    queueAutoSync('saveGoal');
+    renderCurrent();
+  });
+
+  $('#goalRemove')?.addEventListener('click', async () => {
+    state.topicGoals = await CWDB.setTopicGoal(topic.id, null);
+    closeModal();
+    snack('Goal removed');
+    queueAutoSync('removeGoal');
+    renderCurrent();
+  });
+}
+
 /* ---- alerts ---- */
 
 function openAlertsDialog() {
@@ -1717,6 +1915,14 @@ function openTopicEdit(existing) {
       </div>
       ${existing ? `
         <div class="field">
+          <label>Goal &amp; streak</label>
+          <button class="btn secondary" id="topicGoalBtn" style="width:100%;">
+            🎯 ${escapeHtml(CWGOALS.describeGoal(state.topicGoals?.[existing.id], topicMeasurement(existing)) || 'Set a goal')}
+          </button>
+          <p class="muted-small" style="padding:6px 0 0;">Track a streak — “at least 1 per day”
+          to build a habit, “at most 0 per day” to break one.</p>
+        </div>
+        <div class="field">
           <label>
             <input type="checkbox" id="topicArchived" ${existing.archived?'checked':''}> Archived (hides from Categories without deleting events)
           </label>
@@ -1789,6 +1995,10 @@ function openTopicEdit(existing) {
   });
 
   if (existing) {
+    $('#topicGoalBtn').addEventListener('click', () => {
+      closeModal();
+      openGoalEdit(existing);
+    });
     $('#topicDelete').addEventListener('click', () => {
       const evCount = state.events.filter((e) => e.topicid === existing.id).length;
       openConfirm(
@@ -1800,6 +2010,7 @@ function openTopicEdit(existing) {
           await CWDB.delete('topics', existing.id);
           await CWDB.setTopicKind(existing.id, null);
           await CWDB.setTopicMeta(existing.id, null);
+          await CWDB.setTopicGoal(existing.id, null);
           await CWDB.setFavorite(existing.id, false);
           const order = (await CWDB.getMeta('topicOrder')) || [];
           await CWDB.setMeta('topicOrder', order.filter((x) => x !== existing.id));
@@ -2396,9 +2607,11 @@ const PRESETS = [
     name: 'Symptom Tracker',
     blurb: 'Track flare-ups, pain and triggers — and find out what sets them off.',
     topics: [
-      { name: 'Symptom',   kind: 'timeonly', emoji: '🤒', color: '#e05252', role: 'focus', dir: 'down' },
+      { name: 'Symptom',   kind: 'timeonly', emoji: '🤒', color: '#e05252', role: 'focus', dir: 'down',
+        goal: { cmp: 'lte', target: 0, period: 'day' } },
       { name: 'Bad day',   kind: 'timeonly', emoji: '🚩', color: '#c2410c', role: 'marker' },
-      { name: 'Medication',kind: 'timeonly', emoji: '💊', color: '#7c5cff' },
+      { name: 'Medication',kind: 'timeonly', emoji: '💊', color: '#7c5cff',
+        goal: { cmp: 'gte', target: 1, period: 'day' } },
       { name: 'Meal',      kind: 'timeonly', emoji: '🍽️', color: '#f59e0b', role: 'influence', timing: true },
       { name: 'Sleep',     kind: 'duration', emoji: '😴', color: '#3b82f6', role: 'influence', timing: true },
     ],
@@ -2407,12 +2620,15 @@ const PRESETS = [
     id: 'habits',
     icon: '🥤',
     name: 'Daily Habits',
-    blurb: 'Coffee, water, screens, smokes — count what you do and see the pattern.',
+    blurb: 'Coffee, water, screens, smokes — build streaks and see the pattern.',
     topics: [
-      { name: 'Coffee',    kind: 'timeonly', emoji: '☕', color: '#a16207', role: 'focus', dir: 'down', timing: true },
-      { name: 'Water',     kind: 'amount',   emoji: '💧', color: '#0ea5e9' },
+      { name: 'Coffee',    kind: 'timeonly', emoji: '☕', color: '#a16207', role: 'focus', dir: 'down', timing: true,
+        goal: { cmp: 'lte', target: 2, period: 'day' } },
+      { name: 'Water',     kind: 'amount',   emoji: '💧', color: '#0ea5e9', unit: 'ounces',
+        goal: { cmp: 'gte', target: 64, period: 'day' } },
       { name: 'Screen time', kind: 'duration', emoji: '📱', color: '#64748b', role: 'influence' },
-      { name: 'Slipped up', kind: 'timeonly', emoji: '🚩', color: '#c2410c', role: 'marker' },
+      { name: 'Slipped up', kind: 'timeonly', emoji: '🚩', color: '#c2410c', role: 'marker',
+        goal: { cmp: 'lte', target: 0, period: 'day' } },
       { name: 'Sleep',     kind: 'duration', emoji: '😴', color: '#3b82f6', role: 'influence', timing: true },
     ],
   },
@@ -2422,9 +2638,11 @@ const PRESETS = [
     name: 'Fitness & Health',
     blurb: 'Workouts, weight and steps — see what actually moves the numbers.',
     topics: [
-      { name: 'Workout',   kind: 'duration', emoji: '🏋️', color: '#16a34a', role: 'focus', dir: 'up' },
-      { name: 'Weight',    kind: 'amount',   emoji: '⚖️', color: '#7c5cff' },
-      { name: 'Walk',      kind: 'duration', emoji: '🚶', color: '#0ea5e9', role: 'influence' },
+      { name: 'Workout',   kind: 'duration', emoji: '🏋️', color: '#16a34a', role: 'focus', dir: 'up',
+        goal: { cmp: 'gte', target: 150, period: 'week' } },
+      { name: 'Weight',    kind: 'amount',   emoji: '⚖️', color: '#7c5cff', unit: 'pounds' },
+      { name: 'Walk',      kind: 'duration', emoji: '🚶', color: '#0ea5e9', role: 'influence',
+        goal: { cmp: 'gte', target: 20, period: 'day' } },
       { name: 'Rest day',  kind: 'timeonly', emoji: '🛌', color: '#94a3b8', role: 'marker' },
       { name: 'Sleep',     kind: 'duration', emoji: '😴', color: '#3b82f6', role: 'influence', timing: true },
     ],
@@ -2438,18 +2656,24 @@ const PRESETS = [
   },
 ];
 
-/* Amount topics need a measurement; everything else uses the generic default. */
-function presetMeasurementId(kind) {
-  return 10;
+/* Time-only and duration topics use the generic duration measurement; an
+ * amount topic needs a real unit, or its quantities would render as hh:mm. */
+function presetMeasurementId(spec) {
+  if (spec.kind !== 'amount') return 10;
+  const byName = Object.fromEntries(
+    (window.CWDB_DEFAULT_MEASUREMENTS || []).map((m) => [m.name, m.id])
+  );
+  return byName[spec.unit] ?? byName.count ?? 100;
 }
 
 async function applyPreset(preset) {
   const order = (await CWDB.getMeta('topicOrder')) || [];
   const roles = (await CWDB.getTopicRoles()) || {};
+  const goals = (await CWDB.getTopicGoals()) || {};
   for (const spec of preset.topics) {
     const id = await CWDB.nextId('topics');
     await CWDB.put('topics', {
-      id, name: spec.name, desc: '', msureid: presetMeasurementId(spec.kind),
+      id, name: spec.name, desc: '', msureid: presetMeasurementId(spec),
       optype: 1, type: 1, archived: false,
     });
     order.push(id);
@@ -2458,9 +2682,17 @@ async function applyPreset(preset) {
     if (spec.role) {
       roles[id] = { role: spec.role, dir: spec.dir || 'down', timing: !!spec.timing };
     }
+    if (spec.goal) {
+      goals[id] = {
+        ...spec.goal,
+        metric: CWGOALS.defaultMetric(spec.kind),
+        since: Date.now(),
+      };
+    }
   }
   await CWDB.setMeta('topicOrder', order);
   await CWDB.setTopicRoles(roles);
+  await CWDB.setTopicGoals(goals);
   await CWDB.setMeta('onboarded', true);
 }
 

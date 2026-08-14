@@ -305,6 +305,25 @@ const db = {
     await this.setMeta('topicRoles', map || {});
   },
 
+  /* Per-topic goals: maps a topic id to { metric, cmp, target, period, since }.
+   * Drives the streak display. Malformed records are filtered out on read by
+   * goals.js. In-app only, not part of the backup schema. */
+  async getTopicGoals() {
+    return (await this.getMeta('topicGoals')) || {};
+  },
+
+  async setTopicGoal(topicId, goal) {
+    const map = (await this.getMeta('topicGoals')) || {};
+    if (goal == null) delete map[topicId];
+    else map[topicId] = goal;
+    await this.setMeta('topicGoals', map);
+    return map;
+  },
+
+  async setTopicGoals(map) {
+    await this.setMeta('topicGoals', map || {});
+  },
+
   /* Insight / alert settings. */
   async getInsightSettings() {
     const s = (await this.getMeta('insightSettings')) || {};
