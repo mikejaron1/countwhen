@@ -11,11 +11,11 @@ const state = {
   topicKinds: {}, // topicId -> 'timeonly' | 'duration' | 'amount'
   topicMeta: {},  // topicId -> { emoji, color }
   quickBar: [],   // fixed, user-curated ordered list of topic ids for the quick-access bar
-  topicRoles: {}, // topicId -> 'bathroom' | 'meal' | 'blood' | 'accident' | ...
+  topicRoles: {}, // topicId -> { role: 'focus'|'marker'|'influence', dir, timing }
   insightSettings: null,
   insights: null,           // cached result of CWINSIGHTS.analyze()
   insightsDirty: true,      // recompute on next Insights render
-  insightOutcome: 'goCount',
+  insightOutcome: null,
   insightLag: 0,
   statsTopicId: null,
   statsPeriod: 'daily',
@@ -907,12 +907,16 @@ function drawHeatmap(events) {
 function insightsSettings() {
   return state.insightSettings || {
     cutoffHour: 4, windowDays: 7, insightWindow: 90,
-    alertsEnabled: false, alertOn: 'flare',
+    nightStart: 22, nightEnd: 6,
+    alertsEnabled: false, alertOn: 'alert',
   };
 }
 
-function hasBathroomRole() {
-  return Object.values(state.topicRoles || {}).includes('bathroom');
+/* Insights need at least one topic tagged as a focus or a marker before they
+ * have anything to explain. */
+function hasInsightRole() {
+  const roles = CWINSIGHTS.normalizeRoles(state.topicRoles || {});
+  return Object.values(roles).some((r) => r.role === 'focus' || r.role === 'marker');
 }
 
 function computeInsights(force = false) {
@@ -926,15 +930,17 @@ function computeInsights(force = false) {
     cutoffHour: s.cutoffHour,
     windowDays: s.windowDays,
     insightWindow: s.insightWindow,
+    nightStart: s.nightStart,
+    nightEnd: s.nightEnd,
   });
   state.insightsDirty = false;
   return state.insights;
 }
 
 const STATUS_META = {
-  flare:        { icon: '🔴', title: 'Looks like a flare-up',      cls: 'flare' },
-  watch:        { icon: '🟠', title: 'Worse than usual — keep an eye on it', cls: 'watch' },
-  ok:           { icon: '🟢', title: 'Normal week',                cls: 'ok' },
+  alert:        { icon: '🔴', title: 'Well outside your usual range', cls: 'flare' },
+  watch:        { icon: '🟠', title: 'Drifting from your usual — keep an eye on it', cls: 'watch' },
+  ok:           { icon: '🟢', title: 'A typical stretch',          cls: 'ok' },
   better:       { icon: '🟢', title: 'Better than usual',          cls: 'ok' },
   insufficient: { icon: '⚪', title: 'Not enough history yet',     cls: 'none' },
   unknown:      { icon: '⚪', title: 'No baseline yet',            cls: 'none' },
@@ -957,15 +963,15 @@ function renderInsights() {
     bindWelcomeBanner();
     return;
   }
-  if (!hasBathroomRole()) {
+  if (!hasInsightRole()) {
     main.innerHTML = `
       <div class="setup-card">
         <h3>One-time setup</h3>
-        <p>To answer questions like <em>“is this a flare-up?”</em> or <em>“does a late
-        dinner make the next day worse?”</em>, the app needs to know which of your
-        topics mean what.</p>
-        <p>Tag at least your main <strong>bathroom</strong> topic — plus meals, blood
-        and accidents if you track them.</p>
+        <p>To answer questions like <em>“is this week unusual?”</em> or <em>“does a late
+        dinner change tomorrow?”</em>, the app needs to know which of your topics
+        is the one you actually want to understand.</p>
+        <p>Pick a <strong>focus</strong> topic — the thing you want more or less of.
+        Everything else you log is automatically tested against it.</p>
         <button class="btn" id="goSetupRoles">Set up insights</button>
       </div>`;
     $('#goSetupRoles').addEventListener('click', openRolesSetup);
@@ -973,7 +979,7 @@ function renderInsights() {
   }
 
   const res = computeInsights();
-  const { status, meals, narrative, table } = res;
+  const { status, timing, narrative, table } = res;
   const s = insightsSettings();
   const meta = STATUS_META[status.level] || STATUS_META.unknown;
 
@@ -999,9 +1005,9 @@ function renderInsights() {
       </div>
       <ul class="status-reasons">${status.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>
       ${metricChips ? `<div class="metric-row">${metricChips}</div>` : ''}
-      ${status.percentile != null ? `<p class="muted-small">This week ranks higher than
-        <strong>${status.percentile}%</strong> of all weeks on record
-        (${status.windowTotal} trips; worst ever was ${status.worstWindowTotal}).</p>` : ''}
+      ${status.percentile != null ? `<p class="muted-small">This stretch ranks higher than
+        <strong>${status.percentile}%</strong> of all ${status.windowDays}-day windows on
+        record (${status.windowTotal} × ${escapeHtml(status.primaryLabel || '')}).</p>` : ''}
       <div class="status-actions">
         <button class="btn secondary small" id="insAlerts">${s.alertsEnabled ? '🔔 Alerts on' : '🔕 Turn on alerts'}</button>
         <button class="btn secondary small" id="insSetup">⚙️ Topics &amp; settings</button>
@@ -1018,7 +1024,7 @@ function renderInsights() {
     ${statusCard}
 
     <div class="stats-section">
-      <h3>Trips per day (last 120 days)</h3>
+      <h3>${escapeHtml(focusName(table))} per day (last 120 days)</h3>
       <div class="chart-wrap"><canvas id="chartInsTrend"></canvas></div>
     </div>
 
@@ -1032,7 +1038,7 @@ function renderInsights() {
       and a rank-based test. Correlation still isn’t causation.</p>
     </div>
 
-    ${renderMealSection(meals, table)}
+    ${renderTimingSection(timing, table)}
 
     <div class="stats-section">
       <h3>What moves the needle</h3>
@@ -1060,18 +1066,25 @@ function renderInsights() {
   drawInsightsTrend(table);
 }
 
-function renderMealSection(meals, table) {
-  if (!table.hasMeals) {
+/* Name of the primary focus topic, for headings. */
+function focusName(table) {
+  const tid = table.focusIds[0];
+  const t = state.topics.find((x) => x.id === tid);
+  return t ? t.name : 'Events';
+}
+
+function renderTimingSection(timing, table) {
+  if (!table.timingIds.length) {
     return `<div class="stats-section">
-      <h3>Meal timing</h3>
-      <p class="muted-small">Tag a topic as <strong>Meal / food</strong> in
-      ⚙️ Topics &amp; settings to test whether first- or last-meal timing
-      affects your day.</p></div>`;
+      <h3>Timing</h3>
+      <p class="muted-small">Tick <strong>“time of day matters”</strong> on a topic in
+      ⚙️ Topics &amp; settings to test whether doing it earlier or later changes
+      your day — meals, bedtime, first coffee, last screen.</p></div>`;
   }
-  if (!meals.length) {
+  if (!timing.length) {
     return `<div class="stats-section">
-      <h3>Meal timing</h3>
-      <p class="muted-small">Not enough overlapping meal + bathroom days yet.</p></div>`;
+      <h3>Timing</h3>
+      <p class="muted-small">Not enough days where both were logged yet.</p></div>`;
   }
   const N = CWINSIGHTS;
   const verdict = (q, p) => {
@@ -1086,7 +1099,7 @@ function renderMealSection(meals, table) {
     return { txt: 'No clear effect', cls: 'sig-none' };
   };
   const groups = {};
-  for (const m of meals) {
+  for (const m of timing) {
     if (!isFinite(m.p)) continue;               // nothing testable
     if (m.earlyMean === 0 && m.lateMean === 0) continue;  // never happens
     (groups[m.predictor] = groups[m.predictor] || []).push(m);
@@ -1117,9 +1130,9 @@ function renderMealSection(meals, table) {
   }).join('');
 
   return `<div class="stats-section">
-    <h3>Meal timing</h3>
+    <h3>Timing</h3>
     <p class="muted-small">Compares your latest third of days against your earliest
-    third for each meal time.</p>
+    third for each time-of-day.</p>
     ${cards}
   </div>`;
 }
@@ -1128,7 +1141,7 @@ function renderExplorer(res) {
   const N = CWINSIGHTS;
   const outcomeKey = res.outcomes.find((o) => o.key === state.insightOutcome)
     ? state.insightOutcome
-    : (res.outcomes[0]?.key || 'goCount');
+    : (res.outcomes[0]?.key || null);
   state.insightOutcome = outcomeKey;
   const rows = res.tests
     .filter((t) => t.outcomeKey === outcomeKey && t.lag === state.insightLag)
@@ -1173,20 +1186,22 @@ function renderExplorer(res) {
 function drawInsightsTrend(table) {
   const canvas = $('#chartInsTrend');
   if (!canvas) return;
+  const tid = table.focusIds[0];
+  if (tid == null) return;
   const days = table.days.slice(-120);
   if (days.length < 5) return;
   const labels = days.map((r) => `${r.date.getMonth() + 1}/${r.date.getDate()}`);
-  const counts = days.map((r) => r.goCount);
+  const counts = days.map((r) => r.counts[tid] || 0);
   const roll = CWINSIGHTS.rolling(counts, 7);
   const baseline = CWINSIGHTS.median(
-    table.days.slice(-97, -7).map((r) => r.goCount)
+    table.days.slice(-97, -7).map((r) => r.counts[tid] || 0)
   );
   applyChartTheme();
   state.charts.insTrend = new Chart(canvas, {
     data: {
       labels,
       datasets: [
-        { type: 'bar', label: 'trips', data: counts, backgroundColor: CHART.neutral, borderRadius: 3, order: 3 },
+        { type: 'bar', label: 'per day', data: counts, backgroundColor: CHART.neutral, borderRadius: 3, order: 3 },
         { type: 'line', label: '7-day avg', data: roll, borderColor: CHART.primary,
           borderWidth: 2, pointRadius: 0, tension: 0.3, order: 1 },
         ...(isFinite(baseline) ? [{
@@ -1211,31 +1226,61 @@ function drawInsightsTrend(table) {
 /* ---- role setup ---- */
 
 function openRolesSetup() {
-  const roleOpts = (cur) =>
-    ['<option value="">— none —</option>']
-      .concat(CWINSIGHTS.ROLES.map((r) =>
-        `<option value="${r.key}" ${cur === r.key ? 'selected' : ''}>${r.icon} ${escapeHtml(r.label)}</option>`))
+  const N = CWINSIGHTS;
+  const cur = N.normalizeRoles(state.topicRoles || {});
+  const roleOpts = (r) =>
+    ['<option value="">— not used —</option>']
+      .concat(N.ROLES.map((x) =>
+        `<option value="${x.key}" ${r && r.role === x.key ? 'selected' : ''}>${x.icon} ${escapeHtml(x.label)}</option>`))
       .join('');
   const topics = state.topics.filter((t) => !t.archived);
-  const rows = topics.map((t) => `
-    <div class="role-row">
+  const rows = topics.map((t) => {
+    const r = cur[t.id];
+    const isFocus = r && r.role === 'focus';
+    return `
+    <div class="role-row role-block" data-role-block="${t.id}">
       <div class="role-name">${escapeHtml(topicEmoji(t))} ${escapeHtml(t.name)}</div>
-      <select data-role-topic="${t.id}">${roleOpts(state.topicRoles[t.id] || '')}</select>
-    </div>`).join('');
+      <select data-role-topic="${t.id}">${roleOpts(r)}</select>
+      <div class="role-extra" data-role-extra="${t.id}" ${r ? '' : 'hidden'}>
+        <label class="role-dir" data-role-dir-wrap="${t.id}" ${isFocus ? '' : 'hidden'}>
+          <span>Better when it goes</span>
+          <select data-role-dir="${t.id}">
+            <option value="down" ${!r || r.dir !== 'up' ? 'selected' : ''}>down — fewer is better</option>
+            <option value="up" ${r && r.dir === 'up' ? 'selected' : ''}>up — more is better</option>
+          </select>
+        </label>
+        <label class="role-timing">
+          <input type="checkbox" data-role-timing="${t.id}" ${r && r.timing ? 'checked' : ''} />
+          <span>Time of day matters (test earlier vs later)</span>
+        </label>
+      </div>
+    </div>`;
+  }).join('');
   const s = insightsSettings();
   const hourOpts = [0, 1, 2, 3, 4, 5, 6].map((h) =>
     `<option value="${h}" ${s.cutoffHour === h ? 'selected' : ''}>${h}:00</option>`).join('');
+  const nightOpts = (sel) => Array.from({ length: 24 }, (_, h) =>
+    `<option value="${h}" ${sel === h ? 'selected' : ''}>${N.fmtHour(h)}</option>`).join('');
 
   openModal(`
     <header><button class="icon-btn" data-close>←</button><div class="title">Insights setup</div></header>
     <div class="body">
-      <p class="muted-small">Tell the app what each topic means so it can test the
-      right things. Only <strong>Bathroom trip</strong> is required.</p>
+      <p class="muted-small">Pick the one topic you most want to understand — your
+      <strong>focus</strong>. Everything else you log is tested against it
+      automatically, so you don't have to tag it all.</p>
       ${rows}
       <div class="role-row" style="margin-top:14px;">
         <div class="role-name">Day starts at<br>
-          <span class="muted-small">A 2am trip counts toward the night before.</span></div>
+          <span class="muted-small">Something logged at 2am counts toward the night before.</span></div>
         <select id="insCutoff">${hourOpts}</select>
+      </div>
+      <div class="role-row">
+        <div class="role-name">Overnight runs from</div>
+        <select id="insNightStart">${nightOpts(s.nightStart ?? 22)}</select>
+      </div>
+      <div class="role-row">
+        <div class="role-name">…until</div>
+        <select id="insNightEnd">${nightOpts(s.nightEnd ?? 6)}</select>
       </div>
     </div>
     <div class="actions">
@@ -1243,15 +1288,35 @@ function openRolesSetup() {
       <button class="btn" id="saveRoles">Save</button>
     </div>
   `);
+
+  // Show the direction / timing controls only once a role is chosen, and the
+  // direction picker only for a focus (it is meaningless for the others).
+  $$('[data-role-topic]').forEach((sel) => {
+    sel.addEventListener('change', () => {
+      const id = sel.dataset.roleTopic;
+      const extra = $(`[data-role-extra="${id}"]`);
+      const dirWrap = $(`[data-role-dir-wrap="${id}"]`);
+      if (extra) extra.hidden = !sel.value;
+      if (dirWrap) dirWrap.hidden = sel.value !== 'focus';
+    });
+  });
+
   $('#saveRoles').addEventListener('click', async () => {
     const map = {};
     $$('[data-role-topic]').forEach((sel) => {
-      if (sel.value) map[Number(sel.dataset.roleTopic)] = sel.value;
+      if (!sel.value) return;
+      const id = Number(sel.dataset.roleTopic);
+      const dir = $(`[data-role-dir="${id}"]`)?.value === 'up' ? 'up' : 'down';
+      const timing = !!$(`[data-role-timing="${id}"]`)?.checked;
+      map[id] = { role: sel.value, dir, timing };
     });
     await CWDB.setTopicRoles(map);
     state.topicRoles = map;
-    const cutoffHour = Number($('#insCutoff').value);
-    state.insightSettings = await CWDB.setInsightSettings({ cutoffHour });
+    state.insightSettings = await CWDB.setInsightSettings({
+      cutoffHour: Number($('#insCutoff').value),
+      nightStart: Number($('#insNightStart').value),
+      nightEnd: Number($('#insNightEnd').value),
+    });
     state.insightsDirty = true;
     closeModal();
     snack('Insights settings saved');
@@ -1265,18 +1330,19 @@ function openAlertsDialog() {
   const s = insightsSettings();
   const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
   openModal(`
-    <header><button class="icon-btn" data-close>←</button><div class="title">Flare-up alerts</div></header>
+    <header><button class="icon-btn" data-close>←</button><div class="title">Status alerts</div></header>
     <div class="body">
-      <p>Get a notification when your recent week looks worse than your own
-      baseline — more trips, more time, or blood / accidents above your normal rate.</p>
+      <p>Get a notification when your recent stretch drifts away from your own
+      baseline — your focus topic moving the wrong way, or a marker day showing up
+      more often than usual.</p>
       <label class="row-toggle">
         <input type="checkbox" id="alertsOn" ${s.alertsEnabled ? 'checked' : ''} />
-        <span>Enable flare-up alerts</span>
+        <span>Enable status alerts</span>
       </label>
       <label class="row-toggle">
         <span>Alert me when status is</span>
         <select id="alertOn">
-          <option value="flare" ${s.alertOn === 'flare' ? 'selected' : ''}>flare only</option>
+          <option value="alert" ${s.alertOn !== 'watch' ? 'selected' : ''}>alert only</option>
           <option value="watch" ${s.alertOn === 'watch' ? 'selected' : ''}>watch or worse</option>
         </select>
       </label>
@@ -1301,17 +1367,17 @@ function openAlertsDialog() {
       alertOn: $('#alertOn').value,
     });
     closeModal();
-    snack(enabled ? 'Flare alerts on' : 'Flare alerts off');
+    snack(enabled ? 'Status alerts on' : 'Status alerts off');
     if (state.view === 'insights') renderInsights();
   });
   $('#alertTest').addEventListener('click', async () => {
     const res = computeInsights(true);
-    await showFlareNotification(res.status, true);
+    await showStatusNotification(res.status, true);
     snack(`Current status: ${res.status.level}`);
   });
 }
 
-async function showFlareNotification(status, isTest = false) {
+async function showStatusNotification(status, isTest = false) {
   const meta = STATUS_META[status.level] || STATUS_META.unknown;
   const body = status.reasons.slice(0, 3).join('\n');
   const title = isTest ? `CountWhen: ${meta.title}` : meta.title;
@@ -1319,9 +1385,9 @@ async function showFlareNotification(status, isTest = false) {
     if ('Notification' in window && Notification.permission === 'granted') {
       const reg = await navigator.serviceWorker?.getRegistration?.();
       if (reg?.showNotification) {
-        await reg.showNotification(title, { body, tag: 'countwhen-flare', icon: 'icons/icon-192.png' });
+        await reg.showNotification(title, { body, tag: 'countwhen-status', icon: 'icons/icon-192.png' });
       } else {
-        new Notification(title, { body, tag: 'countwhen-flare' });
+        new Notification(title, { body, tag: 'countwhen-status' });
       }
       return true;
     }
@@ -1332,20 +1398,20 @@ async function showFlareNotification(status, isTest = false) {
 
 /* Runs at startup: if the current window looks bad and we haven't nagged
  * recently, fire a notification + in-app snackbar. */
-async function checkFlareAlert() {
+async function checkStatusAlert() {
   const s = insightsSettings();
   if (!s.alertsEnabled) return;
-  if (!hasBathroomRole()) return;
+  if (!hasInsightRole()) return;
   const cooldown = (s.alertCooldownHours || 20) * 3600000;
   if (s.lastAlertAt && Date.now() - s.lastAlertAt < cooldown) return;
   let res;
   try { res = computeInsights(true); } catch (e) { console.warn(e); return; }
   const level = res.status.level;
   const trigger = s.alertOn === 'watch'
-    ? (level === 'watch' || level === 'flare')
-    : level === 'flare';
+    ? (level === 'watch' || level === 'alert')
+    : level === 'alert';
   if (!trigger) return;
-  await showFlareNotification(res.status);
+  await showStatusNotification(res.status);
   snack(`${STATUS_META[level].icon} ${STATUS_META[level].title} — see Insights`);
   state.insightSettings = await CWDB.setInsightSettings({
     lastAlertAt: Date.now(), lastAlertLevel: level,
@@ -1617,7 +1683,7 @@ function openTopicEdit(existing) {
     <div class="body">
       <div class="field">
         <label>Name</label>
-        <input id="topicName" type="text" value="${existing ? escapeHtml(existing.name) : ''}" placeholder="e.g. poop start" autocomplete="off">
+        <input id="topicName" type="text" value="${existing ? escapeHtml(existing.name) : ''}" placeholder="e.g. coffee, headache, workout" autocomplete="off">
       </div>
       <div class="field">
         <label>Description (optional)</label>
@@ -1638,7 +1704,7 @@ function openTopicEdit(existing) {
       <div class="field">
         <label>Topic type</label>
         <div class="kind-picker" id="kindPicker">
-          <label class="kind-opt"><input type="radio" name="kind" value="timeonly" ${existingKind==='timeonly'?'checked':''}> <strong>Time only</strong><br><span>Just record when it happened (e.g. "poop start", "first meal", "saw blood").</span></label>
+          <label class="kind-opt"><input type="radio" name="kind" value="timeonly" ${existingKind==='timeonly'?'checked':''}> <strong>Time only</strong><br><span>Just record when it happened (e.g. "woke up", "first meal", "headache").</span></label>
           <label class="kind-opt"><input type="radio" name="kind" value="duration" ${existingKind==='duration'?'checked':''}> <strong>Duration</strong><br><span>Record how long something lasted in hh:mm (e.g. "workout", "nap").</span></label>
           <label class="kind-opt"><input type="radio" name="kind" value="amount"   ${existingKind==='amount'?'checked':''}> <strong>Amount</strong><br><span>Record a quantity with a unit (e.g. "water 12 oz", "weight 175 lb").</span></label>
         </div>
@@ -2106,15 +2172,17 @@ function renderCurrent() {
 
 /* ======== MODAL / SNACKBAR / DRAWER ======== */
 
-function openModal(html) {
+function openModal(html, { dismissible = true } = {}) {
   const root = $('#modalRoot');
   root.innerHTML = `<div class="scrim"><section class="dialog">${html}</section></div>`;
   root.querySelectorAll('[data-close]').forEach((el) => {
     el.addEventListener('click', () => closeModal());
   });
-  root.querySelector('.scrim').addEventListener('click', (e) => {
-    if (e.target === e.currentTarget) closeModal();
-  });
+  if (dismissible) {
+    root.querySelector('.scrim').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) closeModal();
+    });
+  }
   pushOverlayState('modal');
 }
 
@@ -2316,6 +2384,137 @@ function openTopicPicker() {
   });
 }
 
+/* ======== ONBOARDING PRESETS ======== */
+
+/* Starter packs shown on a first launch. Each topic becomes a real topic with
+ * a kind, emoji, colour and (optionally) an insights role, so a new install is
+ * useful immediately instead of being an empty screen. */
+const PRESETS = [
+  {
+    id: 'symptoms',
+    icon: '🩺',
+    name: 'Symptom Tracker',
+    blurb: 'Track flare-ups, pain and triggers — and find out what sets them off.',
+    topics: [
+      { name: 'Symptom',   kind: 'timeonly', emoji: '🤒', color: '#e05252', role: 'focus', dir: 'down' },
+      { name: 'Bad day',   kind: 'timeonly', emoji: '🚩', color: '#c2410c', role: 'marker' },
+      { name: 'Medication',kind: 'timeonly', emoji: '💊', color: '#7c5cff' },
+      { name: 'Meal',      kind: 'timeonly', emoji: '🍽️', color: '#f59e0b', role: 'influence', timing: true },
+      { name: 'Sleep',     kind: 'duration', emoji: '😴', color: '#3b82f6', role: 'influence', timing: true },
+    ],
+  },
+  {
+    id: 'habits',
+    icon: '🥤',
+    name: 'Daily Habits',
+    blurb: 'Coffee, water, screens, smokes — count what you do and see the pattern.',
+    topics: [
+      { name: 'Coffee',    kind: 'timeonly', emoji: '☕', color: '#a16207', role: 'focus', dir: 'down', timing: true },
+      { name: 'Water',     kind: 'amount',   emoji: '💧', color: '#0ea5e9' },
+      { name: 'Screen time', kind: 'duration', emoji: '📱', color: '#64748b', role: 'influence' },
+      { name: 'Slipped up', kind: 'timeonly', emoji: '🚩', color: '#c2410c', role: 'marker' },
+      { name: 'Sleep',     kind: 'duration', emoji: '😴', color: '#3b82f6', role: 'influence', timing: true },
+    ],
+  },
+  {
+    id: 'fitness',
+    icon: '🏋️',
+    name: 'Fitness & Health',
+    blurb: 'Workouts, weight and steps — see what actually moves the numbers.',
+    topics: [
+      { name: 'Workout',   kind: 'duration', emoji: '🏋️', color: '#16a34a', role: 'focus', dir: 'up' },
+      { name: 'Weight',    kind: 'amount',   emoji: '⚖️', color: '#7c5cff' },
+      { name: 'Walk',      kind: 'duration', emoji: '🚶', color: '#0ea5e9', role: 'influence' },
+      { name: 'Rest day',  kind: 'timeonly', emoji: '🛌', color: '#94a3b8', role: 'marker' },
+      { name: 'Sleep',     kind: 'duration', emoji: '😴', color: '#3b82f6', role: 'influence', timing: true },
+    ],
+  },
+  {
+    id: 'blank',
+    icon: '🛠️',
+    name: 'Custom',
+    blurb: 'Start from nothing and build your own topics.',
+    topics: [],
+  },
+];
+
+/* Amount topics need a measurement; everything else uses the generic default. */
+function presetMeasurementId(kind) {
+  return 10;
+}
+
+async function applyPreset(preset) {
+  const order = (await CWDB.getMeta('topicOrder')) || [];
+  const roles = (await CWDB.getTopicRoles()) || {};
+  for (const spec of preset.topics) {
+    const id = await CWDB.nextId('topics');
+    await CWDB.put('topics', {
+      id, name: spec.name, desc: '', msureid: presetMeasurementId(spec.kind),
+      optype: 1, type: 1, archived: false,
+    });
+    order.push(id);
+    await CWDB.setTopicKind(id, spec.kind);
+    await CWDB.setTopicMeta(id, { emoji: spec.emoji, color: spec.color });
+    if (spec.role) {
+      roles[id] = { role: spec.role, dir: spec.dir || 'down', timing: !!spec.timing };
+    }
+  }
+  await CWDB.setMeta('topicOrder', order);
+  await CWDB.setTopicRoles(roles);
+  await CWDB.setMeta('onboarded', true);
+}
+
+/* True only for a genuinely fresh install: no topics and no events. Anyone
+ * restoring a backup or upgrading skips this entirely. */
+async function needsOnboarding() {
+  if (await CWDB.getMeta('onboarded')) return false;
+  const topics = await CWDB.getAll('topics');
+  if (topics.length) { await CWDB.setMeta('onboarded', true); return false; }
+  const events = await CWDB.getAll('events');
+  if (events.length) { await CWDB.setMeta('onboarded', true); return false; }
+  return true;
+}
+
+function openOnboarding() {
+  const cards = PRESETS.map((p) => `
+    <button class="preset-card" data-preset="${p.id}">
+      <span class="preset-icon">${p.icon}</span>
+      <span class="preset-text">
+        <strong>${escapeHtml(p.name)}</strong>
+        <span class="muted-small">${escapeHtml(p.blurb)}</span>
+      </span>
+    </button>`).join('');
+
+  openModal(`
+    <header><div class="title">What do you want to track?</div></header>
+    <div class="body">
+      <p class="muted-small">Pick a starting point. These are just topics — rename,
+      delete or add to them any time. Already have a backup? Choose Custom, then
+      import it.</p>
+      ${cards}
+    </div>
+    <div class="actions">
+      <button class="btn secondary" id="onboardImport">Import a backup…</button>
+    </div>
+  `, { dismissible: false });
+
+  $$('[data-preset]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const preset = PRESETS.find((p) => p.id === btn.dataset.preset);
+      btn.disabled = true;
+      await applyPreset(preset);
+      closeModal();
+      await reload();
+      if (preset.topics.length) snack(`${preset.name} topics added`);
+    });
+  });
+  $('#onboardImport').addEventListener('click', async () => {
+    await CWDB.setMeta('onboarded', true);
+    closeModal();
+    triggerImport();
+  });
+}
+
 /* ======== INIT ======== */
 
 async function init() {
@@ -2329,6 +2528,11 @@ async function init() {
   }
 
   await reload();
+
+  // First launch: offer a starting point instead of an empty screen.
+  try {
+    if (await needsOnboarding()) openOnboarding();
+  } catch (e) { console.warn('onboarding skipped', e); }
 
   // Tab clicks
   $$('.app-tabs .tab').forEach((tb) => {
@@ -2391,8 +2595,8 @@ async function init() {
     try { await window.CWDRIVE.startupSync(); } catch (_) {}
   }
 
-  // Flare-up check (opt-in, throttled).
-  try { await checkFlareAlert(); } catch (e) { console.warn(e); }
+  // Status check (opt-in, throttled).
+  try { await checkStatusAlert(); } catch (e) { console.warn(e); }
 }
 
 window.addEventListener('DOMContentLoaded', init);

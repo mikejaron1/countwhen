@@ -94,7 +94,7 @@ function reqToPromise(req) {
 const DEVICE_META_KEYS = [
   'driveClientId', 'driveSyncBase', 'driveRemoteMeta',
   'driveLegacyCleanupAt', 'driveLegacyCleanupDone',
-  'lastDriveSync', 'lastLocalChangeAt', 'lastFlareAlert',
+  'lastDriveSync', 'lastLocalChangeAt', 'lastFlareAlert', 'onboarded',
 ];
 
 const db = {
@@ -285,9 +285,10 @@ const db = {
     await this.setMeta('quickBar', Array.isArray(ids) ? ids : []);
   },
 
-  /* Health-insight topic roles: maps a topic to a semantic role the
-   * insights engine understands (bathroom / meal / blood / accident /
-   * sleep / med / trigger). In-app only, not part of the backup schema. */
+  /* Insight topic roles: maps a topic id to { role, dir, timing } where role
+   * is focus / marker / influence. Legacy installs may still hold plain role
+   * strings; insights.js migrates those on read. In-app only, not part of the
+   * backup schema. */
   async getTopicRoles() {
     return (await this.getMeta('topicRoles')) || {};
   },
@@ -309,10 +310,12 @@ const db = {
     const s = (await this.getMeta('insightSettings')) || {};
     return {
       cutoffHour: 4,          // logical day rolls over at 4am
-      windowDays: 7,          // "current" window for flare detection
+      windowDays: 7,          // "current" window for status detection
       insightWindow: 90,      // lookback for narrative insights
       alertsEnabled: false,
-      alertOn: 'flare',       // 'flare' | 'watch'
+      alertOn: 'alert',       // 'alert' | 'watch'
+      nightStart: 22,         // overnight window start hour
+      nightEnd: 6,            // overnight window end hour
       alertCooldownHours: 20,
       lastAlertAt: 0,
       lastAlertLevel: '',

@@ -1,8 +1,8 @@
 {
   "id": "/countwhen/",
-  "name": "CountWhen — Event Tracker",
+  "name": "CountWhen: Timestamp & Tally",
   "short_name": "CountWhen",
-  "description": "Count what happens, know when. Log events in one tap and spot the patterns in your history. Offline-first.",
+  "description": "Log exact moments and counts for habits, symptoms, and daily routines.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

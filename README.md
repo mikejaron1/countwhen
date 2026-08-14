@@ -1,6 +1,6 @@
-# CountWhen
+# CountWhen: Timestamp & Tally
 
-**Count what happens, know when.**
+**Log exact moments and counts for habits, symptoms, and daily routines.**
 
 A self-hosted, offline-first Progressive Web App for tracking how often
 something happens and how long it's been since the last time — then
@@ -24,6 +24,11 @@ Google Drive. There is no server, no account, and no analytics.
 **<https://mikejaron1.github.io/countwhen/>**
 
 Open in Chrome on your phone, tap ⋮ → **Install app**. Done.
+
+On a fresh install you pick a starting point — 🩺 **Symptom Tracker**,
+🥤 **Daily Habits**, 🏋️ **Fitness & Health**, or 🛠️ **Custom** (blank).
+A preset just seeds a handful of topics with sensible insight roles;
+rename, delete or add to them freely. Restoring a backup skips it.
 
 ## Update workflow (for the dev)
 
@@ -69,18 +74,28 @@ No drag-and-drop, no console clicks. Pages handles the rest.
   measured topics like ounces / gallons) with a bar chart.
 - **Insights** — see below.
 
-### Insights (v6)
+### Insights (v7)
 
 A statistics engine that looks for what actually moves your numbers,
-rather than just plotting them.
+rather than just plotting them. It is domain-agnostic — it works the
+same whether you track migraines, cigarettes, workouts or water.
 
 - **Topic roles** — you tell the app once (☰ → *Insight topics…*)
-  which of *your* topics mean bathroom trips, meals, blood, bed
-  accidents, medication, drink, etc. Nothing is guessed from names.
-- **Daily outcomes** — trips per day, **total time per day** (summed
-  durations), blood events, accidents, plus first- and last-meal
-  times. Days roll over at 4am (configurable) so a 2am trip counts
-  toward the night before.
+  what each of *your* topics is. Nothing is guessed from names:
+  - **Focus** — the thing you're trying to understand. You also say
+    which direction is *better*: **down** (symptoms, cigarettes,
+    spending) or **up** (workouts, water, pages read).
+  - **Marker** — a notable-day flag that is rare and always bad
+    (a flare, a relapse, a slip-up). Tested with a Poisson tail test.
+  - **Influence** — a candidate cause. This is the default, so
+    anything you log is tested against your focus without tagging.
+  - **Time of day matters** — an extra tick on any topic. Its first
+    and last occurrence each day become predictors, so you can ask
+    "does a later last meal / later first coffee change tomorrow?"
+- **Daily outcomes** — for each focus topic: count per day, total
+  time per day (for duration topics), overnight count, and time of
+  first occurrence. Days roll over at 4am and the overnight window
+  (default 10pm–6am) are both configurable.
 - **Correlations that are actually tested** — every candidate driver
   is tested at **lag 0** (same day) and **lag 1** (yesterday → today).
   Each test must clear *both* a parametric test (Pearson / Welch) and
@@ -88,21 +103,21 @@ rather than just plotting them.
   p-values is kept, then **Benjamini–Hochberg FDR correction** is
   applied across every test run. Results are labelled *significant*
   (q < 0.05) or *suggestive* (q < 0.15) — never "significant" on a
-  single lucky comparison. Rare events (blood, accidents) use a
-  Poisson tail test instead of a t-test.
-- **Meal timing** — a dedicated section answering "does a late last
-  meal, or a late first meal, change tomorrow's trips, total time,
-  blood, or accidents?"
-- **Flare detection** — a robust baseline (median + MAD over the
+  single lucky comparison.
+- **Timing** — a dedicated section comparing your latest third of days
+  against your earliest third for every topic marked *time of day
+  matters*.
+- **Status detection** — a robust baseline (median + MAD over the
   preceding ~90 days) is compared against the last 7 days. The app
-  tells you plainly whether you're **flaring**, worth **watching**,
-  **normal**, or actually **better than usual**, and lists which
-  metrics moved and by how much.
-- **Alerts** — opt in (☰ → *Alerts…*) and the app checks on launch,
-  notifying you when a flare starts instead of waiting for you to go
-  looking.
+  tells you plainly whether you're well **outside your usual range**,
+  worth **watching**, having a **typical stretch**, or actually
+  **better than usual**, and lists which metrics moved and by how
+  much. "Worse" respects each focus topic's direction.
+- **Alerts** — opt in (☰ → *Status alerts…*) and the app checks on
+  launch, notifying you when things drift instead of waiting for you
+  to go looking.
 - **Plain-English narrative** — findings are written out as sentences
-  with their effect sizes and units, not just a correlation matrix.
+  using *your* topic names, with effect sizes and units.
 
 Guardrails: minimum sample sizes (20 paired days, 10 per group),
 tautological self-correlations excluded, and DST-safe day bucketing.
@@ -168,15 +183,29 @@ python3 -m http.server 8000 --bind 0.0.0.0
 Then on the phone: `http://<your-mac-IP>:8000`. (Service worker
 *won't* register over LAN HTTP though — install needs HTTPS.)
 
-Two Node smoke tests run without a browser:
+Four Node smoke tests run without a browser:
 
 ```sh
-node smoke-test.js <path-to-backup.json>   # import → DB → export round-trip
+npm install                                # dev-only: jsdom + fake-indexeddb
+npm test                                   # insights + drive + ui
+
+node insights-smoke.js                     # statistics engine + role migration
 node drive-smoke.js                        # Drive snapshot rotation + legacy cleanup
+node ui-smoke.js                           # onboarding, every tab, role editor
+node smoke-test.js <path-to-backup.json>   # import → DB → export round-trip
 ```
 
-`drive-smoke.js` runs `js/drive.js` against an in-memory fake of the
-Drive v3 API, so it needs no credentials and touches no real files.
+The app itself has no dependencies and no build step — `package.json`
+exists only so the tests can run.
+
+- `insights-smoke.js` plants a known cause in synthetic data and checks
+  the engine recovers it, in both directions, and that legacy role
+  strings still migrate.
+- `drive-smoke.js` runs `js/drive.js` against an in-memory fake of the
+  Drive v3 API, so it needs no credentials and touches no real files.
+- `ui-smoke.js` loads the real `index.html` and app scripts in jsdom
+  against a fake IndexedDB and renders every tab, so a runtime error
+  fails there rather than on your phone.
 
 ## Optional: Google Drive sync
 
@@ -324,10 +353,10 @@ referenced measurement (`msureid` → `measurements[*]`).
 ## Known limitations / next ideas
 
 - No scheduled reminders ("you haven't gone in N hours"). Alerts today
-  are flare-detection only, checked when you open the app.
+  are status-detection only, checked when you open the app.
 - Insights need history to work: roughly 20+ days with the relevant
   topics logged before correlations are attempted, and ~90 days before
-  the flare baseline is meaningful.
+  the status baseline is meaningful.
 - Correlation is not causation. The engine is deliberately
   conservative, but a *suggestive* finding is a hypothesis to test,
   not a diagnosis. It is not medical advice.

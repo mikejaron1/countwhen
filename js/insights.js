@@ -6,7 +6,7 @@
  *   2. Statistical tests between predictors and outcomes, with p-values,
  *      effect sizes and Benjamini-Hochberg FDR correction (so 40 tests
  *      don't produce 2 fake "findings").
- *   3. A robust baseline vs. current-week comparison -> flare detection.
+ *   3. A robust baseline vs. current-window comparison -> status detection.
  *   4. Ranked, plain-English insights.
  *
  * Everything here is pure computation: no DOM, no IndexedDB. Wrapped in an
@@ -138,7 +138,7 @@ function erf(x) {
 
 function normalCdf(z) { return 0.5 * (1 + erf(z / Math.SQRT2)); }
 
-/* P(X >= k) for Poisson(lambda). Used for rare-event flare checks. */
+/* P(X >= k) for Poisson(lambda). Used for rare-event marker checks. */
 function poissonTailP(k, lambda) {
   if (lambda <= 0) return k > 0 ? 0 : 1;
   if (k <= 0) return 1;
@@ -252,16 +252,72 @@ function benjaminiHochberg(tests) {
 
 /* ==================== roles ==================== */
 
+/* A topic's role tells the engine what part it plays in an analysis. The
+ * vocabulary is deliberately domain-neutral: the same three roles describe
+ * bathroom trips vs. meals, migraines vs. caffeine, or workouts vs. sleep.
+ *
+ *   focus     - what you are trying to explain. Generates the outcomes
+ *               ("<topic> per day", "time of first <topic>", …).
+ *   marker    - a notable-day flag. Generates a yes/no outcome for the day.
+ *   influence - a candidate cause. Untagged topics are treated as one of
+ *               these, so you only have to tag what you actually care about.
+ *
+ * `timing` is an independent flag: when set, the *clock time* of that day's
+ * first and last event becomes a predictor too (meals, bedtime, first
+ * coffee, last screen).
+ *
+ * `dir` applies to a focus and says which way is better:
+ *   'down' - fewer / less is better (symptoms, cigarettes, interruptions)
+ *   'up'   - more is better (workouts, water, practice sessions)
+ * It never changes the maths, only whether a rise is reported as a problem.
+ */
 const ROLES = [
-  { key: 'bathroom', label: 'Bathroom trip', hint: 'The main thing you are tracking ("going")', icon: '🚻' },
-  { key: 'meal',     label: 'Meal / food',   hint: 'Used for first-meal / last-meal timing', icon: '🍽' },
-  { key: 'blood',    label: 'Blood',         hint: 'Treated as a bad-day marker', icon: '🩸' },
-  { key: 'accident', label: 'Accident / bed', hint: 'Treated as a bad-day marker', icon: '🛏' },
-  { key: 'sleep',    label: 'Sleep / bedtime', hint: 'Bedtime + wake timing', icon: '😴' },
-  { key: 'med',      label: 'Medication',    hint: 'Tested as a possible cause', icon: '💊' },
-  { key: 'trigger',  label: 'Possible trigger', hint: 'Drinks, stress, exercise…', icon: '⚡' },
+  { key: 'focus', label: 'Focus', icon: '🎯',
+    hint: 'What you want to understand. Everything else gets tested against it.' },
+  { key: 'marker', label: 'Notable-day marker', icon: '🚩',
+    hint: 'A yes/no flag for the day — a symptom, a setback, a milestone.' },
+  { key: 'influence', label: 'Possible influence', icon: '⚡',
+    hint: 'A candidate cause: food, meds, weather, stress, exercise.' },
 ];
 const ROLE_KEYS = new Set(ROLES.map((r) => r.key));
+
+/* Pre-generalisation installs stored a single domain-specific string per
+ * topic. Map those onto the new vocabulary so an existing setup keeps
+ * working — and keeps its insights — without the user re-tagging anything. */
+const LEGACY_ROLE_MAP = {
+  bathroom: { role: 'focus',     dir: 'down' },
+  blood:    { role: 'marker' },
+  accident: { role: 'marker' },
+  meal:     { role: 'influence', timing: true },
+  sleep:    { role: 'influence', timing: true },
+  med:      { role: 'influence' },
+  trigger:  { role: 'influence' },
+};
+
+/* Accepts a modern object, a legacy string, or junk; returns a normalised
+ * role or null. */
+function normalizeRole(v) {
+  if (!v) return null;
+  if (typeof v === 'string') {
+    if (ROLE_KEYS.has(v)) return { role: v, timing: false, dir: 'down' };
+    const legacy = LEGACY_ROLE_MAP[v];
+    if (!legacy) return null;
+    return { role: legacy.role, timing: !!legacy.timing, dir: legacy.dir || 'down' };
+  }
+  if (typeof v === 'object' && ROLE_KEYS.has(v.role)) {
+    return { role: v.role, timing: !!v.timing, dir: v.dir === 'up' ? 'up' : 'down' };
+  }
+  return null;
+}
+
+function normalizeRoles(roles = {}) {
+  const out = {};
+  for (const [tid, v] of Object.entries(roles || {})) {
+    const n = normalizeRole(v);
+    if (n) out[Number(tid)] = n;
+  }
+  return out;
+}
 
 /* ==================== daily table ==================== */
 
@@ -302,6 +358,14 @@ function fmtDayMinutes(min, cutoffHour) {
   return `${h}:${String(m).padStart(2, '0')} ${ampm}${nextDay ? '' : ''}`;
 }
 
+/* Whole-hour clock label, for describing configurable windows ("10pm–6am"). */
+function fmtHour(h) {
+  const hr = ((Math.round(h) % 24) + 24) % 24;
+  const ampm = hr >= 12 ? 'pm' : 'am';
+  let display = hr % 12; if (display === 0) display = 12;
+  return `${display}${ampm}`;
+}
+
 const TAG_RE = /#([A-Za-z0-9_][A-Za-z0-9_-]{0,30})/g;
 function tagsOf(note) {
   if (!note) return [];
@@ -323,18 +387,17 @@ function tagsOf(note) {
  * @param {number} o.cutoffHour logical day rollover hour (default 4)
  * @param {number} o.days      how many trailing days to include (default 400)
  */
-function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, days = 400 }) {
-  const byRole = {};
-  for (const r of ROLES) byRole[r.key] = [];
-  for (const [tid, role] of Object.entries(roles || {})) {
-    if (ROLE_KEYS.has(role)) byRole[role].push(Number(tid));
+function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, days = 400,
+                     nightStart = 22, nightEnd = 6 }) {
+  const norm = normalizeRoles(roles);
+  const byRole = { focus: [], marker: [], influence: [] };
+  const timingIds = [];
+  for (const [tid, r] of Object.entries(norm)) {
+    byRole[r.role].push(Number(tid));
+    if (r.timing) timingIds.push(Number(tid));
   }
-  const roleSet = (key) => new Set(byRole[key] || []);
-  const bathroom = roleSet('bathroom');
-  const meals = roleSet('meal');
-  const blood = roleSet('blood');
-  const accident = roleSet('accident');
-  const sleep = roleSet('sleep');
+  const focusIds = byRole.focus.slice();
+  const markerIds = byRole.marker.slice();
 
   const durationTopics = new Set(
     topics.filter((t) => (kinds[t.id] || '') === 'duration').map((t) => t.id)
@@ -354,21 +417,9 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
         sums: {},          // topicId -> summed qant (seconds for durations)
         firsts: {},        // topicId -> minutes from day start
         lasts: {},
+        nights: {},        // topicId -> n logged inside the night window
+        sevMax: {},        // topicId -> max severity
         tags: new Set(),
-        goCount: 0,
-        goSeconds: 0,
-        goHasDuration: false,
-        goFirst: null,
-        goLast: null,
-        goNight: 0,
-        goSeverityMax: 0,
-        mealCount: 0,
-        mealFirst: null,
-        mealLast: null,
-        bloodCount: 0,
-        accidentCount: 0,
-        sleepFirst: null,
-        sleepLast: null,
         events: 0,
       });
     }
@@ -377,6 +428,11 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
 
   // Pre-create every day in range so gaps count as real zeros.
   for (let k = startKey; k <= todayKey; k = addDays(k, 1)) ensure(k);
+
+  // A night window can wrap midnight (22 -> 6) or not (0 -> 6).
+  const isNight = (hr) => (nightStart > nightEnd
+    ? (hr >= nightStart || hr < nightEnd)
+    : (hr >= nightStart && hr < nightEnd));
 
   for (const e of events) {
     const key = dayKey(e.time, cutoffHour);
@@ -389,40 +445,14 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
     row.sums[tid] = (row.sums[tid] || 0) + Number(e.qant || 0);
     if (row.firsts[tid] == null || min < row.firsts[tid]) row.firsts[tid] = min;
     if (row.lasts[tid] == null || min > row.lasts[tid]) row.lasts[tid] = min;
+    if (isNight(new Date(e.time).getHours())) row.nights[tid] = (row.nights[tid] || 0) + 1;
+    const sev = Number(e.cost || 0);
+    if (sev > (row.sevMax[tid] || 0)) row.sevMax[tid] = sev;
     for (const t of tagsOf(e.note)) row.tags.add(t);
-
-    if (bathroom.has(tid)) {
-      row.goCount++;
-      if (durationTopics.has(tid)) {
-        row.goSeconds += Number(e.qant || 0);
-        row.goHasDuration = true;
-      }
-      if (row.goFirst == null || min < row.goFirst) row.goFirst = min;
-      if (row.goLast == null || min > row.goLast) row.goLast = min;
-      const hr = new Date(e.time).getHours();
-      if (hr >= 22 || hr < 6) row.goNight++;
-      const sev = Number(e.cost || 0);
-      if (sev > row.goSeverityMax) row.goSeverityMax = sev;
-    }
-    if (meals.has(tid)) {
-      row.mealCount++;
-      if (row.mealFirst == null || min < row.mealFirst) row.mealFirst = min;
-      if (row.mealLast == null || min > row.mealLast) row.mealLast = min;
-    }
-    if (blood.has(tid)) row.bloodCount++;
-    if (accident.has(tid)) row.accidentCount++;
-    if (sleep.has(tid)) {
-      if (row.sleepFirst == null || min < row.sleepFirst) row.sleepFirst = min;
-      if (row.sleepLast == null || min > row.sleepLast) row.sleepLast = min;
-    }
   }
 
   const list = Array.from(rows.values()).sort((a, b) => a.key - b.key);
   for (const r of list) {
-    r.goMinutes = r.goHasDuration ? r.goSeconds / 60 : null;
-    r.bloodAny = r.bloodCount > 0 ? 1 : 0;
-    r.accidentAny = r.accidentCount > 0 ? 1 : 0;
-    r.badAny = (r.bloodCount > 0 || r.accidentCount > 0) ? 1 : 0;
     const dow = r.date.getDay();
     r.dow = (dow + 6) % 7;              // 0 = Mon
     r.weekend = (dow === 0 || dow === 6) ? 1 : 0;
@@ -434,90 +464,115 @@ function buildDaily({ events, topics, roles = {}, kinds = {}, cutoffHour = 4, da
   if (firstIdx < 0) firstIdx = list.length;
   const trimmed = list.slice(firstIdx);
 
+  // Which focus topics actually carry duration / night data worth analysing?
+  const hasDurationFor = (tid) => durationTopics.has(tid)
+    && trimmed.some((r) => r.sums[tid] > 0);
+  const hasNightFor = (tid) => trimmed.some((r) => (r.nights[tid] || 0) > 0);
+
   return {
     days: trimmed,
-    cutoffHour,
-    byRole,
-    hasBathroom: bathroom.size > 0,
-    hasDuration: trimmed.some((r) => r.goHasDuration),
-    hasMeals: meals.size > 0,
-    hasBlood: blood.size > 0,
-    hasAccident: accident.size > 0,
+    cutoffHour, nightStart, nightEnd,
+    roles: norm,
+    byRole, focusIds, markerIds, timingIds,
+    durationTopics,
+    hasDurationFor, hasNightFor,
+    hasFocus: focusIds.length > 0,
   };
 }
 
 /* ==================== predictors & outcomes ==================== */
 
-const OUTCOMES = [
-  { key: 'goCount',    label: 'trips per day',      kind: 'continuous', unit: '/day' },
-  { key: 'goMinutes',  label: 'total time per day', kind: 'continuous', unit: ' min' },
-  { key: 'goNight',    label: 'night trips (10pm–6am)', kind: 'continuous', unit: '/night' },
-  { key: 'bloodAny',   label: 'blood that day',     kind: 'binary',     unit: '' },
-  { key: 'accidentAny',label: 'accident that day',  kind: 'binary',     unit: '' },
-  { key: 'goFirst',    label: 'time of first trip', kind: 'continuous', unit: '' },
-];
+/**
+ * Outcomes are generated from whatever the user tagged as a focus or a
+ * marker, so the same engine explains bathroom trips, migraines, workouts or
+ * cigarettes without knowing what any of them are.
+ *
+ * Each outcome carries the topic's `dir` ('down' = fewer is better) so the
+ * narrative layer can say "worse" or "better" instead of just "higher".
+ */
+function buildOutcomes(table, topics) {
+  const nameById = new Map(topics.map((t) => [t.id, t.name]));
+  const nameOf = (id) => nameById.get(id) || nameById.get(Number(id)) || `topic ${id}`;
+  const out = [];
 
-function availableOutcomes(table) {
-  return OUTCOMES.filter((o) => {
-    if (o.key === 'goMinutes') return table.hasDuration;
-    if (o.key === 'bloodAny') return table.hasBlood;
-    if (o.key === 'accidentAny') return table.hasAccident;
-    return table.hasBathroom;
-  });
+  for (const tid of table.focusIds) {
+    const name = nameOf(tid);
+    const dir = table.roles[tid]?.dir || 'down';
+    const base = { topicId: tid, dir, kind: 'continuous' };
+    out.push({ ...base, key: `focus:${tid}:count`, label: `${name} per day`,
+      unit: '/day', digits: 1, get: (r) => r.counts[tid] || 0 });
+    if (table.hasDurationFor(tid)) {
+      out.push({ ...base, key: `focus:${tid}:minutes`, label: `time on ${name} per day`,
+        unit: ' min', digits: 0, get: (r) => (r.sums[tid] || 0) / 60 });
+    }
+    if (table.hasNightFor(tid)) {
+      out.push({ ...base, key: `focus:${tid}:night`, label: `${name} overnight`,
+        unit: '/night', digits: 1, get: (r) => r.nights[tid] || 0 });
+    }
+    out.push({ ...base, key: `focus:${tid}:first`, label: `time of first ${name}`,
+      unit: '', digits: 0, fmt: 'time',
+      get: (r) => (r.firsts[tid] == null ? null : r.firsts[tid]) });
+  }
+
+  for (const tid of table.markerIds) {
+    out.push({ key: `marker:${tid}:any`, label: `${nameOf(tid)} that day`,
+      kind: 'binary', unit: '', digits: 1, topicId: tid, dir: 'down',
+      get: (r) => (r.counts[tid] ? 1 : 0) });
+  }
+
+  return out;
 }
 
 /**
  * Build the list of candidate predictors, each with an accessor.
- * `topicsById` is used for readable labels.
+ * Everything that isn't the outcome itself is fair game.
  */
-function buildPredictors(table, topics, roles = {}, kinds = {}) {
+function buildPredictors(table, topics, kinds = {}) {
   const out = [];
-  const roleOf = (id) => roles[id] || roles[String(id)] || null;
+  const roles = table.roles;
 
-  if (table.hasMeals) {
-    out.push({ key: 'mealFirst', label: 'First meal (time of day)', type: 'time',
-      get: (r) => r.mealFirst });
-    out.push({ key: 'mealLast', label: 'Last meal (time of day)', type: 'time',
-      get: (r) => r.mealLast });
-    out.push({ key: 'mealWindow', label: 'Eating window (first→last meal)', type: 'hours',
-      get: (r) => (r.mealFirst != null && r.mealLast != null ? (r.mealLast - r.mealFirst) / 60 : null) });
-    out.push({ key: 'mealCount', label: 'Number of meals', type: 'count',
-      get: (r) => (r.mealCount || 0) });
-  }
-
-  const sleepIds = table.byRole.sleep || [];
-  if (sleepIds.length) {
-    out.push({ key: 'sleepLast', label: 'Bedtime (last sleep entry)', type: 'time',
-      get: (r) => r.sleepLast });
+  // Topics flagged "timing matters" contribute clock-time predictors: when
+  // the first/last one happened and how wide the window between them was.
+  for (const tid of table.timingIds) {
+    const t = topics.find((x) => x.id === tid);
+    if (!t) continue;
+    const self = [`focus:${tid}:count`, `focus:${tid}:minutes`,
+                  `focus:${tid}:night`, `focus:${tid}:first`, `marker:${tid}:any`];
+    out.push({ key: `first:${tid}`, label: `First ${t.name} (time of day)`, type: 'time',
+      excludeOutcomes: self, get: (r) => (r.firsts[tid] ?? null) });
+    out.push({ key: `last:${tid}`, label: `Last ${t.name} (time of day)`, type: 'time',
+      excludeOutcomes: self, get: (r) => (r.lasts[tid] ?? null) });
+    out.push({ key: `window:${tid}`, label: `${t.name} window (first→last)`, type: 'hours',
+      excludeOutcomes: self,
+      get: (r) => (r.firsts[tid] != null && r.lasts[tid] != null
+        ? (r.lasts[tid] - r.firsts[tid]) / 60 : null) });
   }
 
   out.push({ key: 'weekend', label: 'Weekend', type: 'binary', get: (r) => r.weekend });
 
-  // Every non-bathroom topic's daily count is a candidate cause. A topic that
-  // *defines* an outcome (blood, accidents) must not be tested against that
-  // outcome or we'd "discover" that blood days have blood.
-  const bathroomIds = new Set(table.byRole.bathroom || []);
-  const selfOutcome = { blood: 'bloodAny', accident: 'accidentAny' };
+  // Every topic's daily count is a candidate cause — including other focus
+  // topics, so "do my workouts affect my migraines?" works. A topic is only
+  // barred from predicting *its own* outcomes, which would be circular.
   for (const t of topics) {
-    if (bathroomIds.has(t.id)) continue;
     if (t.archived) continue;
-    const role = roleOf(t.id);
-    const excludeOutcomes = selfOutcome[role] ? [selfOutcome[role]] : [];
-    const isMeasured = (kinds[t.id] || '') !== 'timeonly';
+    const tid = t.id;
+    const role = roles[tid]?.role || 'influence';
+    const selfOutcomes = [`focus:${tid}:count`, `focus:${tid}:minutes`,
+                          `focus:${tid}:night`, `focus:${tid}:first`, `marker:${tid}:any`];
     out.push({
-      key: `topic:${t.id}`,
+      key: `topic:${tid}`,
       label: `${t.name} (count)`,
       type: 'count',
-      role, excludeOutcomes,
-      get: (r) => r.counts[t.id] || 0,
+      role, excludeOutcomes: selfOutcomes,
+      get: (r) => r.counts[tid] || 0,
     });
-    if (isMeasured && (kinds[t.id] || '') === 'amount') {
+    if ((kinds[tid] || '') === 'amount') {
       out.push({
-        key: `topicsum:${t.id}`,
+        key: `topicsum:${tid}`,
         label: `${t.name} (amount)`,
         type: 'amount',
-        role, excludeOutcomes,
-        get: (r) => (r.counts[t.id] ? r.sums[t.id] || 0 : 0),
+        role, excludeOutcomes: selfOutcomes,
+        get: (r) => (r.counts[tid] ? r.sums[tid] || 0 : 0),
       });
     }
   }
@@ -535,13 +590,13 @@ function buildPredictors(table, topics, roles = {}, kinds = {}) {
 }
 
 /* Pair up predictor (day d - lag) with outcome (day d), dropping nulls. */
-function pairSeries(days, predictor, outcomeKey, lag) {
+function pairSeries(days, predictor, outcome, lag) {
   const xs = [], ys = [];
   for (let i = 0; i < days.length; i++) {
     const src = days[i - lag];
     if (!src) continue;
     const x = predictor.get(src);
-    const y = days[i][outcomeKey];
+    const y = outcome.get(days[i]);
     if (x == null || !isFinite(x)) continue;
     if (y == null || !isFinite(y)) continue;
     xs.push(x); ys.push(y);
@@ -562,7 +617,7 @@ function runTests({ table, predictors, outcomes, lags = [0, 1], minN = MIN_N }) 
     for (const predictor of predictors) {
       if (predictor.excludeOutcomes?.includes(outcome.key)) continue;
       for (const lag of lags) {
-        const { xs, ys } = pairSeries(days, predictor, outcome.key, lag);
+        const { xs, ys } = pairSeries(days, predictor, outcome, lag);
         if (xs.length < minN) continue;
         const uniqX = new Set(xs);
         if (uniqX.size < 2) continue;
@@ -577,6 +632,8 @@ function runTests({ table, predictors, outcomes, lags = [0, 1], minN = MIN_N }) 
           outcomeLabel: outcome.label,
           outcomeKind: outcome.kind,
           outcomeUnit: outcome.unit,
+          outcomeDir: outcome.dir || 'down',
+          outcomeFmt: outcome.fmt || null,
           lag,
           n: xs.length,
         };
@@ -653,13 +710,17 @@ function significanceLabel(t) {
   return { level: 'none', label: 'no effect' };
 }
 
-/* ==================== baseline / flare detection ==================== */
+/* ==================== baseline / unusual-period detection ==================== */
 
 /**
  * Compare the last `windowDays` against a robust baseline built from the
  * preceding `baselineDays` (excluding the current window).
+ *
+ * Everything here is direction-aware: a metric moving away from baseline is
+ * only called "worse" when it moves the way the user said is bad. For a focus
+ * marked 'up' (workouts, water) a drop is the problem, not a rise.
  */
-function baselineStatus(table, { windowDays = 7, baselineDays = 90 } = {}) {
+function baselineStatus(table, topics = [], { windowDays = 7, baselineDays = 90 } = {}) {
   const days = table.days;
   const out = { ok: false, level: 'unknown', metrics: [], reasons: [], windowDays };
   if (days.length < windowDays + 21) {
@@ -677,7 +738,12 @@ function baselineStatus(table, { windowDays = 7, baselineDays = 90 } = {}) {
   }
   out.baselineDays = base.length;
 
-  const addContinuous = (key, label, values, baseValues, unit, digits = 1) => {
+  const nameById = new Map(topics.map((t) => [t.id, t.name]));
+  const nameOf = (id) => nameById.get(id) || `topic ${id}`;
+
+  /* `dir` is the direction that counts as *worse* for this metric:
+   * 'down' means a rise is bad, 'up' means a fall is bad. */
+  const addContinuous = (key, label, values, baseValues, unit, digits = 1, dir = 'down') => {
     const v = values.filter((x) => x != null && isFinite(x));
     const b = baseValues.filter((x) => x != null && isFinite(x));
     if (v.length < 3 || b.length < 10) return null;
@@ -689,13 +755,15 @@ function baselineStatus(table, { windowDays = 7, baselineDays = 90 } = {}) {
     // Significance of the window mean vs baseline distribution.
     const w = welch(v, b);
     if (cur === 0 && med === 0) return null;   // nothing tracked here
+    const badWay = dir === 'up' ? -1 : 1;      // sign of a change that is bad
+    const moved = z * badWay;
     const m = {
-      key, label, unit, digits,
+      key, label, unit, digits, dir,
       current: cur, baseline: med, z, pct,
       p: w.p,
-      worse: z > 0,
-      elevated: z >= 1.5 && Math.abs(pct) >= 15 && (isFinite(w.p) ? w.p < 0.1 : true),
-      improved: z <= -1.5 && Math.abs(pct) >= 15,
+      worse: moved > 0,
+      elevated: moved >= 1.5 && Math.abs(pct) >= 15 && (isFinite(w.p) ? w.p < 0.1 : true),
+      improved: moved <= -1.5 && Math.abs(pct) >= 15,
     };
     out.metrics.push(m);
     return m;
@@ -707,7 +775,7 @@ function baselineStatus(table, { windowDays = 7, baselineDays = 90 } = {}) {
     const lambda = rate * recent.length;
     const p = poissonTailP(recentCount, lambda);
     const m = {
-      key, label, rare: true,
+      key, label, rare: true, dir: 'down',
       current: recentCount, baseline: lambda, p,
       unit: ` in ${recent.length}d`, digits: 1,
       pct: lambda > 0 ? ((recentCount - lambda) / lambda) * 100 : (recentCount ? 100 : 0),
@@ -720,72 +788,88 @@ function baselineStatus(table, { windowDays = 7, baselineDays = 90 } = {}) {
     return m;
   };
 
-  if (table.hasBathroom) {
-    addContinuous('goCount', 'Trips per day',
-      recent.map((r) => r.goCount), base.map((r) => r.goCount), '/day', 1);
-    addContinuous('goNight', 'Night trips per night',
-      recent.map((r) => r.goNight), base.map((r) => r.goNight), '/night', 1);
+  for (const tid of table.focusIds) {
+    const name = nameOf(tid);
+    const dir = table.roles[tid]?.dir || 'down';
+    addContinuous(`focus:${tid}:count`, `${name} per day`,
+      recent.map((r) => r.counts[tid] || 0), base.map((r) => r.counts[tid] || 0),
+      '/day', 1, dir);
+    if (table.hasNightFor(tid)) {
+      addContinuous(`focus:${tid}:night`, `${name} overnight`,
+        recent.map((r) => r.nights[tid] || 0), base.map((r) => r.nights[tid] || 0),
+        '/night', 1, dir);
+    }
+    if (table.hasDurationFor(tid)) {
+      addContinuous(`focus:${tid}:minutes`, `Time on ${name} per day`,
+        recent.map((r) => (r.sums[tid] || 0) / 60), base.map((r) => (r.sums[tid] || 0) / 60),
+        ' min', 0, dir);
+    }
   }
-  if (table.hasDuration) {
-    addContinuous('goMinutes', 'Total time per day',
-      recent.map((r) => r.goMinutes), base.map((r) => r.goMinutes), ' min', 0);
-  }
-  if (table.hasBlood) {
-    addRare('blood', 'Blood events',
-      recent.reduce((s, r) => s + r.bloodCount, 0),
-      base.reduce((s, r) => s + r.bloodCount, 0), base.length);
-  }
-  if (table.hasAccident) {
-    addRare('accident', 'Accidents',
-      recent.reduce((s, r) => s + r.accidentCount, 0),
-      base.reduce((s, r) => s + r.accidentCount, 0), base.length);
+
+  // Markers are rare by nature, so they get a Poisson tail test rather than
+  // a mean-vs-baseline comparison.
+  for (const tid of table.markerIds) {
+    addRare(`marker:${tid}`, nameOf(tid),
+      recent.reduce((s, r) => s + (r.counts[tid] || 0), 0),
+      base.reduce((s, r) => s + (r.counts[tid] || 0), 0), base.length);
   }
 
   const elevated = out.metrics.filter((m) => m.elevated);
   const improved = out.metrics.filter((m) => m.improved);
-  const badElevated = elevated.filter((m) => m.key === 'blood' || m.key === 'accident');
+  const markerElevated = elevated.filter((m) => m.rare);
 
-  if (badElevated.length || elevated.length >= 2) out.level = 'flare';
+  if (markerElevated.length || elevated.length >= 2) out.level = 'alert';
   else if (elevated.length === 1) out.level = 'watch';
   else if (improved.length && !elevated.length) out.level = 'better';
   else out.level = 'ok';
   out.ok = out.level === 'ok' || out.level === 'better';
 
   for (const m of elevated) {
+    const wayTxt = m.pct >= 0 ? '+' : '';
     out.reasons.push(
       `${m.label}: ${fmtNum(m.current, m.digits)}${m.unit} vs usual ${fmtNum(m.baseline, m.digits)}${m.unit} ` +
-      `(${m.pct >= 0 ? '+' : ''}${Math.round(m.pct)}%)`
+      `(${wayTxt}${Math.round(m.pct)}%)`
     );
   }
   for (const m of improved) {
     out.reasons.push(
-      `${m.label} is below your usual (${fmtNum(m.current, m.digits)}${m.unit} vs ${fmtNum(m.baseline, m.digits)}${m.unit}).`
+      `${m.label} is ${m.dir === 'up' ? 'above' : 'below'} your usual ` +
+      `(${fmtNum(m.current, m.digits)}${m.unit} vs ${fmtNum(m.baseline, m.digits)}${m.unit}).`
     );
   }
   if (!out.reasons.length) out.reasons.push('Everything is within your normal range.');
 
-  // Where does this week rank against every other 7-day window?
-  if (table.hasBathroom && days.length >= 40) {
+  // Where does this window rank against every other window of the same
+  // length? Uses the primary focus topic.
+  const primary = table.focusIds[0];
+  if (primary != null && days.length >= 40) {
     const totals = [];
     for (let i = 0; i + windowDays <= days.length; i++) {
       let s = 0;
-      for (let j = i; j < i + windowDays; j++) s += days[j].goCount;
+      for (let j = i; j < i + windowDays; j++) s += days[j].counts[primary] || 0;
       totals.push(s);
     }
     const curTotal = totals[totals.length - 1];
     const sorted = totals.slice().sort((a, b) => a - b);
     let below = 0;
     for (const v of sorted) if (v < curTotal) below++;
-    out.percentile = Math.round((below / sorted.length) * 100);
+    const dir = table.roles[primary]?.dir || 'down';
+    const pct = Math.round((below / sorted.length) * 100);
+    out.percentile = pct;
     out.windowTotal = curTotal;
-    out.worstWindowTotal = sorted[sorted.length - 1];
-    // Don't let the headline say "normal" while this is one of the worst
-    // weeks on record.
-    if (out.percentile >= 90 && (out.level === 'ok' || out.level === 'better')) {
+    out.primaryLabel = nameOf(primary);
+    out.primaryDir = dir;
+    // Don't let the headline say "normal" while this is one of the most
+    // extreme windows on record in the direction that matters.
+    const extreme = dir === 'up' ? pct <= 10 : pct >= 90;
+    if (extreme && (out.level === 'ok' || out.level === 'better')) {
       out.level = 'watch';
+      const cmp = dir === 'up'
+        ? `lighter than ${100 - pct}% of all ${windowDays}-day windows on record`
+        : `heavier than ${pct}% of all ${windowDays}-day windows on record`;
       out.reasons.unshift(
-        `This is a heavier week than ${out.percentile}% of all weeks on record ` +
-        `(${curTotal} trips), even though no single metric crossed its alert threshold.`
+        `This stretch is ${cmp} (${curTotal} × ${nameOf(primary)}), ` +
+        `even though no single metric crossed its alert threshold.`
       );
       out.ok = false;
     }
@@ -845,72 +929,86 @@ function describeTest(test, cutoffHour, { withSignificance = false } = {}) {
     `(r=${fmtNum(test.r, 2)}, n=${test.n}${sigTxt}).`;
 }
 
-/* Descriptive, non-inferential observations about a recent window. */
-function descriptiveInsights(table, windowDays = 90) {
+/* Descriptive, non-inferential observations about a recent window.
+ *
+ * Every sentence is generated from the user's own topic names and their
+ * chosen direction, so the same code narrates bathroom trips, migraines,
+ * workouts or cigarettes without any domain vocabulary of its own. */
+function descriptiveInsights(table, topics = [], windowDays = 90) {
   const out = [];
   const days = table.days.slice(-windowDays);
   if (days.length < 21) return out;
   const cutoffHour = table.cutoffHour;
+  const nameById = new Map(topics.map((t) => [t.id, t.name]));
+  const nameOf = (id) => nameById.get(id) || `topic ${id}`;
+  const dowNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
-  const counts = days.map((r) => r.goCount);
-  const avg = mean(counts);
-  if (table.hasBathroom && isFinite(avg)) {
+  for (const tid of table.focusIds) {
+    const name = nameOf(tid);
+    const dir = table.roles[tid]?.dir || 'down';
+    const counts = days.map((r) => r.counts[tid] || 0);
+    const avg = mean(counts);
+    if (!isFinite(avg)) continue;
+    // "worst" only means "most" when more is the bad direction.
+    const peak = Math.max(...counts);
+    const peakWord = dir === 'up' ? 'best day' : 'worst day';
+
     out.push({
       kind: 'summary',
       score: 1,
-      text: `Over the last ${days.length} days you averaged ${fmtNum(avg, 1)} trips/day ` +
-        `(median ${fmtNum(median(counts), 0)}, worst day ${Math.max(...counts)}).`,
+      text: `Over the last ${days.length} days you averaged ${fmtNum(avg, 1)} ${name}/day ` +
+        `(median ${fmtNum(median(counts), 0)}, ${peakWord} ${peak}).`,
     });
-  }
 
-  // Trend over the window
-  if (table.hasBathroom) {
+    // Trend over the window
     const idx = days.map((_, i) => i);
     const pr = pearson(idx, counts);
     if (isFinite(pr.p) && pr.p < 0.05) {
-      const first = mean(counts.slice(0, Math.floor(counts.length / 3)));
-      const last = mean(counts.slice(-Math.floor(counts.length / 3)));
+      const third = Math.floor(counts.length / 3);
+      const first = mean(counts.slice(0, third));
+      const last = mean(counts.slice(-third));
       const ch = pctChange(last, first);
+      const rising = pr.r > 0;
+      const good = (dir === 'up') === rising;
       out.push({
         kind: 'trend',
         score: 3 + Math.abs(pr.r),
-        text: `Trips/day are ${pr.r > 0 ? 'trending up' : 'trending down'} across this window: ` +
+        good,
+        text: `${name} is ${rising ? 'trending up' : 'trending down'} across this window: ` +
           `${fmtNum(first, 1)}/day early vs ${fmtNum(last, 1)}/day recently` +
           (ch != null ? ` (${ch >= 0 ? '+' : ''}${Math.round(ch)}%)` : '') +
           ` (p=${fmtNum(pr.p, 3)}).`,
       });
     }
-  }
 
-  // Time-of-day concentration
-  if (table.hasBathroom) {
-    const firsts = days.map((r) => r.goFirst).filter((x) => x != null);
+    // Time-of-day concentration
+    const firsts = days.map((r) => r.firsts[tid]).filter((x) => x != null);
     if (firsts.length >= 20) {
+      const sortedF = firsts.slice().sort((a, b) => a - b);
       out.push({
         kind: 'timing',
         score: 1.5,
-        text: `Your first trip is usually around ${fmtDayMinutes(median(firsts), cutoffHour)} ` +
-          `(middle 50% between ${fmtDayMinutes(quantile(firsts.slice().sort((a,b)=>a-b), 0.25), cutoffHour)} ` +
-          `and ${fmtDayMinutes(quantile(firsts.slice().sort((a,b)=>a-b), 0.75), cutoffHour)}).`,
+        text: `Your first ${name} is usually around ${fmtDayMinutes(median(firsts), cutoffHour)} ` +
+          `(middle 50% between ${fmtDayMinutes(quantile(sortedF, 0.25), cutoffHour)} ` +
+          `and ${fmtDayMinutes(quantile(sortedF, 0.75), cutoffHour)}).`,
       });
     }
-    const nightTotal = days.reduce((s, r) => s + r.goNight, 0);
-    const total = days.reduce((s, r) => s + r.goCount, 0);
+
+    const nightTotal = days.reduce((s, r) => s + (r.nights[tid] || 0), 0);
+    const total = days.reduce((s, r) => s + (r.counts[tid] || 0), 0);
     if (total > 0 && nightTotal > 0) {
       out.push({
         kind: 'timing',
         score: 1.2,
-        text: `${Math.round((nightTotal / total) * 100)}% of trips happen overnight (10pm–6am) — ` +
+        text: `${Math.round((nightTotal / total) * 100)}% of ${name} happens overnight ` +
+          `(${fmtHour(table.nightStart)}–${fmtHour(table.nightEnd)}) — ` +
           `${fmtNum(nightTotal / days.length, 1)} per night.`,
       });
     }
-  }
 
-  // Day-of-week extremes
-  if (table.hasBathroom) {
-    const names = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+    // Day-of-week extremes
     const buckets = Array.from({ length: 7 }, () => []);
-    for (const r of days) buckets[r.dow].push(r.goCount);
+    for (const r of days) buckets[r.dow].push(r.counts[tid] || 0);
     const avgs = buckets.map((b) => (b.length >= 4 ? mean(b) : NaN));
     const valid = avgs.map((v, i) => [v, i]).filter(([v]) => isFinite(v));
     if (valid.length === 7) {
@@ -923,104 +1021,121 @@ function descriptiveInsights(table, windowDays = 90) {
         out.push({
           kind: 'dow',
           score: 2 + (isFinite(w.p) && w.p < 0.05 ? 1 : 0),
-          text: `${names[hiIdx]} is your heaviest day (${fmtNum(hi, 1)}/day) and ${names[loIdx]} your lightest ` +
-            `(${fmtNum(lo, 1)}/day) — ${Math.round(ch)}% apart` +
+          text: `${dowNames[hiIdx]} is your highest day for ${name} (${fmtNum(hi, 1)}/day) ` +
+            `and ${dowNames[loIdx]} your lowest (${fmtNum(lo, 1)}/day) — ${Math.round(ch)}% apart` +
             (isFinite(w.p) ? `, p=${fmtNum(w.p, 3)}` : '') + '.',
+        });
+      }
+    }
+
+    // Duration, when the topic records one
+    if (table.hasDurationFor(tid)) {
+      const mins = days.map((r) => (r.sums[tid] || 0) / 60).filter((x) => isFinite(x));
+      if (mins.length >= 20) {
+        out.push({
+          kind: 'duration',
+          score: 1.6,
+          text: `You spend about ${fmtNum(median(mins), 0)} min/day on ${name} ` +
+            `(${fmtNum(mean(mins), 0)} avg, peak ${fmtNum(Math.max(...mins), 0)} min).`,
+        });
+      }
+    }
+
+    // Month-over-month
+    if (table.days.length >= 60) {
+      const last30 = table.days.slice(-30).map((r) => r.counts[tid] || 0);
+      const prev30 = table.days.slice(-60, -30).map((r) => r.counts[tid] || 0);
+      const ch = pctChange(mean(last30), mean(prev30));
+      if (ch != null && Math.abs(ch) >= 10) {
+        const w = welch(last30, prev30);
+        out.push({
+          kind: 'mom',
+          score: 2.5 + (isFinite(w.p) && w.p < 0.05 ? 1 : 0),
+          good: (ch > 0) === (dir === 'up'),
+          text: `Last 30 days vs the 30 before: ${fmtNum(mean(last30), 1)} vs ` +
+            `${fmtNum(mean(prev30), 1)} ${name}/day ` +
+            `(${ch >= 0 ? '+' : ''}${Math.round(ch)}%${isFinite(w.p) ? `, p=${fmtNum(w.p, 3)}` : ''}).`,
         });
       }
     }
   }
 
-  // Bad-day clustering
-  if (table.hasBlood || table.hasAccident) {
-    const badDays = days.filter((r) => r.badAny).length;
+  // Marker days: how often, and what they coincide with.
+  if (table.markerIds.length) {
+    const anyMarker = (r) => table.markerIds.some((tid) => (r.counts[tid] || 0) > 0);
+    const label = table.markerIds.map(nameOf).join(' or ');
+    const badDays = days.filter(anyMarker).length;
+    const primary = table.focusIds[0];
     if (badDays) {
-      const withBad = days.filter((r) => r.badAny).map((r) => r.goCount);
-      const without = days.filter((r) => !r.badAny).map((r) => r.goCount);
-      const w = welch(withBad, without);
-      out.push({
-        kind: 'bad',
-        score: 3,
-        text: `${badDays} of the last ${days.length} days had blood or an accident ` +
-          `(${Math.round((badDays / days.length) * 100)}%). On those days you averaged ` +
-          `${fmtNum(mean(withBad), 1)} trips vs ${fmtNum(mean(without), 1)} otherwise` +
-          (isFinite(w.p) ? ` (p=${fmtNum(w.p, 3)})` : '') + '.',
-      });
+      let text = `${badDays} of the last ${days.length} days had ${label} ` +
+        `(${Math.round((badDays / days.length) * 100)}%).`;
+      if (primary != null) {
+        const withBad = days.filter(anyMarker).map((r) => r.counts[primary] || 0);
+        const without = days.filter((r) => !anyMarker(r)).map((r) => r.counts[primary] || 0);
+        if (withBad.length >= 3 && without.length >= 3) {
+          const w = welch(withBad, without);
+          text += ` On those days you averaged ${fmtNum(mean(withBad), 1)} ` +
+            `${nameOf(primary)} vs ${fmtNum(mean(without), 1)} otherwise` +
+            (isFinite(w.p) ? ` (p=${fmtNum(w.p, 3)})` : '') + '.';
+        }
+      }
+      out.push({ kind: 'marker', score: 3, text });
     } else {
-      out.push({ kind: 'bad', score: 2,
-        text: `No blood or accidents in the last ${days.length} days.` });
+      out.push({ kind: 'marker', score: 2,
+        text: `No ${label} in the last ${days.length} days.` });
     }
-    // Current clean streak
+
+    // Current clear streak
     let streak = 0;
     for (let i = table.days.length - 1; i >= 0; i--) {
-      if (table.days[i].badAny) break;
+      if (anyMarker(table.days[i])) break;
       streak++;
     }
     let best = 0, run = 0;
-    for (const r of table.days) { if (r.badAny) run = 0; else { run++; if (run > best) best = run; } }
+    for (const r of table.days) { if (anyMarker(r)) run = 0; else { run++; if (run > best) best = run; } }
     if (best > 0) {
       out.push({ kind: 'streak', score: 1.4,
-        text: `Current clean streak: ${streak} day${streak === 1 ? '' : 's'} (best ever: ${best}).` });
-    }
-  }
-
-  // Duration
-  if (table.hasDuration) {
-    const mins = days.map((r) => r.goMinutes).filter((x) => x != null && isFinite(x));
-    if (mins.length >= 20) {
-      out.push({
-        kind: 'duration',
-        score: 1.6,
-        text: `You spend about ${fmtNum(median(mins), 0)} min/day in the bathroom ` +
-          `(${fmtNum(mean(mins), 0)} avg, worst ${fmtNum(Math.max(...mins), 0)} min).`,
-      });
-    }
-  }
-
-  // Month-over-month
-  if (table.hasBathroom && table.days.length >= 60) {
-    const last30 = table.days.slice(-30).map((r) => r.goCount);
-    const prev30 = table.days.slice(-60, -30).map((r) => r.goCount);
-    const ch = pctChange(mean(last30), mean(prev30));
-    if (ch != null && Math.abs(ch) >= 10) {
-      const w = welch(last30, prev30);
-      out.push({
-        kind: 'mom',
-        score: 2.5 + (isFinite(w.p) && w.p < 0.05 ? 1 : 0),
-        text: `Last 30 days vs the 30 before: ${fmtNum(mean(last30), 1)} vs ${fmtNum(mean(prev30), 1)} trips/day ` +
-          `(${ch >= 0 ? '+' : ''}${Math.round(ch)}%${isFinite(w.p) ? `, p=${fmtNum(w.p, 3)}` : ''}).`,
-      });
+        text: `Current clear streak: ${streak} day${streak === 1 ? '' : 's'} ` +
+          `without ${label} (best ever: ${best}).` });
     }
   }
 
   return out;
 }
 
-/* ==================== meal-timing question ==================== */
+/* ==================== timing question ==================== */
 
 /**
- * Directly answers: does first / last meal timing affect blood, accidents,
- * trips per day, or total time? Splits days into early vs late thirds and
- * reports the difference, plus the continuous correlation.
+ * Directly answers "does *when* I do X change my outcomes?" for every topic
+ * flagged as timing-relevant — first/last meal, bedtime, first coffee, last
+ * screen. Splits days into early vs late thirds and reports the difference,
+ * plus the continuous correlation.
  */
-function mealTimingAnalysis(table, tests) {
-  if (!table.hasMeals) return [];
+function timingAnalysis(table, topics, tests) {
+  if (!table.timingIds.length) return [];
   const rows = [];
   const cutoffHour = table.cutoffHour;
   const days = table.days;
-  const predictors = [
-    { key: 'mealFirst', label: 'First meal', get: (r) => r.mealFirst },
-    { key: 'mealLast', label: 'Last meal', get: (r) => r.mealLast },
-  ];
-  const MEAL_OUTCOMES = ['goCount', 'goMinutes', 'bloodAny', 'accidentAny'];
-  const outcomes = availableOutcomes(table)
-    .filter((o) => MEAL_OUTCOMES.includes(o.key))
-    .sort((a, b) => MEAL_OUTCOMES.indexOf(a.key) - MEAL_OUTCOMES.indexOf(b.key));
+  const nameById = new Map(topics.map((t) => [t.id, t.name]));
+  const nameOf = (id) => nameById.get(id) || `topic ${id}`;
+
+  const predictors = [];
+  for (const tid of table.timingIds) {
+    predictors.push({ key: `first:${tid}`, label: `First ${nameOf(tid)}`, topicId: tid,
+      get: (r) => (r.firsts[tid] ?? null) });
+    predictors.push({ key: `last:${tid}`, label: `Last ${nameOf(tid)}`, topicId: tid,
+      get: (r) => (r.lasts[tid] ?? null) });
+  }
+
+  // Count/duration/marker outcomes answer "how much"; the time-of-first
+  // outcome would just be comparing clocks to clocks, so skip it here.
+  const outcomes = buildOutcomes(table, topics).filter((o) => !o.key.endsWith(':first'));
 
   for (const p of predictors) {
     for (const o of outcomes) {
+      if (o.topicId === p.topicId) continue;    // don't explain a topic with itself
       for (const lag of [0, 1]) {
-        const { xs, ys } = pairSeries(days, p, o.key, lag);
+        const { xs, ys } = pairSeries(days, p, o, lag);
         if (xs.length < MIN_N) continue;
         const sorted = xs.slice().sort((a, b) => a - b);
         const lo = quantile(sorted, 1 / 3);
@@ -1042,6 +1157,7 @@ function mealTimingAnalysis(table, tests) {
           outcome: o.label,
           outcomeKey: o.key,
           outcomeKind: o.kind,
+          outcomeDir: o.dir || 'down',
           lag,
           n: xs.length,
           earlyThreshold: lo,
@@ -1069,15 +1185,16 @@ function mealTimingAnalysis(table, tests) {
 /* ==================== top-level analyze ==================== */
 
 function analyze({ events = [], topics = [], roles = {}, kinds = {}, cutoffHour = 4,
-                   windowDays = 7, insightWindow = 90 } = {}) {
-  const table = buildDaily({ events, topics, roles, kinds, cutoffHour });
-  const outcomes = availableOutcomes(table);
-  const predictors = buildPredictors(table, topics, roles, kinds);
-  const tests = table.hasBathroom && table.days.length >= 30
+                   windowDays = 7, insightWindow = 90,
+                   nightStart = 22, nightEnd = 6 } = {}) {
+  const table = buildDaily({ events, topics, roles, kinds, cutoffHour, nightStart, nightEnd });
+  const outcomes = buildOutcomes(table, topics);
+  const predictors = buildPredictors(table, topics, kinds);
+  const tests = outcomes.length && table.days.length >= 30
     ? runTests({ table, predictors, outcomes })
     : [];
-  const status = baselineStatus(table, { windowDays });
-  const meals = mealTimingAnalysis(table, tests);
+  const status = baselineStatus(table, topics, { windowDays });
+  const timing = timingAnalysis(table, topics, tests);
 
   // Rank the narrative insights: significant tests first, then descriptives.
   // Keep only the stronger lag for each predictor/outcome pair so the list
@@ -1098,10 +1215,10 @@ function analyze({ events = [], topics = [], roles = {}, kinds = {}, cutoffHour 
       text: describeTest(t, cutoffHour),
     });
   }
-  for (const d of descriptiveInsights(table, insightWindow)) narrative.push(d);
+  for (const d of descriptiveInsights(table, topics, insightWindow)) narrative.push(d);
   narrative.sort((a, b) => b.score - a.score);
 
-  return { table, tests, status, meals, narrative, outcomes, predictors };
+  return { table, tests, status, timing, narrative, outcomes, predictors };
 }
 
 /* Rolling mean helper for charts. */
@@ -1119,11 +1236,11 @@ function rolling(values, window) {
 }
 
 window.CWINSIGHTS = {
-  ROLES, ROLE_KEYS, OUTCOMES,
-  analyze, buildDaily, buildPredictors, availableOutcomes, runTests,
-  baselineStatus, mealTimingAnalysis, descriptiveInsights, describeTest,
+  ROLES, ROLE_KEYS, normalizeRole, normalizeRoles, LEGACY_ROLE_MAP,
+  analyze, buildDaily, buildPredictors, buildOutcomes, runTests,
+  baselineStatus, timingAnalysis, descriptiveInsights, describeTest,
   significanceLabel, pairSeries,
-  dayKey, addDays, minutesFromDayStart, fmtDayMinutes, fmtByType, fmtNum, rolling,
+  dayKey, addDays, minutesFromDayStart, fmtDayMinutes, fmtHour, fmtByType, fmtNum, rolling,
   mean, median, sd, mad, quantile, pearson, spearman, welch, cohensD,
   mannWhitney, benjaminiHochberg, poissonTailP, tTestP, normalCdf,
 };
