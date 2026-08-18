@@ -55,7 +55,7 @@ YOUR DATA STAYS YOURS
 - Everything stored on your device
 - Works completely offline
 - Export your full history to JSON at any time
-- Optional backup to your own Google Drive, using your own credentials
+- Optional backup to your own Google Drive
 
 The developer never sees your data, because there is nowhere for it to go.
 
@@ -86,10 +86,10 @@ you don't mind one more questionnaire.
 |---|---|
 | App icon 512×512 | ✅ `store/icon-512.png` |
 | Feature graphic 1024×500 | ✅ `store/feature-graphic.png` |
-| Phone screenshots (2–8 required) | ❌ **still needed** |
+| Phone screenshots (2–8 required) | ✅ `store/screenshots/` (6 @ 1080×1920) |
 
-Suggested screenshots: Categories (with quick-access bar + streak chips),
-Statistics, Insights, Goal editor, Day view.
+Regenerate any time with `npm run screenshots` — it seeds deterministic demo
+data in a throwaway Chrome profile, so no personal data ever reaches the store.
 
 ## Data safety form
 
@@ -100,10 +100,10 @@ That single answer completes the form. Grounds for it:
 - All data is stored on-device in IndexedDB. The app has no backend.
 - The only outbound network call in the codebase is `js/drive.js` →
   `googleapis.com`, and only when the user explicitly triggers a backup.
-- Drive backup uses the **user's own OAuth client ID** with the narrow
-  `drive.file` scope, writing to the user's own Drive. Play's data-safety rules
-  exempt user-initiated transfers to a user's own account, and the developer has
-  no access to it.
+- Drive backup writes to the **user's own Google Drive** under the narrow
+  `drive.file` scope, which only grants access to files the app itself created.
+  Play's rules exempt user-initiated transfers to a user's own account, and the
+  developer has no access to the contents.
 - No analytics, ads, crash reporting, or third-party SDKs of any kind.
 
 Because nothing is collected, the follow-ups (encryption in transit, deletion
@@ -127,3 +127,28 @@ still No. Expected result: **Everyone / PEGI 3**.
 | Financial features | None |
 | Target audience | 18+ (avoids the extra Families policy requirements) |
 | Data deletion URL | Not required — nothing is collected |
+
+## ⚠️ Open item before public launch: the Drive OAuth client ID
+
+`js/config.js` ships a hard-coded `driveClientId`, and `getClientId()` in
+`js/drive.js` prefers it over any value a user saves. That is fine for a
+personal deployment, but on a public Play release **every user's Drive sync
+would run through the owner's Google Cloud project**.
+
+Consequences to resolve first:
+
+- An OAuth consent screen left in *Testing* status is capped at 100 users and
+  shows an "unverified app" warning. It must be published to *In production*.
+- All users appear in that one Cloud project's quota and consent screen.
+
+Options:
+
+1. **Blank `driveClientId` in `config.js`** so Drive sync is off by default and
+   users supply their own ID (matches what README and privacy.html describe).
+   Manual JSON export/import still works with no setup.
+2. **Keep the shared client ID** and publish the OAuth consent screen. `drive.file`
+   is a narrow, non-restricted scope, so this is the lighter verification path,
+   but the project is then serving all users.
+
+This does not change the Data safety answers either way — user data still only
+ever moves to that user's own Drive.
