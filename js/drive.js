@@ -787,7 +787,9 @@ function openSetupDialog(ctx) {
           <div class="field">
             <label for="driveClientIdInput">OAuth Client ID</label>
             <input id="driveClientIdInput" type="text" autocomplete="off"
-              spellcheck="false" placeholder="1234567890-abc….apps.googleusercontent.com"
+              spellcheck="false" autocapitalize="off" autocorrect="off"
+              inputmode="url"
+              placeholder="1234567890-abc….apps.googleusercontent.com"
               value="${esc(idbId)}">
           </div>
           ${idbId ? `<ul><li>Last sync: ${last ? new Date(last).toLocaleString() : 'never'}</li></ul>` : ''}
@@ -807,9 +809,13 @@ function openSetupDialog(ctx) {
     `);
     const save = document.getElementById('driveSaveId');
     if (save) save.addEventListener('click', async () => {
-      const val = (document.getElementById('driveClientIdInput').value || '').trim();
-      if (val && !/\.apps\.googleusercontent\.com$/.test(val)) {
-        snack('That does not look like a Client ID (must end in .apps.googleusercontent.com)');
+      // Mobile keyboards love to add spaces and capitals. A Google client ID
+      // is always lowercase with no whitespace, so normalize both away rather
+      // than bounce the user for something they can't see.
+      const raw = document.getElementById('driveClientIdInput').value || '';
+      const val = raw.replace(/\s+/g, '').toLowerCase();
+      if (val && !/^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$/.test(val)) {
+        snack('That does not look like a Client ID — it should end in .apps.googleusercontent.com');
         return;
       }
       await CWDB.setMeta('driveClientId', val || null);
