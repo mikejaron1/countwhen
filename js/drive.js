@@ -733,6 +733,20 @@ async function disconnect() {
   await CWDB.setMeta('driveClientId', null);
 }
 
+/* Drop any cached token/client so the next sync re-authorizes. Needed when
+ * the client ID changes underneath us. */
+function resetTokenClient() {
+  _tokenClient = null;
+  _accessToken = null;
+  _tokenExpiry = 0;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 /* ---------- in-app dialog ---------- */
 
 function openSetupDialog(ctx) {
@@ -764,10 +778,19 @@ function openSetupDialog(ctx) {
           <p style="font-size:13px;color:#666;">To change any of these, edit
           <code>js/config.js</code> and redeploy the app.</p>
         ` : `
-          <p>Drive sync is <strong>not configured</strong>.</p>
-          <p>Open <code>js/config.js</code> in your hosted app, paste your
-          Google OAuth Client ID, and redeploy. Detailed steps in the README.
-          ${idbId ? '<br>(Legacy IDB Client ID found and will be used as a fallback.)' : ''}</p>
+          <p>Drive sync is <strong>${idbId ? 'set up on this device' : 'not configured'}</strong>.</p>
+          <p style="font-size:13px;color:#666;">Backup goes to <em>your own</em> Google Drive.
+          To enable it, create a Google OAuth Client ID (Web application) in the
+          Google Cloud Console and paste it below — the README has a step-by-step
+          walkthrough. Leave it empty to keep Drive sync off; Export / Import JSON
+          works without any of this.</p>
+          <div class="field">
+            <label for="driveClientIdInput">OAuth Client ID</label>
+            <input id="driveClientIdInput" type="text" autocomplete="off"
+              spellcheck="false" placeholder="1234567890-abc….apps.googleusercontent.com"
+              value="${esc(idbId)}">
+          </div>
+          ${idbId ? `<ul><li>Last sync: ${last ? new Date(last).toLocaleString() : 'never'}</li></ul>` : ''}
         `}
         <p style="font-size:13px;color:#666;">Restore from Drive <em>replaces</em> everything on
         this device with the Drive copy (a safety backup downloads first). Normal
@@ -777,10 +800,23 @@ function openSetupDialog(ctx) {
         <code>${DRIVE_FOLDER_NAME}/${DRIVE_FILE_NAME}</code> in your Drive).</p>
       </div>
       <div class="actions">
+        ${!cfgId ? `<button class="btn secondary" id="driveSaveId">Save ID</button>` : ''}
         ${cfgId || idbId ? `<button class="btn secondary" id="driveSyncDown">Restore from Drive</button>` : ''}
         ${cfgId || idbId ? `<button class="btn" id="driveSyncUp">Sync now</button>` : '<button class="btn" data-close>OK</button>'}
       </div>
     `);
+    const save = document.getElementById('driveSaveId');
+    if (save) save.addEventListener('click', async () => {
+      const val = (document.getElementById('driveClientIdInput').value || '').trim();
+      if (val && !/\.apps\.googleusercontent\.com$/.test(val)) {
+        snack('That does not look like a Client ID (must end in .apps.googleusercontent.com)');
+        return;
+      }
+      await CWDB.setMeta('driveClientId', val || null);
+      resetTokenClient();
+      closeModal();
+      snack(val ? 'Client ID saved — tap Sync now to connect' : 'Drive sync disabled');
+    });
     const up = document.getElementById('driveSyncUp');
     if (up) up.addEventListener('click', async () => {
       try {

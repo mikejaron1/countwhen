@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'countwhen-v7.2.0-2026-08-14';
+const CACHE_VERSION = 'countwhen-v7.3.0-2026-08-17';
 
 const SHELL = [
   './',

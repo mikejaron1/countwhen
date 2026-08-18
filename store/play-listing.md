@@ -128,27 +128,12 @@ still No. Expected result: **Everyone / PEGI 3**.
 | Target audience | 18+ (avoids the extra Families policy requirements) |
 | Data deletion URL | Not required — nothing is collected |
 
-## ⚠️ Open item before public launch: the Drive OAuth client ID
+## Drive OAuth client ID — resolved
 
-`js/config.js` ships a hard-coded `driveClientId`, and `getClientId()` in
-`js/drive.js` prefers it over any value a user saves. That is fine for a
-personal deployment, but on a public Play release **every user's Drive sync
-would run through the owner's Google Cloud project**.
+`js/config.js` no longer ships a client ID. Each user pastes their own under
+☰ → Google Drive sync (stored per-device in IndexedDB), so backups run through
+that user's Google project, not the developer's. Drive sync is simply off until
+they do; Export / Import JSON works regardless.
 
-Consequences to resolve first:
-
-- An OAuth consent screen left in *Testing* status is capped at 100 users and
-  shows an "unverified app" warning. It must be published to *In production*.
-- All users appear in that one Cloud project's quota and consent screen.
-
-Options:
-
-1. **Blank `driveClientId` in `config.js`** so Drive sync is off by default and
-   users supply their own ID (matches what README and privacy.html describe).
-   Manual JSON export/import still works with no setup.
-2. **Keep the shared client ID** and publish the OAuth consent screen. `drive.file`
-   is a narrow, non-restricted scope, so this is the lighter verification path,
-   but the project is then serving all users.
-
-This does not change the Data safety answers either way — user data still only
-ever moves to that user's own Drive.
+This keeps the Data safety answer at **no collection** and avoids needing OAuth
+verification for a shared client.

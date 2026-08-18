@@ -178,8 +178,8 @@ finding.
 - **Installable** — Chrome will offer "Install" on first visit; lives
   as a real app icon on your home screen.
 - **Google Drive sync** — two-way, silent, after every change once
-  you've pasted your OAuth Client ID into `js/config.js`. Wi-Fi only
-  by default. Keeps rolling versioned snapshots on Drive.
+  you've pasted your OAuth Client ID under ☰ → Google Drive sync.
+  Wi-Fi only by default. Keeps rolling versioned snapshots on Drive.
 
 ## Install it on a Pixel (or any Android)
 
@@ -269,25 +269,14 @@ this up once:
    `https://mikejaron1.github.io` (no path, no trailing slash).
 6. Copy the resulting Client ID.
 
-### Bake the Client ID into the app
+### Give the app the Client ID
 
-7. Open `js/config.js` in any text editor.
-8. Paste your Client ID between the quotes on the `driveClientId` line:
-
-   ```js
-   driveClientId: '123456789-abc...xyz.apps.googleusercontent.com',
-   ```
-
-9. Save the file, then deploy:
-
-   ```sh
-   cd ~/projects/countwhen
-   ./deploy.sh "enable drive sync"
-   ```
-
-   (Or commit + push manually.)
-10. Reload the app on your phone. The first time it syncs you'll see
-    Google's "unverified app" warning — tap *Advanced → Go to CountWhen
+7. In the app, open ☰ → **Google Drive sync…**, paste the Client ID into
+   the **OAuth Client ID** field, and tap **Save ID**. It's stored on that
+   device only, so each device (and each user of a public deployment) uses
+   its own Google project.
+8. Tap **Sync now** to connect. The first time you'll see Google's
+   "unverified app" warning — tap *Advanced → Go to CountWhen
     (unsafe)* (it's *your* Cloud project, talking to *your* Drive).
 
 That's it — you'll never need to touch the OAuth setup again. The app
