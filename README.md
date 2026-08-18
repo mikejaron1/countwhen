@@ -177,9 +177,10 @@ finding.
   in IndexedDB. Requests persistent storage so Chrome won't evict.
 - **Installable** — Chrome will offer "Install" on first visit; lives
   as a real app icon on your home screen.
-- **Google Drive sync** — two-way, silent, after every change once
-  you've pasted your OAuth Client ID under ☰ → Google Drive sync.
-  Wi-Fi only by default. Keeps rolling versioned snapshots on Drive.
+- **Google Drive sync** — two-way, silent, after every change. Just
+  sign in under ☰ → Google Drive sync; bring your own OAuth client if
+  you'd rather. Wi-Fi only by default. Keeps rolling versioned
+  snapshots on Drive.
 
 ## Install it on a Pixel (or any Android)
 
@@ -251,13 +252,18 @@ exists only so the tests can run.
   against a fake IndexedDB and renders every tab, so a runtime error
   fails there rather than on your phone.
 
-## Optional: Google Drive sync
+## Google Drive sync
 
-Manual export/import via the Android share sheet to Drive works with
-zero setup. If you'd rather have auto-sync after every change, set
+Drive sync works out of the box on the public build: open ☰ →
+**Google Drive sync…**, tap **Sync now**, and pick your Google account.
+The app only ever sees the files it created itself (`drive.file` scope) —
+never the rest of your Drive.
+
+### Optional: use your own Google Cloud project
+
+If you'd rather authorize through a project you control (self-hosting,
+or you just don't want to go through someone else's OAuth client), set
 this up once:
-
-### One-time Google Cloud Console setup (~10 min)
 
 1. Go to <https://console.cloud.google.com/>, create a project (free).
 2. Enable the **Google Drive API**.
@@ -265,23 +271,24 @@ this up once:
    own Google account as a Test user.
 4. **Credentials → Create Credentials → OAuth Client ID →
    Web application**.
-5. Under **Authorized JavaScript origins** add the app's origin:
-   `https://mikejaron1.github.io` (no path, no trailing slash).
+5. Under **Authorized JavaScript origins** add the origin you serve the
+   app from, e.g. `https://mikejaron1.github.io` (no path, no trailing
+   slash).
 6. Copy the resulting Client ID.
-
-### Give the app the Client ID
-
-7. In the app, open ☰ → **Google Drive sync…**, paste the Client ID into
-   the **OAuth Client ID** field, and tap **Save ID**. It's stored on that
-   device only, so each device (and each user of a public deployment) uses
-   its own Google project.
+7. In the app, open ☰ → **Google Drive sync…** → **Advanced: use your
+   own Google project**, paste the Client ID, and tap **Save ID**. It's
+   stored on that device only and takes precedence over the built-in
+   default. Clearing the field reverts to the default.
 8. Tap **Sync now** to connect. The first time you'll see Google's
    "unverified app" warning — tap *Advanced → Go to CountWhen
     (unsafe)* (it's *your* Cloud project, talking to *your* Drive).
 
-That's it — you'll never need to touch the OAuth setup again. The app
-will silently sync to Drive a few seconds after every change, and at
-launch.
+Self-hosting for a group and want *everyone* on your own project? Set
+`driveClientId` in `js/config.js` instead — that becomes the default for
+that deployment (set it to `''` to ship with Drive sync off entirely).
+
+Either way, the app silently syncs to Drive a few seconds after every
+change, and at launch.
 
 ### Sync behavior
 

@@ -128,12 +128,19 @@ still No. Expected result: **Everyone / PEGI 3**.
 | Target audience | 18+ (avoids the extra Families policy requirements) |
 | Data deletion URL | Not required — nothing is collected |
 
-## Drive OAuth client ID — resolved
+## Drive OAuth client ID — resolved (hybrid)
 
-`js/config.js` no longer ships a client ID. Each user pastes their own under
-☰ → Google Drive sync (stored per-device in IndexedDB), so backups run through
-that user's Google project, not the developer's. Drive sync is simply off until
-they do; Export / Import JSON works regardless.
+`js/config.js` ships the developer's OAuth client ID as a **default**, so a
+normal user just taps *Sync now* and picks a Google account — no setup. Under
+☰ → Google Drive sync → *Advanced* they can paste their **own** client ID,
+which is stored per-device in IndexedDB and **overrides** the default; clearing
+the field reverts to it.
 
-This keeps the Data safety answer at **no collection** and avoids needing OAuth
-verification for a shared client.
+Data safety stays at **no collection**: the token is issued to the user, the
+files land in the user's own Drive, and nothing reaches a developer server.
+
+Pre-launch requirement: the consent screen for the default client must be
+published **Testing → In production** in Google Cloud Console. Until then it is
+capped at 100 users and shows the "unverified app" warning. The only scope used
+is `drive.file`, which Google classifies as **non-sensitive**, so this needs no
+demo video, app review, or third-party security assessment.
