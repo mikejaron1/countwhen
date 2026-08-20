@@ -144,3 +144,15 @@ published **Testing → In production** in Google Cloud Console. Until then it i
 capped at 100 users and shows the "unverified app" warning. The only scope used
 is `drive.file`, which Google classifies as **non-sensitive**, so this needs no
 demo video, app review, or third-party security assessment.
+
+## Pricing — resolved: free, ungated
+
+Launching **free** with no feature gating. A free app can never be converted to
+paid (that needs a new package name), but in-app purchases can be added to a
+free app at any time, so this preserves the most optionality.
+
+Full reasoning, plus what may and may not be gated if a Pro tier is ever added,
+is in [`../DECISIONS.md`](../DECISIONS.md) §1–§2.
+
+Play Console: **Products → App pricing → Make your app free**. No payments
+profile or merchant account is needed for a free app with no IAP.

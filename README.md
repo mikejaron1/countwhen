@@ -405,6 +405,18 @@ referenced measurement (`msureid` → `measurements[*]`).
 - Preset quick-add *values* from imported backups (e.g., "1 glass
   of water = 8 oz") aren't carried over; long-press a quick-access
   chip to enter a custom amount.
+- Native-only features (home screen widget, Quick Settings tile,
+  Health Connect, scheduled local reminders) aren't reachable from
+  the current TWA shell — see [DECISIONS.md](DECISIONS.md) §3 for the
+  Capacitor migration path and §4 for the data-migration plan that
+  must precede it.
+
+## Product & architecture decisions
+
+Standing decisions — free vs. paid, what may and may not be gated, the
+TWA → Capacitor ladder, and the data-migration checklist — are recorded
+in **[DECISIONS.md](DECISIONS.md)**. Read it before changing the
+distribution model or the Android shell.
 
 ## License
 
