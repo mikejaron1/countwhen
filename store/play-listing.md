@@ -71,7 +71,7 @@ CountWhen is a personal record-keeping tool. It is not a medical device, and it 
 |---|---|
 | App category | Health & Fitness (or Productivity — see note) |
 | Tags | habit tracker, symptom tracker, counter, log, statistics |
-| Contact email | mikejaron1@gmail.com |
+| Contact email | countwhentimestampandtally@gmail.com |
 | Website | https://mikejaron1.github.io/countwhen/ |
 | Privacy policy | https://mikejaron1.github.io/countwhen/privacy.html |
 
@@ -156,3 +156,22 @@ is in [`../DECISIONS.md`](../DECISIONS.md) §1–§2.
 
 Play Console: **Products → App pricing → Make your app free**. No payments
 profile or merchant account is needed for a free app with no IAP.
+
+## Public identity
+
+The public contact address is **countwhentimestampandtally@gmail.com** (used in
+the Play listing contact details and in `privacy.html`). The Play *account*
+remains under a personal address; only the listing-facing contact is separate.
+
+Note that the developer's real name is still discoverable through channels that
+cannot be changed after publishing:
+
+- the package name `io.github.mikejaron1.countwhen`, which is permanent and
+  appears in the Play Store URL;
+- the app's own URL, `https://mikejaron1.github.io/countwhen/`, which a TWA must
+  point at publicly and which is named in `assetlinks.json`;
+- the public GitHub repo and its commit history.
+
+This is accepted as partial pseudonymity, not anonymity. Changing it would mean
+a new GitHub account, a new Pages origin, a new package name, and a rebuilt
+bundle — and is only possible *before* the first release is published.
