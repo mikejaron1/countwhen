@@ -1,4 +1,4 @@
-/* CountWhen - Insights engine.
+/* Plotline - Insights engine.
  *
  * Turns the raw event log into:
  *   1. A per-day metric table (trips/day, total time/day, first/last meal,

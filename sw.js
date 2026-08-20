@@ -1,9 +1,9 @@
-/* CountWhen - Service Worker.
+/* Plotline - Service Worker.
  * Versioned cache for app shell. Network bypassed for user JSON files.
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'countwhen-v7.4.0-2026-08-17';
+const CACHE_VERSION = 'plotline-v7.5.0-2026-08-20';
 
 const SHELL = [
   './',

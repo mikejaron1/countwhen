@@ -66,7 +66,7 @@ application time.
 
 Subject: **Want to help me test an Android app? (~2 min setup)**
 
-> Hi — I built a small Android app called **CountWhen** and I need 12+ testers
+> Hi — I built a small Android app called **Plotline** and I need 12+ testers
 > for two weeks before Google will let me publish it. Low effort, no cost, no
 > ads, no account needed.
 >
@@ -79,7 +79,7 @@ Subject: **Want to help me test an Android app? (~2 min setup)**
 > 1. Reply with the Gmail address you use on your phone, so I can add you.
 > 2. I'll send you an opt-in link — open it on your phone and tap *Become a
 >    tester*.
-> 3. Install CountWhen from the Play Store link on that page.
+> 3. Install Plotline from the Play Store link on that page.
 >
 > **The one important thing:** please stay opted in and keep the app installed
 > for at least **14 days**. If people drop out, my 14-day clock restarts. After
@@ -93,7 +93,7 @@ Subject: **Want to help me test an Android app? (~2 min setup)**
 
 ### Reminder to send on ~day 7
 
-> Quick check-in on the CountWhen test — please keep the app installed through
+> Quick check-in on the Plotline test — please keep the app installed through
 > [DATE]; if anyone opts out, the two-week clock starts over. If you've had a
 > chance to use it, I'd love any reaction at all, even "I forgot to open it."
 > That's useful too.

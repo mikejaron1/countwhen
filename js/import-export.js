@@ -1,22 +1,27 @@
-/* CountWhen - Import / Export
+/* Plotline - Import / Export
  * Round-trips the shared JSON backup schema byte-compatibly, so backups
  * written by older trackers using the same schema import without loss.
  */
 
 const REQUIRED_KEYS = ['topics', 'events'];
 
-/* Top-level key holding CountWhen's own settings. Backups written before the
- * rename used LEGACY_APP_META_TOP_KEY; we read either and always write the
- * current one. */
-const APP_META_TOP_KEY = '_countwhen';
-const LEGACY_APP_META_TOP_KEY = '_wdapp';
+/* Top-level key holding Plotline's own settings, plus every name it used
+ * before, oldest last. Backup files outlive installs, so all of them stay
+ * readable; only the current key is ever written. */
+const APP_META_TOP_KEY = '_plotline';
+const LEGACY_APP_META_TOP_KEYS = ['_countwhen', '_wdapp'];
 
-const readAppMeta = (obj) => obj?.[APP_META_TOP_KEY] || obj?.[LEGACY_APP_META_TOP_KEY];
+const readAppMeta = (obj) => {
+  if (!obj) return undefined;
+  if (obj[APP_META_TOP_KEY]) return obj[APP_META_TOP_KEY];
+  for (const k of LEGACY_APP_META_TOP_KEYS) if (obj[k]) return obj[k];
+  return undefined;
+};
 
 const KNOWN_TOP_KEYS = new Set([
   'version', 'saveddatelong', 'saveddate', 'eventcount', 'topiccount',
   'measurements', 'pendtimes', 'topics', 'events', 'appdata',
-  APP_META_TOP_KEY, LEGACY_APP_META_TOP_KEY,
+  APP_META_TOP_KEY, ...LEGACY_APP_META_TOP_KEYS,
 ]);
 
 /* In-app settings that live in the `meta` store rather than in the shared
@@ -275,7 +280,7 @@ function downloadJSON(filename, obj) {
 
 async function exportToFile(filename) {
   const obj = await buildExportObject();
-  const name = filename || `countwhen-backup.json`;
+  const name = filename || `plotline-backup.json`;
   downloadJSON(name, obj);
   await CWDB.setMeta('lastExport', Date.now());
 }
@@ -351,7 +356,7 @@ async function exportToCsv(filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = filename || 'countwhen-events.csv';
+  a.download = filename || 'plotline-events.csv';
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -365,7 +370,7 @@ async function safetyBackup() {
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-` +
                 `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  await exportToFile(`countwhen-backup-${stamp}.json`);
+  await exportToFile(`plotline-backup-${stamp}.json`);
 }
 
 window.CWIO = {

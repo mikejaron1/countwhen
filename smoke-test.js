@@ -126,7 +126,7 @@ const CWIO = global.window.CWIO;
     const o = { ...obj };
     // Settings written under the pre-rebrand key are migrated on import, so
     // normalise the name before comparing.
-    if (o._wdapp && !o._countwhen) { o._countwhen = o._wdapp; delete o._wdapp; }
+    for (const k of ['_countwhen', '_wdapp']) { if (o[k] && !o._plotline) o._plotline = o[k]; delete o[k]; }
     // Recomputed fields will differ; ignore them
     delete o.saveddate;
     delete o.saveddatelong;

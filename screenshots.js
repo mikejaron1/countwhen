@@ -59,6 +59,10 @@ function buildDemoData() {
 
   const events = [];
   let id = 1;
+  /* Anchor "today" at 21:30 so the seeded day has a full evening of activity.
+   * Whatever part of that day is still ahead of the real clock is dropped
+   * below, so the capture always shows a partial today with fresh entries
+   * rather than events dated into the future. */
   const now = new Date();
   now.setHours(21, 30, 0, 0);
 
@@ -125,7 +129,10 @@ function buildDemoData() {
     6: { metric: 'count',   cmp: 'gte', target: 1,  period: 'day',  since },
   };
 
-  return { events, goals };
+  /* Drop anything the 21:30 anchor pushed past the real clock, so the newest
+   * card always reads a sensible "N mins ago" instead of a negative value. */
+  const cutoff = Date.now();
+  return { events: events.filter((e) => e.time <= cutoff), goals };
 }
 
 /* ---------- tiny static server ----------------------------------------- */

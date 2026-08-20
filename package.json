@@ -1,5 +1,5 @@
 {
-  "name": "countwhen",
+  "name": "plotline",
   "private": true,
   "description": "Dev-only manifest. The app itself has no dependencies and no build step; these packages exist purely to run the smoke tests in Node.",
   "scripts": {

@@ -1,4 +1,4 @@
-/* CountWhen - configuration.
+/* Plotline - configuration.
  * Edit this file once and redeploy.
  *
  * Google Drive sync works out of the box — users just tap Sync now and
@@ -15,7 +15,7 @@
 /* App version — BUMP THIS on every change so you can confirm which
  * build is actually running on your device. Shown at the bottom of
  * the ☰ menu. Keep it in sync with CACHE_VERSION in sw.js. */
-window.CW_VERSION = 'v7.4.0 · CountWhen · 2026-08-17';
+window.CW_VERSION = 'v7.5.0 · Plotline · 2026-08-20';
 
 window.CW_CONFIG = {
   // Google OAuth 2.0 Client ID (Web application) used by default. Users can

@@ -1,4 +1,4 @@
-# CountWhen: Timestamp & Tally
+# Plotline: Timestamp & Tally
 
 **Log exact moments and counts for habits, symptoms, and daily routines.**
 
@@ -14,7 +14,7 @@ pretty charts.
 Everything lives on your device (IndexedDB) and, optionally, in your own
 Google Drive. There is no server, no account, and no analytics.
 
-> **Coming from another tracker?** CountWhen imports the widely used
+> **Coming from another tracker?** Plotline imports the widely used
 > flat JSON event-backup schema (topics + events + measurements), so an
 > existing export loads without conversion. See
 > [Data format](#data-format).
@@ -280,7 +280,7 @@ this up once:
    stored on that device only and takes precedence over the built-in
    default. Clearing the field reverts to the default.
 8. Tap **Sync now** to connect. The first time you'll see Google's
-   "unverified app" warning — tap *Advanced → Go to CountWhen
+   "unverified app" warning — tap *Advanced → Go to Plotline
     (unsafe)* (it's *your* Cloud project, talking to *your* Drive).
 
 Self-hosting for a group and want *everyone* on your own project? Set
@@ -327,21 +327,21 @@ Other behaviour:
   it *replaces* everything on this device with the Drive copy, after
   downloading a safety backup. Use it for a fresh device or a bad
   mistake — day to day, plain sync is what you want.
-- Rolling snapshots (`countwhen-1.json`, `-2.json`, … up to 5) are kept
+- Rolling snapshots (`plotline-1.json`, `-2.json`, … up to 5) are kept
   beside the live file so an older copy is always recoverable. So the
   Drive folder normally holds up to six similar-looking files: that's
   expected. A snapshot is only cut when the live file's contents
   actually changed *and* the newest snapshot is at least 12h old, so the
   five slots reach back ~2.5 days at worst instead of piling up five
   near-identical copies from one busy afternoon. (Drive also keeps its
-  own 30-day revision history on `countwhen.json` itself, which covers
+  own 30-day revision history on `plotline.json` itself, which covers
   the "undo the last few minutes" case.)
 - In-app settings (topic colours, emoji, kinds, insight roles, quick
-  bar) ride along inside the backup under a `_countwhen` key, so a new
+  bar) ride along inside the backup under a `_plotline` key, so a new
   device gets your setup too. Readers that don't know the key ignore it.
 
 Scope used: `drive.file` — the app can only see / modify files it
-creates. The sync file lives at `CountWhen/countwhen.json` in your
+creates. The sync file lives at `Plotline/plotline.json` in your
 Drive. Nothing else in your Drive is visible to the app. Backups made
 under an earlier name are renamed in place on first sync, so their Drive
 file IDs and revision history carry over instead of being orphaned. If a
@@ -352,7 +352,7 @@ A leftover old folder is only trashed once it's empty.
 
 ## Data format
 
-CountWhen reads and writes a flat JSON document (`countwhen.json`).
+Plotline reads and writes a flat JSON document (`plotline.json`).
 The schema is shared with other trackers built on it, and unknown keys
 survive a round-trip, so backups move both ways. Top-level keys:
 
@@ -372,7 +372,7 @@ survive a round-trip, so backups move both ways. Top-level keys:
 ```
 
 Any extra top-level keys we don't recognize are preserved verbatim on
-export. This app adds one of its own, `_countwhen`, holding in-app-only
+export. This app adds one of its own, `_plotline`, holding in-app-only
 settings (topic emoji / colour / kind, insight roles, quick-access
 bar). Other readers ignore unknown keys, so backups stay
 interchangeable. New IDs are allocated as `max(existing) + 1`. `qant` is

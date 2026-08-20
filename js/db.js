@@ -1,11 +1,12 @@
-/* CountWhen - IndexedDB wrapper
+/* Plotline - IndexedDB wrapper
  * Stores topics, events, measurements, pendtimes, appdata, meta.
  * All data lives on-device; no network required.
  */
 
-/* NOTE: DB_NAME is deliberately still 'whendidi'. It predates the CountWhen
- * rebrand and is the physical IndexedDB name on every existing install —
- * renaming it would orphan all local data. Do not change it. */
+/* NOTE: DB_NAME is deliberately still 'whendidi'. It predates both rebrands
+ * (WhenDidI -> CountWhen -> Plotline) and is the physical IndexedDB name on
+ * every existing install — renaming it would orphan all local data. Do not
+ * change it. */
 const DB_NAME = 'whendidi';
 const DB_VERSION = 1;
 

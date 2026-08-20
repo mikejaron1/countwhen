@@ -1,6 +1,6 @@
 # Product & architecture decisions
 
-Standing decisions for CountWhen, with the reasoning behind them, so future
+Standing decisions for Plotline, with the reasoning behind them, so future
 changes argue against a recorded position instead of a vague memory.
 
 Last reviewed: 2026-08-19 (pre-launch, v7.4.0).

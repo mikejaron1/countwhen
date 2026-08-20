@@ -1,4 +1,4 @@
-/* CountWhen - Google Drive sync (optional).
+/* Plotline - Google Drive sync (optional).
  *
  * Configuration lives in js/config.js — set window.CW_CONFIG.driveClientId
  * to your OAuth Client ID and the rest is automatic:
@@ -11,18 +11,22 @@
  */
 
 const DRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
-const DRIVE_FOLDER_NAME = 'CountWhen';
-const DRIVE_FILE_NAME = 'countwhen.json';
-const SNAPSHOT_NAME = (i) => `countwhen-${i}.json`;
+const DRIVE_FOLDER_NAME = 'Plotline';
+const DRIVE_FILE_NAME = 'plotline.json';
+const SNAPSHOT_NAME = (i) => `plotline-${i}.json`;
 
 /* Installs that synced under the app's previous name keep their backups under
  * the names below. Both the folder and the files are renamed in place rather
  * than recreated, so existing Drive file IDs — and the revision history
  * attached to them — survive the rebrand instead of being orphaned. These
- * three strings are load-bearing: removing them strands that data. */
-const DRIVE_LEGACY_FOLDER_NAME = 'WhenDidI';
-const DRIVE_LEGACY_FILE_NAME = 'whendidibk.json';
-const LEGACY_SNAPSHOT_NAME = (i) => `whendidibk-${i}.json`;
+ * three strings are load-bearing: removing them strands that data.
+ *
+ * Only the immediately preceding name is migrated. The app was renamed twice
+ * (WhenDidI -> CountWhen -> Plotline), but the first rename shipped before any
+ * public release, so no install can still be sitting on the WhenDidI names. */
+const DRIVE_LEGACY_FOLDER_NAME = 'CountWhen';
+const DRIVE_LEGACY_FILE_NAME = 'countwhen.json';
+const LEGACY_SNAPSHOT_NAME = (i) => `countwhen-${i}.json`;
 
 const DRIVE_MAX_VERSIONS = 5; // rotated snapshots
 
@@ -37,10 +41,11 @@ const DRIVE_MAX_VERSIONS = 5; // rotated snapshots
  * much further. */
 const DRIVE_MIN_SNAPSHOT_GAP_MS = 12 * 60 * 60 * 1000;
 
-/* Top-level key carrying CountWhen's own settings inside a backup, plus the
- * name it used before the rebrand (still read so older files merge cleanly). */
-const APP_META_KEY = '_countwhen';
-const LEGACY_APP_META_KEY = '_wdapp';
+/* Top-level key carrying Plotline's own settings inside a backup, plus every
+ * name it used before, oldest last. Backup files outlive installs, so all of
+ * them stay readable; only the current key is ever written. */
+const APP_META_KEY = '_plotline';
+const LEGACY_APP_META_KEYS = ['_countwhen', '_wdapp'];
 
 const CFG = () => window.CW_CONFIG || {};
 
@@ -305,7 +310,7 @@ async function rotateVersions(folderId, currentFileId, currentMd5 = null) {
  * equivalent current-name file is absent; when both exist (two devices
  * upgrading at different times) the legacy copy is skipped forever and shows
  * up as a duplicate. Same for the legacy folder, which `findOrCreateFolder`
- * leaves untouched if a CountWhen folder already exists.
+ * leaves untouched if a Plotline folder already exists.
  *
  * Duplicates are trashed (recoverable), orphans are renamed into the current
  * scheme, and the legacy folder is only trashed once it holds nothing this app
@@ -378,7 +383,7 @@ const FILE_FIELDS = 'id,name,modifiedTime,md5Checksum,size';
 
 async function createSyncFile(folderId, obj) {
   const json = JSON.stringify(obj);
-  const boundary = '-------countwhen-boundary-' + Math.random().toString(36).slice(2);
+  const boundary = '-------plotline-boundary-' + Math.random().toString(36).slice(2);
   const metadata = { name: DRIVE_FILE_NAME, parents: [folderId], mimeType: 'application/json' };
   const body =
     `--${boundary}\r\n` +
@@ -523,10 +528,15 @@ function mergeBackups(base, local, remote, { preferRemote = false } = {}) {
     appdata:      mergeCollection(b.appdata, local.appdata, remote.appdata, 'name', preferRemote, stats),
   };
   // In-app settings are a single blob: last writer wins. Either side may still
-  // carry the pre-rebrand key; we read both and always write the current one.
-  const readApp = (o) => o?.[APP_META_KEY] || o?.[LEGACY_APP_META_KEY];
+  // carry a pre-rebrand key; we read all of them and always write the current.
+  const readApp = (o) => {
+    if (!o) return undefined;
+    if (o[APP_META_KEY]) return o[APP_META_KEY];
+    for (const k of LEGACY_APP_META_KEYS) if (o[k]) return o[k];
+    return undefined;
+  };
   const localApp = readApp(local), remoteApp = readApp(remote);
-  delete out[LEGACY_APP_META_KEY];
+  for (const k of LEGACY_APP_META_KEYS) delete out[k];
   if (localApp || remoteApp) {
     if (!localApp) out[APP_META_KEY] = remoteApp;
     else if (!remoteApp) out[APP_META_KEY] = localApp;

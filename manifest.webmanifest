@@ -1,7 +1,7 @@
 {
   "id": "/countwhen/",
-  "name": "CountWhen: Timestamp & Tally",
-  "short_name": "CountWhen",
+  "name": "Plotline: Track & Find Trends",
+  "short_name": "Plotline",
   "description": "Log exact moments and counts for habits, symptoms, and daily routines.",
   "start_url": "./index.html",
   "scope": "./",

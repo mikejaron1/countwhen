@@ -5,10 +5,10 @@ Paste-ready content for the Play Console listing of
 
 ## Store listing
 
-**App name** (30 max — uses 28)
+**App name** (30 max — uses 29)
 
 ```
-CountWhen: Timestamp & Tally
+Plotline: Track & Find Trends
 ```
 
 **Short description** (80 max — uses 70)
@@ -22,7 +22,7 @@ Log exact moments and counts for habits, symptoms, and daily routines.
 ```
 How many times did it happen, and how long has it been since the last one?
 
-CountWhen answers both in one tap. Pick a topic, tap it, and the moment is logged. From there the app does the work: running totals, time-since-last on every card, streaks against your goals, and a real statistics engine that looks for what actually moves your numbers.
+Plotline answers both in one tap. Pick a topic, tap it, and the moment is logged. From there the app does the work: running totals, time-since-last on every card, streaks against your goals, and a real statistics engine that looks for what actually moves your numbers.
 
 Track anything you can count or time - water, caffeine, workouts, medications, symptoms, moods, chores, screen breaks, the dog's walks. If it happens and you want a record of when, it fits.
 
@@ -42,7 +42,7 @@ SEE WHAT'S HAPPENING
 - Goals and streaks: "at least 8 a day", "at most 2 a week", with a live streak counter and a best-ever record
 
 FIND WHAT ACTUALLY MATTERS
-Most trackers stop at pretty charts. CountWhen runs actual statistics. Tell it which topics are outcomes you care about and which are possible influences, and it compares them against each other, corrects for multiple comparisons using Benjamini-Hochberg FDR so you are not chasing noise, and reports only the associations that survive. It also checks timing effects, like whether something late in the evening changes the next day.
+Most trackers stop at pretty charts. Plotline runs actual statistics. Tell it which topics are outcomes you care about and which are possible influences, and it compares them against each other, corrects for multiple comparisons using Benjamini-Hochberg FDR so you are not chasing noise, and reports only the associations that survive. It also checks timing effects, like whether something late in the evening changes the next day.
 
 Everything is described in plain language, using your own topic names.
 
@@ -62,7 +62,7 @@ The developer never sees your data, because there is nowhere for it to go.
 FREE
 No ads, no subscription, no paid tier, no upsell.
 
-CountWhen is a personal record-keeping tool. It is not a medical device, and it does not diagnose, treat, or provide medical advice. Talk to a clinician about health decisions.
+Plotline is a personal record-keeping tool. It is not a medical device, and it does not diagnose, treat, or provide medical advice. Talk to a clinician about health decisions.
 ```
 
 ## Listing fields

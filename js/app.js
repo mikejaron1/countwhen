@@ -1,4 +1,4 @@
-/* CountWhen - UI controller. Vanilla JS, single-page, 3 views. */
+/* Plotline - UI controller. Vanilla JS, single-page, 3 views. */
 
 const VIEWS = ['categories', 'recent', 'day', 'stats', 'insights'];
 const state = {
@@ -1578,14 +1578,14 @@ function openAlertsDialog() {
 async function showStatusNotification(status, isTest = false) {
   const meta = STATUS_META[status.level] || STATUS_META.unknown;
   const body = status.reasons.slice(0, 3).join('\n');
-  const title = isTest ? `CountWhen: ${meta.title}` : meta.title;
+  const title = isTest ? `Plotline: ${meta.title}` : meta.title;
   try {
     if ('Notification' in window && Notification.permission === 'granted') {
       const reg = await navigator.serviceWorker?.getRegistration?.();
       if (reg?.showNotification) {
-        await reg.showNotification(title, { body, tag: 'countwhen-status', icon: 'icons/icon-192.png' });
+        await reg.showNotification(title, { body, tag: 'plotline-status', icon: 'icons/icon-192.png' });
       } else {
-        new Notification(title, { body, tag: 'countwhen-status' });
+        new Notification(title, { body, tag: 'plotline-status' });
       }
       return true;
     }
@@ -2206,7 +2206,7 @@ function triggerImport() {
         openModal(`
           <header><button class="icon-btn" data-close>←</button><div class="title">Import errors</div></header>
           <div class="body">
-            <p>The file doesn't look like a CountWhen backup:</p>
+            <p>The file doesn't look like a Plotline backup:</p>
             <ul>${errs.slice(0, 10).map((m) => `<li>${escapeHtml(m)}</li>`).join('')}</ul>
             ${errs.length > 10 ? `<p>(+${errs.length-10} more)</p>` : ''}
           </div>
@@ -2266,15 +2266,15 @@ function triggerImport() {
 }
 
 async function doExport() {
-  await CWIO.exportToFile('countwhen-backup.json');
-  snack('Exported countwhen-backup.json');
+  await CWIO.exportToFile('plotline-backup.json');
+  snack('Exported plotline-backup.json');
 }
 
 async function doExportCsv() {
   const now = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}`;
-  await CWIO.exportToCsv(`countwhen-events-${stamp}.csv`);
+  await CWIO.exportToCsv(`plotline-events-${stamp}.csv`);
   snack('Exported CSV');
 }
 
@@ -2293,7 +2293,7 @@ function openAbout() {
   openModal(`
     <header><button class="icon-btn" data-close>←</button><div class="title">About</div></header>
     <div class="body">
-      <p><strong>CountWhen</strong> — count what happens, know when.</p>
+      <p><strong>Plotline</strong> — log what happens, find what matters.</p>
       <p>An offline-first event tracker. Log a moment in one tap, then look back
       across days, weeks, and months to spot the patterns you'd otherwise miss.</p>
       <p>All data lives only on this device in IndexedDB. Use Export JSON or Google Drive sync

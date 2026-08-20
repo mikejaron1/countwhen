@@ -106,7 +106,7 @@ new Function(src + probe)();
 const T = window.__test;
 
 /* ---- helpers ---- */
-const FOLDER = () => add({ name: 'CountWhen', mimeType: 'application/vnd.google-apps.folder' });
+const FOLDER = () => add({ name: 'Plotline', mimeType: 'application/vnd.google-apps.folder' });
 const json = (n) => JSON.stringify({ events: [n] });
 const namesIn = (fid) => [...files.values()]
   .filter((f) => !f.trashed && (f.parents || []).includes(fid))
@@ -124,57 +124,57 @@ async function test(name, fn) {
 
   await test('rotation snapshots the primary file on first run', async () => {
     const fid = FOLDER();
-    const cur = add({ name: 'countwhen.json', parents: [fid], content: json(1) });
+    const cur = add({ name: 'plotline.json', parents: [fid], content: json(1) });
     await T.rotateVersions(fid, cur, md5(json(1)));
-    assert.deepStrictEqual(namesIn(fid), ['countwhen-1.json', 'countwhen.json']);
+    assert.deepStrictEqual(namesIn(fid), ['plotline-1.json', 'plotline.json']);
   });
 
   await test('repeat sync with unchanged contents does not cut a new snapshot', async () => {
     const fid = FOLDER();
-    const cur = add({ name: 'countwhen.json', parents: [fid], content: json(1) });
+    const cur = add({ name: 'plotline.json', parents: [fid], content: json(1) });
     for (let i = 0; i < 6; i++) await T.rotateVersions(fid, cur, md5(json(1)));
-    assert.deepStrictEqual(namesIn(fid), ['countwhen-1.json', 'countwhen.json']);
+    assert.deepStrictEqual(namesIn(fid), ['plotline-1.json', 'plotline.json']);
     assert.strictEqual(calls.copy, 1, 'expected exactly one copy, got ' + calls.copy);
   });
 
   await test('changed contents still rotate once the gap has passed', async () => {
     const fid = FOLDER();
-    const cur = add({ name: 'countwhen.json', parents: [fid], content: json(1) });
+    const cur = add({ name: 'plotline.json', parents: [fid], content: json(1) });
     await T.rotateVersions(fid, cur, md5(json(1)));
     advanceHours(13);
     files.get(cur).content = json(2);
     await T.rotateVersions(fid, cur, md5(json(2)));
     assert.deepStrictEqual(namesIn(fid),
-      ['countwhen-1.json', 'countwhen-2.json', 'countwhen.json']);
-    const snap1 = [...files.values()].find((f) => f.name === 'countwhen-1.json');
-    const snap2 = [...files.values()].find((f) => f.name === 'countwhen-2.json');
+      ['plotline-1.json', 'plotline-2.json', 'plotline.json']);
+    const snap1 = [...files.values()].find((f) => f.name === 'plotline-1.json');
+    const snap2 = [...files.values()].find((f) => f.name === 'plotline-2.json');
     assert.strictEqual(snap1.content, json(2));
     assert.strictEqual(snap2.content, json(1));
   });
 
   await test('changed contents inside the gap do not cut a snapshot', async () => {
     const fid = FOLDER();
-    const cur = add({ name: 'countwhen.json', parents: [fid], content: json(0) });
+    const cur = add({ name: 'plotline.json', parents: [fid], content: json(0) });
     await T.rotateVersions(fid, cur, md5(json(0)));
     for (let i = 1; i <= 20; i++) {   // a busy afternoon of real edits
       advanceHours(0.5);
       files.get(cur).content = json(i);
       await T.rotateVersions(fid, cur, md5(json(i)));
     }
-    assert.deepStrictEqual(namesIn(fid), ['countwhen-1.json', 'countwhen.json']);
+    assert.deepStrictEqual(namesIn(fid), ['plotline-1.json', 'plotline.json']);
     assert.strictEqual(calls.copy, 1, 'expected 1 copy, got ' + calls.copy);
   });
 
   await test('five slots reach back more than two days', async () => {
     const fid = FOLDER();
-    const cur = add({ name: 'countwhen.json', parents: [fid], content: json(0) });
+    const cur = add({ name: 'plotline.json', parents: [fid], content: json(0) });
     for (let i = 1; i <= 60; i++) {   // 30 days of hourly edits
       advanceHours(12);
       files.get(cur).content = json(i);
       await T.rotateVersions(fid, cur, md5(json(i)));
     }
     const oldest = [...files.values()]
-      .filter((f) => !f.trashed && /countwhen-\d+\.json/.test(f.name))
+      .filter((f) => !f.trashed && /plotline-\d+\.json/.test(f.name))
       .sort((a, b) => Date.parse(a.modifiedTime) - Date.parse(b.modifiedTime))[0];
     const spanDays = (clock - Date.parse(oldest.modifiedTime)) / 86400000;
     assert.ok(spanDays >= 2, 'oldest snapshot only ' + spanDays.toFixed(1) + ' days back');
@@ -182,46 +182,46 @@ async function test(name, fn) {
 
   await test('rotation never keeps more than DRIVE_MAX_VERSIONS snapshots', async () => {
     const fid = FOLDER();
-    const cur = add({ name: 'countwhen.json', parents: [fid], content: json(0) });
+    const cur = add({ name: 'plotline.json', parents: [fid], content: json(0) });
     for (let i = 1; i <= 9; i++) {
       advanceHours(13);
       files.get(cur).content = json(i);
       await T.rotateVersions(fid, cur, md5(json(i)));
     }
-    const snaps = namesIn(fid).filter((n) => /countwhen-\d+\.json/.test(n));
+    const snaps = namesIn(fid).filter((n) => /plotline-\d+\.json/.test(n));
     assert.strictEqual(snaps.length, T.DRIVE_MAX_VERSIONS);
   });
 
   await test('legacy duplicate primary file is trashed, current kept', async () => {
     const fid = FOLDER();
-    add({ name: 'countwhen.json', parents: [fid], content: json(1) });
-    add({ name: 'whendidibk.json', parents: [fid], content: json(0) });
+    add({ name: 'plotline.json', parents: [fid], content: json(1) });
+    add({ name: 'countwhen.json', parents: [fid], content: json(0) });
     const res = await T.cleanupLegacyArtifacts(fid);
-    assert.deepStrictEqual(namesIn(fid), ['countwhen.json']);
+    assert.deepStrictEqual(namesIn(fid), ['plotline.json']);
     assert.strictEqual(calls.trash, 1);
     assert.strictEqual(res.found, 1);
   });
 
   await test('orphan legacy file with no counterpart is renamed, not trashed', async () => {
     const fid = FOLDER();
-    add({ name: 'whendidibk-2.json', parents: [fid], content: json(0) });
+    add({ name: 'countwhen-2.json', parents: [fid], content: json(0) });
     await T.cleanupLegacyArtifacts(fid);
-    assert.deepStrictEqual(namesIn(fid), ['countwhen-2.json']);
+    assert.deepStrictEqual(namesIn(fid), ['plotline-2.json']);
     assert.strictEqual(calls.trash, 0);
     assert.strictEqual(calls.rename, 1);
   });
 
   await test('empty legacy folder is trashed', async () => {
     const fid = FOLDER();
-    const legacy = add({ name: 'WhenDidI', mimeType: 'application/vnd.google-apps.folder' });
+    const legacy = add({ name: 'CountWhen', mimeType: 'application/vnd.google-apps.folder' });
     await T.cleanupLegacyArtifacts(fid);
     assert.strictEqual(files.get(legacy).trashed, true);
   });
 
   await test('legacy folder holding data is left alone', async () => {
     const fid = FOLDER();
-    const legacy = add({ name: 'WhenDidI', mimeType: 'application/vnd.google-apps.folder' });
-    add({ name: 'whendidibk.json', parents: [legacy], content: json(0) });
+    const legacy = add({ name: 'CountWhen', mimeType: 'application/vnd.google-apps.folder' });
+    add({ name: 'countwhen.json', parents: [legacy], content: json(0) });
     await T.cleanupLegacyArtifacts(fid);
     assert.strictEqual(files.get(legacy).trashed, false, 'legacy folder with data was trashed');
   });
@@ -229,24 +229,24 @@ async function test(name, fn) {
   await test('cleanup is not repeated once a clean pass finds nothing', async () => {
     metaStore.clear();
     const fid = FOLDER();
-    add({ name: 'countwhen.json', parents: [fid], content: json(1) });
+    add({ name: 'plotline.json', parents: [fid], content: json(1) });
     await T.maybeCleanupLegacyArtifacts(fid);
     assert.strictEqual(await CWDB.getMeta('driveLegacyCleanupDone'), true);
     metaStore.set('driveLegacyCleanupAt', 0);
-    add({ name: 'whendidibk.json', parents: [fid], content: json(0) });
+    add({ name: 'countwhen.json', parents: [fid], content: json(0) });
     await T.maybeCleanupLegacyArtifacts(fid);
-    assert.ok(namesIn(fid).includes('whendidibk.json'), 'sweep ran again after being marked done');
+    assert.ok(namesIn(fid).includes('countwhen.json'), 'sweep ran again after being marked done');
   });
 
   await test('cleanup is throttled to once a day', async () => {
     metaStore.clear();
     const fid = FOLDER();
-    add({ name: 'countwhen.json', parents: [fid], content: json(1) });
-    add({ name: 'whendidibk.json', parents: [fid], content: json(0) });
+    add({ name: 'plotline.json', parents: [fid], content: json(1) });
+    add({ name: 'countwhen.json', parents: [fid], content: json(0) });
     await T.maybeCleanupLegacyArtifacts(fid);
     assert.strictEqual(calls.trash, 1);
-    add({ name: 'whendidibk-1.json', parents: [fid], content: json(0) });
-    add({ name: 'countwhen-1.json', parents: [fid], content: json(1) });
+    add({ name: 'countwhen-1.json', parents: [fid], content: json(0) });
+    add({ name: 'plotline-1.json', parents: [fid], content: json(1) });
     await T.maybeCleanupLegacyArtifacts(fid);
     assert.strictEqual(calls.trash, 1, 'second sweep ran inside the 24h window');
   });
