@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "day.plotline.app",
+      "sha256_cert_fingerprints": [
+        "7C:91:A1:74:3A:D3:45:D9:20:74:77:83:9B:E7:77:D2:D5:40:5A:AC:3D:1E:16:40:C9:D1:6D:8E:66:BC:CE:92"
+      ]
+    }
+  }
+]

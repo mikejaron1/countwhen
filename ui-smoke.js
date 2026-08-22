@@ -24,7 +24,7 @@ const html = fs.readFileSync(path.join(ROOT, 'index.html'), 'utf8')
 
 const dom = new JSDOM(html, {
   runScripts: 'outside-only',
-  url: 'https://example.com/countwhen/',
+  url: 'https://example.com/',
   virtualConsole: vc,
   pretendToBeVisual: true,
 });

@@ -21,7 +21,7 @@ Google Drive. There is no server, no account, and no analytics.
 
 ## Live URL
 
-**<https://mikejaron1.github.io/countwhen/>**
+**<https://plotline.day/>**
 
 Open in Chrome on your phone, tap ⋮ → **Install app**. Done.
 
@@ -186,7 +186,7 @@ finding.
 
 ### Step 1 — Open the URL in Chrome
 
-<https://mikejaron1.github.io/countwhen/>
+<https://plotline.day/>
 
 ### Step 2 — Install on the phone
 
@@ -272,7 +272,7 @@ this up once:
 4. **Credentials → Create Credentials → OAuth Client ID →
    Web application**.
 5. Under **Authorized JavaScript origins** add the origin you serve the
-   app from, e.g. `https://mikejaron1.github.io` (no path, no trailing
+   app from, e.g. `https://plotline.day` (no path, no trailing
    slash).
 6. Copy the resulting Client ID.
 7. In the app, open ☰ → **Google Drive sync…** → **Advanced: use your

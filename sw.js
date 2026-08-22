@@ -3,7 +3,7 @@
  * Bump CACHE_VERSION when shipping new assets.
  */
 
-const CACHE_VERSION = 'plotline-v7.5.0-2026-08-20';
+const CACHE_VERSION = 'plotline-v7.6.0-2026-08-21';
 
 const SHELL = [
   './',

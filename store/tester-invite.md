@@ -38,7 +38,7 @@ Two traps worth stating explicitly to testers:
 
 - The Google account they opt in with **must be the same account signed in on
   their Android phone**, or the Play listing will 404 for them.
-- Using the website (`https://mikejaron1.github.io/countwhen/`) does **not**
+- Using the website (`https://plotline.day/`) does **not**
   count. It is the same app, but Play only counts Play installs.
 
 ## Is opting in enough?

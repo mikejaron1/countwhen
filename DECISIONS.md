@@ -14,7 +14,7 @@ gating**.
 
 **Why:**
 
-- The Android app is a TWA pointing at `https://mikejaron1.github.io/countwhen/`.
+- The Android app is a TWA pointing at `https://plotline.day/`.
   A TWA must load a publicly reachable URL, so the full app is always
   usable for free in any browser. Gating would only inconvenience
   non-technical users.
@@ -95,7 +95,7 @@ deferring monetization until after that move rather than building it twice.
 **What it does not cost.** Package name and signing key are not TWA
 concepts — Play only checks package name, signing key, and versionCode, and
 the contents of the AAB are arbitrary. A Capacitor or fully native build
-shipped under `io.github.mikejaron1.countwhen` with the same key reaches
+shipped under `day.plotline.app` with the same key reaches
 existing users as a normal **update**, preserving the listing, reviews,
 ratings, and install base. Nothing about the store presence has to be
 rebuilt.
@@ -122,7 +122,7 @@ Connect data.
 ## 4. Data migration plan (required before any shell change)
 
 **The risk.** App data lives in IndexedDB (`whendidi`) under the origin
-`https://mikejaron1.github.io`, inside **Chrome's** storage — that is how
+`https://plotline.day`, inside **Chrome's** storage — that is how
 TWAs work. A Capacitor or native app runs in a different storage partition
 and **cannot read it**. A naive swap would look exactly like total data
 loss to every existing user.

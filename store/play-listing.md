@@ -1,7 +1,7 @@
 # Google Play listing — copy & form answers
 
 Paste-ready content for the Play Console listing of
-`io.github.mikejaron1.countwhen`. Character counts verified against Play limits.
+`day.plotline.app`. Character counts verified against Play limits.
 
 ## Store listing
 
@@ -72,8 +72,8 @@ Plotline is a personal record-keeping tool. It is not a medical device, and it d
 | App category | Health & Fitness (or Productivity — see note) |
 | Tags | habit tracker, symptom tracker, counter, log, statistics |
 | Contact email | countwhentimestampandtally@gmail.com |
-| Website | https://mikejaron1.github.io/countwhen/ |
-| Privacy policy | https://mikejaron1.github.io/countwhen/privacy.html |
+| Website | https://plotline.day/ |
+| Privacy policy | https://plotline.day/privacy.html |
 
 **Category note:** *Health & Fitness* matches user intent and searches better for
 a symptom tracker, but it triggers Play's **Health Apps declaration**. *Productivity*
@@ -166,9 +166,9 @@ remains under a personal address; only the listing-facing contact is separate.
 Note that the developer's real name is still discoverable through channels that
 cannot be changed after publishing:
 
-- the package name `io.github.mikejaron1.countwhen`, which is permanent and
+- the package name `day.plotline.app`, which is permanent and
   appears in the Play Store URL;
-- the app's own URL, `https://mikejaron1.github.io/countwhen/`, which a TWA must
+- the app's own URL, `https://plotline.day/`, which a TWA must
   point at publicly and which is named in `assetlinks.json`;
 - the public GitHub repo and its commit history.
 
