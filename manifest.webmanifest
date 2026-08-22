@@ -2,7 +2,7 @@
   "id": "/",
   "name": "Plotline: Track & Find Trends",
   "short_name": "Plotline",
-  "description": "Log exact moments and counts for habits, symptoms, and daily routines.",
+  "description": "Track habits and symptoms, then find which ones actually affect how you feel.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",

@@ -1,7 +1,7 @@
 # Google Play listing — copy & form answers
 
 Paste-ready content for the Play Console listing of
-`day.plotline.app`. Character counts verified against Play limits.
+`day.plotline.app`. Character counts verified against Play limits: name 29/30, short 77/80, full 2949/4000.
 
 ## Store listing
 
@@ -11,43 +11,52 @@ Paste-ready content for the Play Console listing of
 Plotline: Track & Find Trends
 ```
 
-**Short description** (80 max — uses 70)
+**Short description** (80 max — uses 77)
 
 ```
-Log exact moments and counts for habits, symptoms, and daily routines.
+Track habits and symptoms, then find which ones actually affect how you feel.
 ```
 
-**Full description** (4000 max — uses ~2500)
+**Full description** (4000 max — uses 2949)
 
 ```
-How many times did it happen, and how long has it been since the last one?
+Most trackers just count things. Plotline tells you what your numbers mean.
 
-Plotline answers both in one tap. Pick a topic, tap it, and the moment is logged. From there the app does the work: running totals, time-since-last on every card, streaks against your goals, and a real statistics engine that looks for what actually moves your numbers.
+Log a headache, a coffee, a workout, a bad night's sleep - one tap each. Then Plotline does the part other trackers skip: it runs real statistics across your history and tells you, in plain language, which things actually go together.
 
-Track anything you can count or time - water, caffeine, workouts, medications, symptoms, moods, chores, screen breaks, the dog's walks. If it happens and you want a record of when, it fits.
+FIND WHAT ACTUALLY MATTERS
+Mark which topics are outcomes you care about - headaches, mood, energy, sleep - and which ones might influence them, like caffeine, workouts, or screen time. Plotline then:
 
-WHAT YOU CAN LOG
+- Compares every influence against every outcome
+- Corrects for multiple comparisons using Benjamini-Hochberg FDR, so you are not chasing coincidences
+- Reports only the associations that survive that correction
+- Tests timing effects, such as whether something in the evening changes the next day
+- Explains every finding in plain English, using your own topic names
+
+That last part is the point. "You logged coffee after 4pm on 12 days, and slept 47 minutes less on those nights" is something you can act on. A bar chart is not.
+
+Statistics are hard to do honestly. Most apps show you a chart and let you draw your own conclusions, which is how people end up certain about things that never happened. Plotline is built to tell you when a pattern is real and, just as importantly, when it is not.
+
+ONE TAP TO LOG
 - One-tap timestamps, the fastest possible entry
-- Counts and amounts in your own units (oz, mg, reps, miles)
+- Counts and amounts in your own units - oz, mg, reps, miles
 - Durations, for anything you time rather than count
 - A 0-5 severity rating when intensity matters, not just frequency
-- Notes with #tags that you can search and filter later
+- Notes with #tags you can search and filter later
 - Edit or backdate any entry when you forget in the moment
 - A pinned quick-access bar for whatever you log most
 
-SEE WHAT'S HAPPENING
+SEE THE SHAPE OF IT
 - Time since last, on every topic at a glance
 - Day view, searchable history, and per-topic statistics
 - Charts of counts and trends over time
-- Goals and streaks: "at least 8 a day", "at most 2 a week", with a live streak counter and a best-ever record
+- Goals and streaks - "at least 8 a day", "at most 2 a week" - with a live streak counter and a best-ever record
 
-FIND WHAT ACTUALLY MATTERS
-Most trackers stop at pretty charts. Plotline runs actual statistics. Tell it which topics are outcomes you care about and which are possible influences, and it compares them against each other, corrects for multiple comparisons using Benjamini-Hochberg FDR so you are not chasing noise, and reports only the associations that survive. It also checks timing effects, like whether something late in the evening changes the next day.
-
-Everything is described in plain language, using your own topic names.
+TRACK ANYTHING
+Water, caffeine, workouts, medications, symptoms, moods, migraines, chores, screen breaks, the dog's walks. If it happens and you want a record of when, it fits.
 
 SET IT UP IN SECONDS
-Start from a preset - Symptom Tracker, Daily Habits, or Fitness & Health - or build your own from scratch. Rename, reorder, and delete anything.
+Start from a preset - Symptom Tracker, Daily Habits, or Fitness & Health - or build your own. Rename, reorder, and delete anything.
 
 YOUR DATA STAYS YOURS
 - No account, no sign-up, no server
@@ -57,7 +66,7 @@ YOUR DATA STAYS YOURS
 - Export your full history to JSON at any time
 - Optional backup to your own Google Drive
 
-The developer never sees your data, because there is nowhere for it to go.
+The developer never sees your data, because there is nowhere for it to go. The analysis runs on your phone, not on a server.
 
 FREE
 No ads, no subscription, no paid tier, no upsell.

@@ -4,7 +4,8 @@
   "description": "Dev-only manifest. The app itself has no dependencies and no build step; these packages exist purely to run the smoke tests in Node.",
   "scripts": {
     "test": "node insights-smoke.js && node goals-smoke.js && node drive-smoke.js && node ui-smoke.js",
-    "screenshots": "node screenshots.js"
+    "screenshots": "node screenshots.js",
+    "logo": "node logo.js"
   },
   "devDependencies": {
     "fake-indexeddb": "^6.0.0",

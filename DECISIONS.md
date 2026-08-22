@@ -231,3 +231,63 @@ as **`day.plotline.app`**. Both replace the pre-launch
 - The origin change discarded existing IndexedDB data — see §4.
 - Cloudflare DNS must stay **unproxied (grey cloud)** for the apex A records,
   or GitHub cannot issue the certificate.
+
+---
+
+## 7. Third-party health data (Health Connect, Strava, Garmin)
+
+**Decision:** do nothing now. No Play Console setting has to be chosen today
+to keep this option open, and none of the irreversible choices block it.
+
+**What is genuinely irreversible, and why none of it is in the way:**
+
+| Choice | Status |
+| --- | --- |
+| Package name | Fixed at `day.plotline.app` (§6). Carries across any shell change. |
+| Free vs paid | Free, permanently. IAP can still be added at any time (§2). |
+| Everything else | Data safety, permissions, category, health declarations, target audience — all editable, and all *expected* to change when features change. |
+
+So the answer to "must I decide now or lose the option" is: **no**. The
+blockers are architectural, and they are already on the roadmap in §3.
+
+**Google Fit is not an option at all.** Google's own docs state the Fit APIs
+"will be deprecated in 2026" and that **as of May 1, 2024 developers cannot
+sign up to use these APIs**. There is no path in, even if we wanted one.
+Health Connect is the designated replacement.
+
+**Health Connect is native-only.** It is an Android API surface
+(`androidx.health.connect`) with no web equivalent, so it cannot be reached
+from a TWA. It requires the Capacitor step in §3. At that point it also
+requires a Play Console health-apps declaration and an approved permissions
+request — filled in *then*, not now.
+
+**Strava and Garmin are a different problem: they need a server.** Both use
+OAuth flows whose token exchange requires a client secret, which cannot be
+shipped in a public client — and this repo is public. Options, worst to
+best:
+
+1. Ship the secret in the app. Not viable; it is public immediately.
+2. Ask each user to register their own API application. Technically honest,
+   but a wall almost no one will climb.
+3. A minimal token-exchange endpoint (a Cloudflare Worker on the domain we
+   already own) that holds the secret and brokers tokens.
+
+Option 3 is the only realistic one, and it is the reason to think before
+building: it puts a server into a product whose central promise is "no
+server, no account, no analytics". That promise can survive a narrowly
+scoped broker that never stores health data — but it stops being literally
+true, and the store listing and privacy policy would both need rewriting.
+
+**Consequences to accept before starting:**
+
+- Data safety changes from "no data collected" to collecting health and
+  fitness data. Permitted, but it is a visible downgrade on the listing.
+- Play's health-apps policy adds review steps and forbids using the data for
+  ads or sale.
+- The privacy policy needs a third-party-data section.
+
+**Recommended sequencing:** Health Connect first, when the app is already
+native. It is on-device, needs no server, keeps the privacy promise intact,
+and covers sleep, steps and heart rate — the inputs the correlation engine
+would benefit from most. Treat Strava and Garmin as a separate, later
+decision, weighed against the cost of running a server at all.
