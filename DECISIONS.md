@@ -184,9 +184,26 @@ escape hatch removes control from self-hosters. The hybrid serves both.
 - The only scope used is `drive.file`, which Google classifies as
   **non-sensitive** — no demo video, app review, or third-party security
   assessment required.
-- The consent screen must be published **Testing → In production**, or the
-  default client is capped at 100 users and shows an "unverified app"
-  warning.
+- **While the consent screen sits in Testing, Drive sync is effectively
+  broken for everyone, including the developer.** Google's docs are
+  explicit: Testing projects are limited to at most 100 *explicitly listed*
+  test users, and **"authorizations by a test user will expire seven days
+  from the time of consent."** Nobody who is not on that list can connect
+  at all, and everyone on it silently drops off weekly. The name/email/
+  profile exception to this rule does not apply, because the app requests
+  `drive.file`.
+- **Publishing to In production is free and unblocks everything.** Because
+  the only scope is non-sensitive: verification is not mandatory ("if your
+  app utilizes only non-sensitive scopes, it is not mandatory for your app
+  to complete the app verification process"); the OAuth user cap does not
+  apply, since it "limits the number of users that can grant permission to
+  your app when requesting unapproved **sensitive or restricted** scopes";
+  and no "unverified app" warning is shown, since that too is triggered by
+  sensitive or restricted scopes. The 7-day expiry disappears with it.
+- The one thing production does *not* grant is branding: the app name and
+  logo appear on the consent screen only after the lighter-weight "brand
+  verification". Until then users see a less polished screen, which is
+  cosmetic and not a blocker.
 - Data safety remains **no collection**: the token is issued to the user,
   files land in the user's own Drive, and nothing reaches a developer
   server.
