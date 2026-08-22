@@ -44,6 +44,27 @@ cd ~/projects/countwhen
 
 No drag-and-drop, no console clicks. Pages handles the rest.
 
+### Hosting notes
+
+The site is served from the custom domain **`plotline.day`**, so this repo
+publishes at the *domain root* rather than under a `/countwhen/` path.
+
+Three files exist only to make that work, and none should be deleted:
+
+| File | Why it matters |
+| --- | --- |
+| `CNAME` | Tells GitHub Pages which custom domain to serve. |
+| `.nojekyll` | Disables Jekyll, which strips dot-directories. Without it `.well-known/` silently 404s. |
+| `.well-known/assetlinks.json` | Digital Asset Links. Proves the domain and the Android app belong together; if it 404s or the fingerprints are wrong, the TWA renders with a browser URL bar. |
+
+`assetlinks.json` must list **two** SHA-256 fingerprints: the local upload
+key (`android.keystore`) and the Play App Signing key that Google generates
+(Play Console → Test and release → Setup → App integrity).
+
+DNS lives at Cloudflare. The apex `A` records must stay **unproxied (grey
+cloud)** — with the orange proxy on, GitHub cannot issue the certificate.
+
+
 ## Features
 
 ### Logging

@@ -71,7 +71,7 @@ Plotline is a personal record-keeping tool. It is not a medical device, and it d
 |---|---|
 | App category | Health & Fitness (or Productivity — see note) |
 | Tags | habit tracker, symptom tracker, counter, log, statistics |
-| Contact email | countwhentimestampandtally@gmail.com |
+| Contact email | hello@plotline.day |
 | Website | https://plotline.day/ |
 | Privacy policy | https://plotline.day/privacy.html |
 
@@ -159,19 +159,26 @@ profile or merchant account is needed for a free app with no IAP.
 
 ## Public identity
 
-The public contact address is **countwhentimestampandtally@gmail.com** (used in
-the Play listing contact details and in `privacy.html`). The Play *account*
-remains under a personal address; only the listing-facing contact is separate.
+The Play listing contact address is a project-specific mailbox, separate from
+the Play *account*, which remains under a personal address.
 
-Note that the developer's real name is still discoverable through channels that
-cannot be changed after publishing:
+As of the `plotline.day` move, the public URLs and the package name are
+brand-neutral — `day.plotline.app` and `https://plotline.day/` name the
+product, not the developer. What remains discoverable:
 
-- the package name `day.plotline.app`, which is permanent and
-  appears in the Play Store URL;
-- the app's own URL, `https://plotline.day/`, which a TWA must
-  point at publicly and which is named in `assetlinks.json`;
-- the public GitHub repo and its commit history.
+- the **public GitHub repo** and its commit history, authored under the
+  developer's real name (the commit email is GitHub's `noreply` proxy, so the
+  real address is not exposed);
+- the **developer name** on the Play listing, if left as a personal name —
+  set this to *Plotline* under Developer account → About you;
+- **WHOIS** for `plotline.day`, unless registrar privacy is enabled.
 
-This is accepted as partial pseudonymity, not anonymity. Changing it would mean
-a new GitHub account, a new Pages origin, a new package name, and a rebuilt
-bundle — and is only possible *before* the first release is published.
+This is deliberate. Full anonymity is not achievable — Google holds a verified
+legal identity for every developer account — and it is not the goal.
+Attribution is useful, and an open repo is a trust asset for an app whose core
+claim is privacy. The aim is only that the identity is not *advertised*.
+
+**One thing that changes this calculus: monetization.** Google requires
+merchant accounts — any account with paid apps or in-app purchases — to
+publish a **full physical address** on the store listing, taken from the linked
+payments profile. See `DECISIONS.md` §2 before creating a first in-app product.

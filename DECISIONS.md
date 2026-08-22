@@ -3,7 +3,7 @@
 Standing decisions for Plotline, with the reasoning behind them, so future
 changes argue against a recorded position instead of a vague memory.
 
-Last reviewed: 2026-08-19 (pre-launch, v7.4.0).
+Last reviewed: 2026-08-21 (pre-launch, v7.6.0).
 
 ---
 
@@ -75,6 +75,19 @@ product SKU in Play Console. Two caveats:
 Both caveats disappear under Capacitor (§3), which is the argument for
 deferring monetization until after that move rather than building it twice.
 
+**The privacy cost of monetizing.** Per Google Play's developer-information
+policy, "merchant accounts (developer accounts with apps that monetize via
+paid apps or in-app purchases) **must show their full address on Google
+Play**", taken from the linked Google payments profile. Adding a single IAP
+therefore publishes a physical address on the listing — a much larger
+disclosure than the package name or the repo, and it is not avoidable by
+declaring non-trader status.
+
+The mitigation is to control *which* address that is: a registered LLC
+address, a virtual mailbox, or a registered-agent address, set on the
+payments profile **before** the first in-app product is created. This has to
+be arranged ahead of monetizing, not after.
+
 ---
 
 ## 3. Architecture: TWA now, Capacitor when native is needed
@@ -127,6 +140,13 @@ TWAs work. A Capacitor or native app runs in a different storage partition
 and **cannot read it**. A naive swap would look exactly like total data
 loss to every existing user.
 
+**This already bit us once.** Moving from `mikejaron1.github.io/countwhen/`
+to `plotline.day` (§6) changed the *origin*, so IndexedDB did not follow —
+anyone who had installed the old URL saw an empty app. It was survivable
+only because the move happened during internal testing, with a handful of
+testers and no real data. The same move after launch would be a disaster.
+Treat origin as permanent from here on.
+
 **The mitigation** — both hatches already exist and must keep working:
 
 1. **Google Drive sync** — the clean path. The cutover release prompts
@@ -170,3 +190,44 @@ escape hatch removes control from self-hosters. The hybrid serves both.
 - Data safety remains **no collection**: the token is issued to the user,
   files land in the user's own Drive, and nothing reaches a developer
   server.
+
+---
+
+## 6. Identity: own domain, neutral package name
+
+**Decision:** serve the app from **`plotline.day`** and ship the Android app
+as **`day.plotline.app`**. Both replace the pre-launch
+`mikejaron1.github.io/countwhen/` and `io.github.mikejaron1.countwhen`.
+
+**Why:**
+
+- **The old names were wrong on the merits.** The URL and package advertised
+  `countwhen`, a name abandoned after a Play Store collision with an existing
+  app of the same name. Shipping a product whose store URL names a different
+  product is confusing and unfixable later — package names are permanent.
+- **Timing forced the decision.** A package name can only be changed by
+  deleting the app and creating a new one. That is an hour of form-filling
+  before closed testing starts, versus an hour *plus* a restarted 14-day
+  tester clock afterwards. There was no cheaper moment than this one.
+- **It reads as a product, not a hobby.** Relevant because monetization (§2)
+  is now an explicit goal.
+- Removing the `mikejaron1` username from public URLs is a **side benefit,
+  not the rationale**. Real anonymity is not achievable — the repo is public
+  and every commit carries the author's name — and it is not wanted:
+  attribution is useful, and open source is a trust asset for a privacy app.
+  The goal is only that the identity is not *advertised*.
+
+**Consequences:**
+
+- GitHub Pages serves a project repo at the **domain root** under a custom
+  domain, so `.well-known/assetlinks.json` moved into this repo and the
+  separate `mikejaron1.github.io` repo is retired.
+- **`.nojekyll` is mandatory.** Jekyll strips dot-directories, which would
+  silently 404 `.well-known/assetlinks.json` and leave the TWA showing a
+  browser URL bar.
+- The manifest `id` changed `/countwhen/` → `/` to match the new scope. Safe
+  only because the origin changed at the same time, making it a new PWA
+  identity regardless.
+- The origin change discarded existing IndexedDB data — see §4.
+- Cloudflare DNS must stay **unproxied (grey cloud)** for the apex A records,
+  or GitHub cannot issue the certificate.
