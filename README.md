@@ -64,6 +64,15 @@ key (`android.keystore`) and the Play App Signing key that Google generates
 DNS lives at Cloudflare. The apex `A` records must stay **unproxied (grey
 cloud)** — with the orange proxy on, GitHub cannot issue the certificate.
 
+**Changing the origin breaks Google sign-in until the OAuth client is
+updated.** Drive sync uses Google Identity Services `initTokenClient`, an
+implicit token flow that validates the caller against the **Authorized
+JavaScript origins** list on the OAuth client (there is no redirect URI to
+change). After any origin move, add the new origin at
+<https://console.cloud.google.com/apis/credentials> — scheme and host only,
+no trailing slash and no path — or every sign-in fails with
+`Error 400: origin_mismatch`.
+
 
 ## Features
 
