@@ -62,10 +62,9 @@ scripts.forEach(load);
   const N = w.CWINSIGHTS;
 
   // 1. Fresh install: onboarding is offered.
-  await D.seedDefaults();
+  await waitFor(() => w.document.querySelectorAll('[data-preset]').length === 4);
   const fresh = await w.eval('needsOnboarding()');
   assert(fresh === true, 'fresh install should need onboarding');
-  await w.eval('openOnboarding()');
   const cards = w.document.querySelectorAll('[data-preset]');
   assert(cards.length === 4, `expected 4 preset cards, got ${cards.length}`);
 

@@ -164,29 +164,17 @@ function topicKind(topic) {
 /* ======== DATA LOADING ======== */
 
 async function reload() {
-  const [topics, events, measurements, favIds, topicKinds, topicMeta,
-         topicRoles, insightSettings, topicGoals, topicPrefs, dayChecks,
-         activeTimers, lastExport, lastDriveSync, lastLocalChangeAt, driveEnabled,
-         reorderHintHidden] = await Promise.all([
-    CWDB.getAll('topics'),
-    CWDB.getAll('events'),
-    CWDB.getAll('measurements'),
-    CWDB.getFavoriteTopicIds(),
-    CWDB.getAllTopicKinds(),
-    CWDB.getAllTopicMeta(),
-    CWDB.getTopicRoles(),
-    CWDB.getInsightSettings(),
-    CWDB.getTopicGoals(),
-    CWDB.getMeta('topicPrefs', {}),
-    CWDB.getMeta('dayChecks', {}),
-    CWDB.getMeta('activeTimers', {}),
-    CWDB.getMeta('lastExport', 0),
-    CWDB.getMeta('lastDriveSync', 0),
-    CWDB.getMeta('lastLocalChangeAt', 0),
-    CWDB.getMeta('driveEnabled'),
-    CWDB.getMeta('reorderHintHidden', false),
+  const { topics, events, measurements, favorites, meta } = await CWDB.getViewData([
+    'topicKinds', 'topicMeta', 'topicRoles', 'insightSettings', 'topicGoals',
+    'topicPrefs', 'dayChecks', 'activeTimers', 'lastExport', 'lastDriveSync',
+    'lastLocalChangeAt', 'driveEnabled', 'reorderHintHidden', 'topicOrder',
+    'quickBar', 'dataRevision',
   ]);
-  const savedOrder = (await CWDB.getMeta('topicOrder')) || [];
+  const { topicKinds, topicMeta, topicRoles, topicGoals, topicPrefs, dayChecks,
+    activeTimers, lastExport = 0, lastDriveSync = 0, lastLocalChangeAt = 0,
+    driveEnabled, reorderHintHidden = false } = meta;
+  const insightSettings = await CWDB.getInsightSettings(meta.insightSettings || {});
+  const savedOrder = meta.topicOrder || [];
   const knownIds = new Set(topics.map((t) => t.id));
   const orderedKnown = [...new Set(savedOrder.filter((id) => knownIds.has(id)))];
   const orderedSet = new Set(orderedKnown);
@@ -208,7 +196,7 @@ async function reload() {
     if (!previous || previous.time < event.time) state.latestByTopic.set(event.topicid, event);
   }
   state.measurements = measurements;
-  state.favorites = new Set(favIds);
+  state.favorites = new Set(favorites.map((favorite) => favorite.topicid));
   state.topicKinds = { ...(topicKinds || {}) };
   for (const topic of state.topics) {
     if (!state.topicKinds[topic.id]) state.topicKinds[topic.id] = inferKind(topic);
@@ -223,9 +211,10 @@ async function reload() {
     driveEnabled: driveEnabled ?? !!lastDriveSync };
   state.reorderHintHidden = reorderHintHidden;
   state.insightSettings = insightSettings;
+  state.dataRevision = meta.dataRevision ?? 0;
   state.insightsDirty = true;
   // Quick-access bar: keep only ids that still map to existing, non-archived topics.
-  const savedQuick = (await CWDB.getMeta('quickBar')) || [];
+  const savedQuick = meta.quickBar || [];
   const validQuick = Array.isArray(savedQuick)
     ? savedQuick.filter((id) => {
         const t = byId.get(id);
@@ -235,6 +224,22 @@ async function reload() {
   state.quickBar = validQuick;
   if (state.statsTopicId == null && state.topics.length) {
     state.statsTopicId = state.topics[0].id;
+  }
+}
+
+async function reconcileDayChecks() {
+  const emptyDays = new Set(Object.keys(state.dayChecks).filter((key) => state.dayChecks[key] === 'none'));
+  if (!emptyDays.size) return;
+  let changed = false;
+  const checks = { ...state.dayChecks };
+  for (const event of state.events) {
+    const key = CWSTATS.logicalDate(event.time, insightsSettings().cutoffHour);
+    if (emptyDays.delete(key)) { checks[key] = 'incomplete'; changed = true; }
+    if (!emptyDays.size) break;
+  }
+  if (changed) {
+    await CWDB.setMeta('dayChecks', checks);
+    state.dayChecks = checks;
   }
 }
 
@@ -302,25 +307,11 @@ function measuredValue(events, topic) {
   return total / (aggregation === 'mean' ? events.length : 1);
 }
 
-function backupHealthHtml() {
-  const backup = state.backup;
-  const latest = Math.max(backup.lastExport || 0, backup.lastDriveSync || 0);
-  const pending = latest && backup.lastLocalChangeAt > latest;
-  const text = !latest ? 'Not backed up yet'
-    : pending ? 'Changes waiting for backup'
-    : `Last ${backup.lastDriveSync >= backup.lastExport ? 'synced' : 'exported'} ${fmtDateLong(latest)}`;
-  return `<div class="backup-health"><span>${escapeHtml(text)}</span>
-    <button class="btn secondary small" id="backupHealthAction">${backup.driveEnabled ? 'Sync now' : 'Back up'}</button></div>`;
-}
-
-function bindBackupHealth() {
-  bindAction($('#backupHealthAction'), async () => {
-    if (state.backup.driveEnabled) {
-      const result = await CWDRIVE.syncNow({ interactive: true });
-      await CWDRIVE.afterSync(result);
-      await reload(); renderCurrent();
-    } else openDrive();
-  });
+function renderSyncActivity(detail) {
+  const activity = $('#syncActivity');
+  const syncing = /syncing/.test(detail.message || '');
+  activity.hidden = !syncing;
+  activity.textContent = syncing ? 'Syncing now' : '';
 }
 
 function dayCheckHtml(key) {
@@ -340,7 +331,7 @@ function dayCheckHtml(key) {
 
 function bindDayCheck(key) {
   bindAction($('#dayCheck'), async (event) => {
-    const value = event.target.value;
+    const value = event.value;
     const [start, end] = dayBounds(key);
     if (value === 'none' && state.events.some((e) => e.time >= start && e.time < end)) {
       throw new Error('This day has entries. Choose "Logged everything" or "Incomplete" instead.');
@@ -362,14 +353,15 @@ function timerHtml(topic) {
 
 async function startTimer(topic) {
   const started = Date.now();
-  await CWMODEL.mutate(() => CWDB.startTimer(topic.id, started));
-  snack(`Timer started for ${topic.name}`);
+  const result = await CWMODEL.mutate(() => CWDB.startTimer(topic.id, started));
+  snack(result == null ? `Timer already running for ${topic.name}` : `Timer started for ${topic.name}`);
 }
 
 async function stopTimer(topic) {
   const stopped = Date.now();
   await CWMODEL.mutate(async () => {
     const event = await CWDB.finishTimer(topic.id, stopped);
+    if (!event) { snack('This timer was already stopped.'); return; }
     snack(`Saved ${topic.name} timer`, { undo: () => CWMODEL.mutate(() => CWDB.delete('events', event.id)) });
   });
 }
@@ -435,14 +427,12 @@ function renderCategories() {
   const topics = state.topics.filter((t) => !t.archived);
   if (!topics.length) {
     main.innerHTML = `
-      ${backupHealthHtml()}
       ${welcomeBannerHtml()}
       <div class="empty">
         <p>${state.topics.length ? 'All topics are archived. Your history is still saved.' : 'No topics yet.'}</p>
         <button class="btn" id="emptyAddTopic">Add a topic</button>
         ${state.topics.length ? '<button class="btn secondary" id="emptyManage">Manage topics</button>' : ''}
       </div>`;
-    bindBackupHealth();
     bindWelcomeBanner();
     $('#emptyAddTopic')?.addEventListener('click', () => openTopicEdit(null));
     $('#emptyManage')?.addEventListener('click', openTopicsManager);
@@ -491,14 +481,12 @@ function renderCategories() {
   }).join('');
 
   main.innerHTML = `
-    ${backupHealthHtml()}
     ${quickBar}
     ${state.reorderHintHidden ? '' : '<div class="reorder-hint">Log an entry, or long-press a card to reorder. Edit topics in Menu → Manage topics. <button class="btn secondary small" id="hideReorderHint">Got it</button></div>'}
     ${dayCheckHtml(logicalDay())}
     <div id="categoriesList">${html}</div>
     <button class="new-topic-tile" id="addTopicBtn">+ New topic</button>
   `;
-  bindBackupHealth();
   bindDayCheck(logicalDay());
   bindAction($('#hideReorderHint'), async () => {
     await CWDB.setMeta('reorderHintHidden', true);
@@ -2289,7 +2277,6 @@ function openTopicEdit(existing) {
     else delete allPrefs[savedTopicId].quickAmount;
     await CWDB.setMeta('topicPrefs', allPrefs);
     closeModal({ origin });
-    await reload();
     snack('Saved');
     queueAutoSync('saveTopic');
     renderCurrent();
@@ -2309,7 +2296,6 @@ function openTopicEdit(existing) {
           const count = (state.eventsByTopic.get(existing.id) || []).length;
           await CWDB.deleteTopic(existing.id);
           closeModal({ origin });
-          await reload();
           snack(`Deleted "${existing.name}" and ${count.toLocaleString()} event${count === 1 ? '' : 's'}`);
           queueAutoSync('deleteTopic');
           renderCurrent();
@@ -2538,7 +2524,6 @@ function triggerImport() {
       bindAction($('#impMerge'), async ({ origin }) => {
         await CWIO.importMerge(obj);
         closeModal({ origin });
-        await reload();
         snack(`Merged ${sum.events.toLocaleString()} events`);
         queueAutoSync('import');
         renderCurrent();
@@ -2547,7 +2532,6 @@ function triggerImport() {
         await CWIO.safetyBackup();
         await CWIO.importReplace(obj);
         closeModal({ origin });
-        await reload();
         snack(`Loaded ${sum.events.toLocaleString()} events`);
         queueAutoSync('import');
         renderCurrent();
@@ -2561,7 +2545,7 @@ function triggerImport() {
 
 async function doExport() {
   await CWIO.exportToFile('plotline-backup.json');
-  await reload(); renderCurrent();
+  await CWMODEL.refresh();
   snack('Exported plotline-backup.json');
 }
 
@@ -2713,6 +2697,7 @@ function setView(view) {
 }
 
 function renderCurrent() {
+  if (CWMODEL.isMutating()) return;
   const active = document.activeElement;
   const hadFocus = $('#main').contains(active) && active !== $('#main');
   let focusSelector = active?.id && /^[A-Za-z][\w-]*$/.test(active.id) ? `#${active.id}` : null;
@@ -2781,6 +2766,7 @@ function severityBadge(ev) {
 /* ======== AUTO-SYNC (calls into drive.js if configured) ======== */
 function queueAutoSync(reason = 'change') {
   state.insightsDirty = true;   // data changed -> recompute insights lazily
+  if (CWMODEL.isMutating()) return; // the coordinator schedules once after commit
   if (window.CWDRIVE?.queueAutoSync) {
     window.CWDRIVE.queueAutoSync(reason).catch(reportError);
   }
@@ -2943,7 +2929,7 @@ async function needsOnboarding() {
 
 function openOnboarding() {
   const cards = PRESETS.map((p) => `
-    <button class="preset-card" data-preset="${p.id}">
+    <button class="preset-card" data-preset="${p.id}" data-action-key="onboarding-preset">
       <span class="preset-icon">${p.icon}</span>
       <span class="preset-text">
         <strong>${escapeHtml(p.name)}</strong>
@@ -2966,12 +2952,11 @@ function openOnboarding() {
   `, { dismissible: false });
 
   $$('[data-preset]').forEach((btn) => {
-    bindAction(btn, async () => {
+    bindAction(btn, async ({ origin }) => {
       const preset = PRESETS.find((p) => p.id === btn.dataset.preset);
       $$('[data-preset]').forEach((button) => { button.disabled = true; });
       await applyPreset(preset);
-      closeModal();
-      await reload();
+      closeModal({ origin });
       renderCurrent();
       if (preset.topics.length) snack(`${preset.name} topics added`);
     }, { mutation: true });
@@ -2987,8 +2972,7 @@ function openOnboarding() {
     await CWDRIVE.syncDown({ interactive: true });
     await CWDB.setMeta('onboarded', true);
     closeModal();
-    await reload();
-    renderCurrent();
+    await CWMODEL.refresh();
     snack('Restored from Drive');
   });
 }
@@ -3044,7 +3028,7 @@ async function init() {
     try {
       const res = await window.CWDRIVE.syncNow({ interactive: true });
       if (res?.action === 'merged' && res.changedLocally) {
-        await reload(); renderCurrent();
+        await CWMODEL.refresh();
         snack(`Merged with Drive: ${res.stats?.fromRemote || 0} pulled in`);
       } else {
         snack('Synced');
@@ -3088,12 +3072,12 @@ async function init() {
     $(`#tab-${VIEWS[target]}`).focus();
   });
   CWMODEL.start();
+  window.addEventListener('plotline:sync-status', (event) => renderSyncActivity(event.detail));
   setInterval(() => { if (document.visibilityState !== 'hidden') refreshLiveLabels(); }, 30000);
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState !== 'visible') return;
     try {
-      await reload();
-      if (!$('#modalRoot .dialog')) renderCurrent();
+      if (!$('#modalRoot .dialog')) await CWMODEL.refresh();
       refreshLiveLabels();
     } catch (error) { reportError(error); }
   });
@@ -3136,6 +3120,8 @@ window.addEventListener('DOMContentLoaded', () => init().catch(reportError));
 window.openTopicEdit = openTopicEdit;
 window.CWAPP = {
   reload,
+  dataRevision: () => state.dataRevision,
+  reconcileDayChecks,
   renderCurrent,
   snack,
   openModal,

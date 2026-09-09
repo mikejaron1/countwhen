@@ -411,6 +411,22 @@ async function run() {
   assert.deepEqual(copy(await DB.getMeta('activeTimers')), {});
   console.log('PASS atomic timer start/finish, cleanup rollback, retry and concurrent operations');
 
+  const revision = await DB.getMeta('dataRevision', 0);
+  const revisions = await Promise.all(Array.from({ length: 10 }, () => DB.markChange()));
+  assert.equal(new Set(revisions).size, 10);
+  assert.equal(await DB.getMeta('dataRevision'), revision + 10);
+  const view = copy(await DB.getViewData(['dataRevision', 'topicPrefs']));
+  assert.equal(view.meta.dataRevision, revision + 10);
+  assert.equal(view.meta.drivePendingSnapshot, undefined);
+  assert.deepEqual(view.events, copy(await DB.getAll('events')));
+  assert.deepEqual(view.topics, copy(await DB.getAll('topics')));
+  await DB.setMeta('dataRevision', 0);
+  assert.equal(await DB.markChange(revision + 10), revision + 11, 'reset cannot reuse an older view revision');
+  const lastLocalChange = await DB.getMeta('lastLocalChangeAt');
+  assert.equal(await DB.markChange(0, { local: false }), revision + 12);
+  assert.equal(await DB.getMeta('lastLocalChangeAt'), lastLocalChange, 'remote refreshes are not local edits');
+  console.log('PASS coherent lightweight view snapshots and atomic mutation revisions');
+
   await DB.clearAll();
   const cleared = await snapshot();
   for (const [key, rows] of Object.entries(cleared)) if (key !== 'meta') assert.deepEqual(rows, []);

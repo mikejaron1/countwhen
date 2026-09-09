@@ -1172,6 +1172,13 @@ body.drag-active .card { touch-action: none; }
 .sync-pill.error { background: rgba(229,72,77,0.45); }
 .sync-pill.ok    { background: rgba(18,179,166,0.35); }
 button.sync-pill { border: 1px solid var(--on-chrome-dim); cursor: pointer; }
+.sync-activity {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--on-chrome-dim);
+  white-space: nowrap;
+}
 
 /* ===== Insights view ===== */
 .setup-card {
@@ -1473,6 +1480,22 @@ button.sync-pill { border: 1px solid var(--on-chrome-dim); cursor: pointer; }
 .quick-bar { scroll-padding-inline: 10px; }
 .quick-chip { max-width: min(80vw, 360px); white-space: normal; overflow-wrap: anywhere; text-align: left; }
 button:disabled:active { transform: none; }
+button[aria-busy="true"] { cursor: progress; opacity: .7; }
+button[aria-busy="true"]::after {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-left: 6px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: pending-action .7s linear infinite;
+}
+@keyframes pending-action { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button[aria-busy="true"]::after { animation: none; }
+}
 
 /* Native form controls remain usable in the compact settings and status panels. */
 :where(.app-main, .dialog) :where(select, input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), textarea) {
@@ -1494,7 +1517,7 @@ button:disabled:active { transform: none; }
 [aria-invalid="true"] { border-color: var(--danger-ink) !important; }
 .field .hint { display: inline-block; margin-left: 0; line-height: 1.5; }
 
-.backup-health, .today-checkin {
+.today-checkin {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1507,7 +1530,7 @@ button:disabled:active { transform: none; }
   font-size: var(--text-small);
   color: var(--ink-soft);
 }
-.backup-health > span, .today-checkin > label {
+.today-checkin > label {
   flex: 1 1 180px;
   min-width: 0;
   overflow-wrap: anywhere;

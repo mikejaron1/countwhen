@@ -378,7 +378,10 @@ remaps records and their settings together. Device reset disconnects Drive befor
 clearing local storage and never uploads an empty replacement.
 
 **Synchronization:** local mutations and Drive snapshots share `plotline-data`
-locking, with a same-page queue fallback. Remote checks, bounded remerges and
+locking, with a same-page queue fallback. Network requests must remain outside
+that lock; local revision checks protect edits made while a request is in flight.
+UI mutations use one small-metadata/history snapshot after committing rather
+than repeatedly reading all events or recovery copies. Remote checks, bounded remerges and
 retained recovery snapshots reduce conflict risk; they are not an atomic
 server-side write precondition and must not be described as one.
 

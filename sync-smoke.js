@@ -18,10 +18,34 @@ const backup = (overrides = {}) => ({
 });
 const event = (id, amount = 1) => ({ id, topicid: 1, time: 1000, amount });
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function completesWhileBlocked(promise) {
+  let timer;
+  try {
+    await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('local mutation waited for network')), 1000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+async function editLocal(h, change, stamped = true) {
+  return h.api.withDataLock(async () => {
+    await change();
+    const db = h.db || h.browser.CWDB;
+    if (stamped) await db.setMeta('dataRevision', (await db.getMeta('dataRevision', 0)) + 1);
+    await db.setMeta('lastLocalChangeAt', Date.now());
+  });
+}
+
 function harness(initial = backup(), remote = clone(initial)) {
-  const meta = new Map([['driveEnabled', true], ['driveSyncBase', clone(initial)]]);
+  const meta = new Map([['driveEnabled', true], ['driveSyncBase', clone(initial)], ['dataRevision', 1]]);
   const state = { local: clone(initial), remote: clone(remote), revision: 1,
-    reads: 0, writes: 0, auth: 0, applies: 0, safety: 0, locks: [], statuses: [] };
+    reads: 0, writes: 0, auth: 0, applies: 0, safety: 0, locks: [], lockDepth: 0, statuses: [] };
   let lockQueue = Promise.resolve();
   const stat = () => state.remote ? {
     id: 'primary', version: String(state.revision), modifiedTime: '2026-01-01T00:00:00Z',
@@ -31,7 +55,11 @@ function harness(initial = backup(), remote = clone(initial)) {
     console, setTimeout, clearTimeout, URL, Blob,
     navigator: { onLine: true, locks: { request(name, opts, fn) {
       state.locks.push([name, opts.mode]);
-      const result = lockQueue.then(fn); lockQueue = result.catch(() => {}); return result;
+      const result = lockQueue.then(async () => {
+        state.lockDepth++;
+        try { return await fn(); } finally { state.lockDepth--; }
+      });
+      lockQueue = result.catch(() => {}); return result;
     } } },
     document: { visibilityState: 'visible', addEventListener() {}, getElementById() { return null; } },
     CustomEvent: class { constructor(type, opts) { this.type = type; this.detail = opts.detail; } },
@@ -39,24 +67,35 @@ function harness(initial = backup(), remote = clone(initial)) {
       addEventListener() {}, dispatchEvent(e) { state.statuses.push(e); } },
     CWDB: { normalizeInsightSettings: ioContext.CWDB.normalizeInsightSettings,
       async getMeta(key, fallback = null) { return meta.has(key) ? clone(meta.get(key)) : fallback; },
-      async setMeta(key, value) { meta.set(key, clone(value)); } },
+      async setMeta(key, value) { meta.set(key, clone(value)); },
+      async markChange(minimumRevision = 0, { local = true } = {}) {
+        const revision = Math.max(meta.get('dataRevision') || 0, minimumRevision) + 1;
+        meta.set('dataRevision', revision);
+        if (local) meta.set('lastLocalChangeAt', Date.now());
+        return revision;
+      } },
     CWIO: {
       async buildExportObject() { state.reads++; await state.onBuild?.(); return clone(state.local); },
       validateBackup: ioContext.window.CWIO.validateBackup,
-      async safetyBackup() { state.safety++; },
+      async safetyBackup() { assert.equal(state.lockDepth, 0); state.safety++; await state.onSafety?.(); },
       async checkTimerReplacement() {},
-      async importReplace(o) { await state.onApply?.(); state.applies++; state.local = clone(o); },
+      async importReplace(o) {
+        await state.onApply?.(); state.applies++; state.local = clone(o);
+      },
     },
     hooks: {
-      async auth() { state.auth++; await state.onAuth?.(); return 'fake'; },
-      async stat() { await state.onStat?.(); return clone(stat()); },
-      async read() { await state.onRead?.(); return clone(state.remote); },
+      async auth() { assert.equal(state.lockDepth, 0); state.auth++; await state.onAuth?.(); return 'fake'; },
+      async stat() { assert.equal(state.lockDepth, 0); await state.onStat?.(); return clone(stat()); },
+      async read() { assert.equal(state.lockDepth, 0); await state.onRead?.(); return clone(state.remote); },
       async write(id, obj) {
+        assert.equal(state.lockDepth, 0);
         state.writes++; state.remote = clone(obj); state.revision++;
         const result = stat();
         await state.onWrite?.();
         return result;
       },
+      async rotate() { assert.equal(state.lockDepth, 0); await state.onRotate?.(); },
+      async cleanup() { assert.equal(state.lockDepth, 0); await state.onCleanup?.(); },
     },
   };
   vm.createContext(browser);
@@ -69,8 +108,8 @@ function harness(initial = backup(), remote = clone(initial)) {
     readSyncFile = hooks.read;
     updateSyncFile = hooks.write;
     createSyncFile = async (folder, obj) => hooks.write(null, obj);
-    rotateVersions = async () => {};
-    maybeCleanupLegacyArtifacts = async () => {};
+    rotateVersions = hooks.rotate;
+    maybeCleanupLegacyArtifacts = hooks.cleanup;
     window.compare = comparableBackup;
   `, browser);
   return { api: browser.window.CWDRIVE, state, meta, browser };
@@ -97,7 +136,7 @@ async function storageHarness() {
   h.browser.CWIO = {
     ...io,
     async buildExportObject() { h.state.reads++; return io.buildExportObject(); },
-    async safetyBackup() { h.state.safety++; },
+    async safetyBackup() { assert.equal(h.state.lockDepth, 0); h.state.safety++; await h.state.onSafety?.(); },
     async importReplace(obj, options) {
       await h.state.onApply?.();
       await io.importReplace(obj, options);
@@ -166,7 +205,7 @@ async function test(name, fn) {
     assert.equal(h.state.remote._plotline.activeTimers, undefined);
     await h.api.syncDown();
     assert.equal(await h.db.getMeta('activeTimers'), null);
-    assert.deepEqual(h.state.locks, [['plotline-data', 'exclusive'], ['plotline-data', 'exclusive']]);
+    assert.deepEqual(h.state.locks, Array.from({ length: 5 }, () => ['plotline-data', 'exclusive']));
   });
   await test('real storage: colliding duration topics preserve the timer on the moved local topic', async () => {
     const h = await storageHarness();
@@ -259,6 +298,79 @@ async function test(name, fn) {
     assert.equal(h.state.applies, 1);
     assert.equal(h.state.local._plotline.topicPrefs[1].quickAmount, 4);
     assert.equal(h.state.local._plotline.dayChecks['2026-01-02'], 'none');
+  });
+  await test('sync replacements advance revision without pretending remote changes were local edits', async () => {
+    const h = harness();
+    h.meta.set('dataRevision', 10);
+    h.meta.set('lastLocalChangeAt', 1234);
+    const markChange = h.browser.CWDB.markChange;
+    h.browser.CWDB.markChange = async (minimumRevision, options) => {
+      assert.equal(h.state.lockDepth, 1, 'revision must be stamped before releasing the apply lock');
+      assert.equal(h.state.applies, minimumRevision - 9);
+      return markChange(minimumRevision, options);
+    };
+    await h.api.syncNow();
+    assert.equal(h.meta.get('dataRevision'), 10, 'unchanged upload does not invalidate UI caches');
+    assert.equal(h.meta.get('lastLocalChangeAt'), 1234, 'unchanged upload does not stamp a change');
+    h.state.remote.events.push(event(3)); h.state.revision++;
+    await h.api.syncNow();
+    assert.equal(h.meta.get('dataRevision'), 11);
+    await h.api.syncDown();
+    assert.equal(h.meta.get('dataRevision'), 12, 'explicit restore replaces records even when contents match');
+    assert.equal(h.meta.get('lastLocalChangeAt'), 1234);
+    assert.ok(h.meta.get('lastDriveSync') >= h.meta.get('lastLocalChangeAt'));
+  });
+  await test('failed local apply does not advance the model revision', async () => {
+    const h = harness();
+    h.state.remote.events.push(event(3));
+    h.state.onApply = () => { throw new Error('transaction aborted'); };
+    await assert.rejects(h.api.syncNow(), /transaction aborted/);
+    assert.equal(h.meta.get('dataRevision'), 1);
+    assert.equal(h.state.applies, 0);
+  });
+  await test('real storage sync and restore revisions remain monotonic', async () => {
+    const h = await storageHarness();
+    await h.db.setMeta('dataRevision', 40);
+    h.state.remote.events.push({ id: 3, topicid: 1, time: 2000, qant: 60 });
+    await h.api.syncNow();
+    assert.equal(await h.db.getMeta('dataRevision'), 41);
+    await h.api.syncDown();
+    assert.equal(await h.db.getMeta('dataRevision'), 42);
+  });
+  await test('afterSync uses the model refresh queue instead of racing reload/render with a mutation', async () => {
+    const h = harness();
+    const blocked = deferred(), started = deferred();
+    const calls = [];
+    h.browser.window.CWAPP = {
+      reload() { throw new Error('direct reload must not bypass the model'); },
+      renderCurrent() { throw new Error('direct render must not replace busy controls'); },
+      snack() { calls.push('snack'); },
+    };
+    h.browser.window.CWMODEL = {
+      refresh() { return h.api.withDataLock(() => { calls.push('refresh'); }); },
+    };
+    const mutation = h.api.withDataLock(async () => {
+      started.resolve(); await blocked.promise; calls.push('mutation');
+    });
+    await started.promise;
+    const refresh = h.api.afterSync({ action: 'merged', changedLocally: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(calls, []);
+    blocked.resolve();
+    await Promise.all([mutation, refresh]);
+    assert.deepEqual(calls, ['mutation', 'refresh', 'snack']);
+    await h.api.afterSync({ action: 'merged', changedLocally: false });
+    assert.equal(calls.length, 3);
+  });
+  await test('afterSync retains direct reload/render only when no model exists', async () => {
+    const h = harness(), calls = [];
+    h.browser.window.CWAPP = {
+      async reload() { calls.push('reload'); },
+      renderCurrent() { calls.push('render'); },
+      snack() { calls.push('snack'); },
+    };
+    await h.api.afterSync({ action: 'merged', changedLocally: true });
+    assert.deepEqual(calls, ['reload', 'render', 'snack']);
   });
   await test('portable maps merge separate topics, days, and nested fields', async () => {
     const h = harness();
@@ -470,6 +582,230 @@ async function test(name, fn) {
     assert.equal(h.meta.get('driveSyncBase').events.length, 0);
     assert.ok(h.meta.get('drivePendingSnapshot'));
   });
+  for (const phase of ['onRead', 'onWrite']) {
+    for (const stamped of [true, false]) {
+      await test(`${phase}: locked edit/add/delete completes during network and survives retry (${stamped ? 'revision' : 'fallback'})`, async () => {
+        const h = harness(backup({ events: [event(1), event(2)] }));
+        h.state.remote.events.push(event(3));
+        const started = deferred(), blocked = deferred();
+        let first = true;
+        h.state[phase] = async () => {
+          if (!first) return;
+          first = false; started.resolve(); await blocked.promise;
+        };
+        const sync = h.api.syncNow();
+        try {
+          await started.promise;
+          await completesWhileBlocked(editLocal(h, () => {
+            h.state.local.events = [event(1, 9), event(4)];
+          }, stamped));
+          assert.equal(h.state.applies, 0);
+        } finally { blocked.resolve(); }
+        await sync;
+        assert.deepEqual(h.state.local.events.map((e) => e.id).sort(), [1, 3, 4]);
+        assert.equal(h.state.local.events.find((e) => e.id === 1).amount, 9);
+        assert.deepEqual(h.state.remote.events, h.state.local.events);
+        assert.equal(h.state.auth, 1, 'local retries reuse the authenticated operation');
+        assert.equal(h.meta.get('drivePendingSnapshot').status, 'confirmed');
+      });
+    }
+  }
+  await test('a revision-only change during upload is checked inside the apply lock', async () => {
+    const h = harness();
+    h.state.remote.events.push(event(3));
+    h.state.onWrite = async () => {
+      if (h.state.writes === 1) await editLocal(h, () => {});
+    };
+    await h.api.syncNow();
+    assert.equal(h.state.writes, 2);
+    assert.equal(h.state.auth, 1);
+  });
+  await test('continuous local races are bounded, retain recovery, and never mark old edits synced', async () => {
+    const h = harness();
+    h.state.remote.events.push(event(3));
+    h.state.onWrite = async () => {
+      await editLocal(h, () => { h.state.local.events.push(event(100 + h.state.writes)); });
+    };
+    await assert.rejects(h.api.syncNow(), /LOCAL_CHANGED/);
+    assert.equal(h.state.writes, 4);
+    assert.equal(h.state.auth, 1);
+    assert.equal(h.state.applies, 0);
+    assert.equal(h.meta.has('lastDriveSync'), false);
+    assert.equal(h.meta.get('drivePendingSnapshot').status, 'pending');
+    h.state.onWrite = null;
+    await h.api.syncNow();
+    assert.deepEqual(h.state.local.events.map((e) => e.id).sort(), [101, 102, 103, 104, 3].sort());
+  });
+  await test('local changes during safety export do not get overwritten', async () => {
+    const h = harness();
+    h.state.remote.events.push(event(3));
+    h.state.onSafety = async () => {
+      if (h.state.safety === 1) await editLocal(h, () => { h.state.local.events.push(event(4)); });
+    };
+    await h.api.syncNow();
+    assert.deepEqual(h.state.local.events.map((e) => e.id).sort(), [3, 4]);
+  });
+  for (const phase of ['onRead', 'onSafety']) {
+    await test(`explicit restore rejects new local data during ${phase} until reconfirmed`, async () => {
+      const h = harness();
+      h.state.remote.events.push(event(3));
+      h.state[phase] = async () => {
+        h.state[phase] = null;
+        await completesWhileBlocked(editLocal(h, () => { h.state.local.events.push(event(4)); }));
+      };
+      await assert.rejects(h.api.syncDown(), /LOCAL_CHANGED.*confirm restore again/);
+      assert.deepEqual(h.state.local.events.map((e) => e.id), [4]);
+      assert.equal(h.state.applies, 0);
+      assert.equal(h.meta.has('lastDriveSync'), false);
+      assert.equal(h.meta.get('drivePendingSnapshot').status, 'restore');
+      await h.api.syncDown();
+      assert.deepEqual(h.state.local.events.map((e) => e.id), [3]);
+    });
+  }
+  await test('real storage: a timer started during download is preserved through local retry', async () => {
+    const h = await storageHarness();
+    h.state.remote._plotline.topicMeta = { 1: { color: '#123456' } };
+    let first = true;
+    h.state.onRead = async () => {
+      if (!first) return;
+      first = false;
+      await completesWhileBlocked(editLocal(h, () => h.db.startTimer(1, 1000), false));
+    };
+    await h.api.syncNow();
+    assert.deepEqual(clone(await h.db.getMeta('activeTimers')), { 1: 1000 });
+    assert.equal(h.state.auth, 1);
+  });
+  await test('real storage: timer-only changes during restore require renewed confirmation', async () => {
+    const h = await storageHarness();
+    h.state.onRead = async () => {
+      h.state.onRead = null;
+      await completesWhileBlocked(editLocal(h, () => h.db.startTimer(1, 1000), false));
+    };
+    await assert.rejects(h.api.syncDown(), /LOCAL_CHANGED/);
+    assert.deepEqual(clone(await h.db.getMeta('activeTimers')), { 1: 1000 });
+    assert.equal(h.state.applies, 0);
+  });
+  await test('real storage: timer and edited legacy topic keep their identity through upload retry', async () => {
+    const h = await storageHarness();
+    const base = clone(h.state.local); base.topics = []; base._plotline.topicKinds = {};
+    await h.db.setMeta('driveSyncBase', base);
+    h.state.remote.topics[0].name = 'Remote duration';
+    h.state.onWrite = async () => {
+      if (h.state.writes !== 1) return;
+      await completesWhileBlocked(editLocal(h, async () => {
+        await h.db.startTimer(1, 1000);
+        const topic = await h.db.get('topics', 1);
+        await h.db.put('topics', { ...topic, name: 'Edited local duration' });
+      }));
+    };
+    await h.api.syncNow();
+    const topics = await h.db.getAll('topics');
+    const moved = topics.find((t) => t.name === 'Edited local duration');
+    assert.equal(topics.length, 2);
+    assert.notEqual(moved.id, 1);
+    assert.deepEqual(clone(await h.db.getMeta('activeTimers')), { [moved.id]: 1000 });
+    assert.equal(h.state.auth, 1);
+  });
+  await test('colliding legacy event deletion during accepted upload does not resurrect moved copy', async () => {
+    const h = harness();
+    h.state.local.events.push(event(1, 2));
+    h.state.remote.events.push(event(1, 3));
+    h.state.onWrite = async () => {
+      if (h.state.writes === 1) await editLocal(h, () => { h.state.local.events = []; });
+    };
+    await h.api.syncNow();
+    assert.deepEqual(h.state.local.events, [event(1, 3)]);
+    assert.deepEqual(h.state.remote.events, [event(1, 3)]);
+  });
+  await test('pending accepted upload does not resurrect a subsequently deleted legacy collision', async () => {
+    const h = harness();
+    h.state.local.events.push(event(1, 2));
+    h.state.remote.events.push(event(1, 3));
+    h.state.onWrite = async () => {
+      await editLocal(h, () => { h.state.local.events = []; });
+      throw new Error('network interrupted');
+    };
+    await assert.rejects(h.api.syncNow(), /network interrupted/);
+    h.state.onWrite = null;
+    await h.api.syncNow();
+    assert.deepEqual(h.state.local.events, [event(1, 3)]);
+    assert.deepEqual(h.state.remote.events, [event(1, 3)]);
+  });
+  await test('a pending collision plus a newer remote edit defers instead of resurrecting a local delete', async () => {
+    const h = harness();
+    h.state.local.events.push(event(1, 2));
+    h.state.remote.events.push(event(1, 3));
+    h.state.onWrite = () => { throw new Error('network interrupted'); };
+    await assert.rejects(h.api.syncNow(), /network interrupted/);
+    const moved = h.state.remote.events.find((e) => e.id !== 1);
+    moved.amount = 9; h.state.revision++;
+    await editLocal(h, () => { h.state.local.events = []; });
+    h.state.onWrite = null;
+    await assert.rejects(h.api.syncNow(), /LOCAL_CONFLICT/);
+    assert.deepEqual(h.state.local.events, []);
+    assert.equal(h.state.writes, 1);
+    assert.equal(h.meta.has('lastDriveSync'), false);
+    assert.equal(h.meta.get('drivePendingSnapshot').status, 'pending');
+  });
+  await test('older recovery without event identity maps defers newer deletes rather than guessing', async () => {
+    const h = harness();
+    const local = backup({ events: [event(1, 2)] });
+    const candidate = backup({ events: [event(1, 3), event(99, 2)] });
+    h.meta.set('drivePendingSnapshot', { status: 'pending', snapshot: candidate, localSnapshot: local,
+      localIdMaps: { topics: { 1: 1 }, measurements: { 1: 1 } } });
+    h.state.remote = clone(candidate);
+    await assert.rejects(h.api.syncNow(), /LOCAL_CONFLICT.*older recovery/);
+    assert.deepEqual(h.state.local.events, []);
+    assert.equal(h.state.writes, 0);
+    assert.equal(h.meta.get('drivePendingSnapshot').snapshot.events.length, 2);
+  });
+  await test('legacy alert normalization keeps remapped metadata through a pending local topic edit', async () => {
+    const h = harness(backup({ topics: [] }));
+    h.state.local = backup({ topics: [{ id: 1, name: 'Local', msureid: 1 }],
+      _plotline: { insightSettings: { alertOn: 'flare' }, topicPrefs: { 1: { quickAmount: 4 } },
+        topicOrder: [1], quickBar: [1], favorites: [{ topicid: 1 }] } });
+    h.state.remote = backup({ topics: [{ id: 1, name: 'Remote', msureid: 1 }] });
+    h.state.onWrite = () => { throw new Error('network interrupted'); };
+    await assert.rejects(h.api.syncNow(), /network interrupted/);
+    await editLocal(h, () => {
+      h.state.local.topics[0].name = 'Edited local';
+      h.state.local._plotline.topicPrefs[1].quickAmount = 8;
+    });
+    h.state.onWrite = null;
+    await h.api.syncNow();
+    const id = h.state.local.topics.find((t) => t.name === 'Edited local').id;
+    assert.notEqual(id, 1);
+    assert.equal(h.state.local.topics.length, 2);
+    assert.equal(h.state.local._plotline.insightSettings.alertOn, 'alert');
+    assert.equal(h.state.local._plotline.topicPrefs[id].quickAmount, 8);
+    assert.deepEqual(h.state.local._plotline.topicOrder, [id]);
+    assert.deepEqual(h.state.local._plotline.quickBar, [id]);
+    assert.deepEqual(h.state.local._plotline.favorites, [{ topicid: id }]);
+  });
+  await test('real storage: cancelling a timer during upload does not resurrect the device-only timer', async () => {
+    const h = await storageHarness();
+    await h.db.startTimer(1, 1000);
+    h.state.remote._plotline.topicMeta = { 1: { color: '#123456' } };
+    h.state.onWrite = async () => {
+      if (h.state.writes === 1) await editLocal(h, () => h.db.setMeta('activeTimers', {}), false);
+    };
+    await h.api.syncNow();
+    assert.deepEqual(clone(await h.db.getMeta('activeTimers')), {});
+    assert.equal(h.state.writes, 2);
+    assert.equal(h.state.auth, 1);
+  });
+  await test('coalesced background requests during cleanup still sync their newer edits', async () => {
+    const h = harness();
+    let coalesced;
+    h.state.onCleanup = async () => {
+      h.state.onCleanup = null;
+      await editLocal(h, () => { h.state.local.events.push(event(4)); });
+      coalesced = h.api.syncNow();
+    };
+    await h.api.syncNow();
+    await coalesced;
+    assert.deepEqual(h.state.remote.events, [event(4)]);
+  });
   await test('syncNow and syncDown use one serial queue and shared exclusive lock', async () => {
     const h = harness();
     let release;
@@ -481,13 +817,29 @@ async function test(name, fn) {
     assert.equal(h.state.reads, 1);
     assert.equal((await h.api.getConnectionState()).pending, true);
     release(); await Promise.all([a, b]);
-    assert.deepEqual(h.state.locks, [['plotline-data', 'exclusive'], ['plotline-data', 'exclusive']]);
+    assert.deepEqual(h.state.locks, Array.from({ length: 5 }, () => ['plotline-data', 'exclusive']));
     assert.equal(h.state.auth, 2);
   });
   await test('queue fallback works without navigator.locks', async () => {
     const h = harness(); delete h.browser.navigator.locks;
     await Promise.all([h.api.syncNow(), h.api.syncNow()]);
+    assert.equal(h.state.writes, 1, 'identical background requests coalesce');
+  });
+  await test('background bursts coalesce while explicit operations remain serialized', async () => {
+    const h = harness();
+    const blocked = deferred(), started = deferred();
+    h.state.onRead = async () => { started.resolve(); await blocked.promise; };
+    const first = h.api.syncNow();
+    await started.promise;
+    const burst = Array.from({ length: 30 }, () => h.api.syncNow());
+    assert.ok(burst.every((p) => p === first));
+    const explicit = h.api.syncNow({ interactive: true });
+    await completesWhileBlocked(editLocal(h, () => { h.state.local.events.push(event(4)); }));
+    blocked.resolve();
+    await Promise.all([first, ...burst, explicit]);
+    assert.equal(h.state.auth, 2);
     assert.equal(h.state.writes, 2);
+    assert.deepEqual(h.state.remote.events, [event(4)]);
   });
   await test('fallback data lock also serializes model mutations with sync snapshots', async () => {
     const h = harness(); delete h.browser.navigator.locks;
@@ -545,6 +897,22 @@ async function test(name, fn) {
     assert.equal(h.state.writes, 0);
     assert.equal((await h.api.getConnectionState()).enabled, false);
   });
+  await test('disconnect during a deferred read permits local edits and prevents all later remote writes', async () => {
+    const h = harness();
+    const blocked = deferred(), started = deferred();
+    h.state.onRead = async () => { started.resolve(); await blocked.promise; };
+    const sync = assert.rejects(h.api.syncNow(), /DISCONNECTED/);
+    await started.promise;
+    const disconnected = h.api.disconnect();
+    try {
+      await completesWhileBlocked(editLocal(h, () => { h.state.local.events.push(event(4)); }));
+      assert.equal(h.state.writes, 0);
+    } finally { blocked.resolve(); }
+    await Promise.all([sync, disconnected]);
+    assert.deepEqual(h.state.local.events, [event(4)]);
+    assert.equal(h.state.writes, 0);
+    assert.equal(h.meta.get('driveEnabled'), false);
+  });
   await test('disconnect drains accepted writes and rejects queued sync before local reset', async () => {
     const h = harness();
     h.state.local.events = [event(2)];
@@ -553,7 +921,7 @@ async function test(name, fn) {
     const writeStarted = new Promise((resolve) => { written = resolve; });
     h.state.onWrite = async () => { written(); await gate; };
     const active = assert.rejects(h.api.syncNow(), /DISCONNECTED/);
-    const queued = assert.rejects(h.api.syncNow(), /DISCONNECTED/);
+    const queued = assert.rejects(h.api.syncNow({ interactive: true }), /DISCONNECTED/);
     await writeStarted;
     let drained = false;
     const disconnect = h.api.disconnect().then(() => { drained = true; });
@@ -619,6 +987,59 @@ async function test(name, fn) {
   await test('status event dispatch does not require a header pill', async () => {
     const h = harness(); await h.api.syncNow();
     assert.ok(h.state.statuses.some((e) => e.type === 'plotline:sync-status' && e.detail.status === 'ok'));
+  });
+  await test('sync activity status follows pill DOM updates and survives redundant queued requests', async () => {
+    const h = harness();
+    const pill = { textContent: '', style: {}, classList: { remove() {}, add() {} } };
+    const activity = {};
+    h.browser.document.getElementById = (id) => ({ syncPill: pill, syncActivity: activity })[id] || null;
+    const observed = [];
+    const dispatch = h.browser.window.dispatchEvent;
+    h.browser.window.dispatchEvent = (e) => {
+      observed.push({ ...clone(e.detail), pill: pill.textContent });
+      dispatch(e);
+    };
+    const blocked = deferred(), started = deferred();
+    h.state.onRead = async () => { started.resolve(); await blocked.promise; };
+    const sync = h.api.syncNow();
+    await started.promise;
+    assert.equal(pill.textContent, '☁ Sync');
+    assert.equal(observed[0].pill, '☁ Sync', 'listeners must see the updated DOM');
+    assert.equal(observed[0].pending, true);
+    assert.equal(observed[0].phase, 'syncing');
+    try {
+      for (let i = 0; i < 3; i++) await h.api.queueAutoSync('marked-change');
+      assert.equal(pill.textContent, '☁ queued…', 'queued pill status remains meaningful');
+      assert.equal(observed.at(-1).pending, true);
+      assert.match(observed.at(-1).message, /syncing/);
+      assert.ok(observed.every((entry) => entry.pending && /syncing/.test(entry.message)),
+        'activity must not flicker off before the real operation finishes');
+    } finally { blocked.resolve(); }
+    await sync;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(pill.textContent, '☁ synced');
+    assert.equal(observed.at(-1).pending, false);
+    assert.equal(observed.at(-1).phase, 'idle');
+    assert.equal(observed.at(-1).message, '☁ synced', 'pending decoration must not persist after completion');
+    await h.api.disconnect();
+  });
+  await test('the original syncing pill remains when the activity span is absent, and errors remain visible', async () => {
+    const h = harness();
+    const pill = { textContent: '', style: {}, classList: { remove() {}, add() {} } };
+    h.browser.document.getElementById = (id) => id === 'syncPill' ? pill : null;
+    const blocked = deferred(), started = deferred();
+    h.state.onRead = async () => {
+      started.resolve(); await blocked.promise; throw new Error('network interrupted');
+    };
+    const rejected = assert.rejects(h.api.syncNow(), /network interrupted/);
+    await started.promise;
+    assert.equal(pill.textContent, '☁ syncing…');
+    blocked.resolve();
+    await rejected;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(pill.textContent, '☁ sync failed');
+    assert.equal(h.state.statuses.at(-1).detail.pending, false);
+    assert.equal(h.state.statuses.at(-1).detail.status, 'error');
   });
   console.log(failures ? `\n${failures} failing` : '\nall passing');
   process.exitCode = failures ? 1 : 0;

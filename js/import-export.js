@@ -443,7 +443,9 @@ async function applyBackup(obj) { return importReplace(obj); }
 
 async function buildExportObject() {
   const now = new Date();
-  const dataset = await CWDB.getDataset();
+  const dataset = await CWDB.getExportDataset([
+    ...APP_META_KEYS, 'extraAppMeta', 'extraTopKeys', 'originalVersion', 'backupSchemaVersion',
+  ]);
   const { measurements, pendtimes, topics, events } = dataset;
   const appdata = dataset.appdata.filter((row) => !isLocalKey(row.name));
   const meta = Object.fromEntries(dataset.meta.map((r) => [r.key, r.value]));

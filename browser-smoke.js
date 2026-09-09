@@ -39,6 +39,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     await page.waitForFunction(() => document.querySelectorAll('#main .card').length === 5);
     await page.evaluate(() => CWMODEL.whenIdle());
     assert.equal(await page.locator('#modalRoot .dialog').count(), 0);
+    assert.equal(await page.locator('.backup-health, #backupHealthAction').count(), 0);
+    await page.evaluate(() => setStatus('', '☁ syncing…'));
+    assert.equal(await page.locator('#syncActivity').textContent(), 'Syncing now');
+    assert.equal(await page.locator('#syncPill').textContent(), '☁ Sync');
+    assert.equal(await page.locator('#syncActivity').evaluate((element) =>
+      element.previousElementSibling.id), 'syncPill');
 
     // Quick amounts are real quantities, and Undo accepts pointer input.
     const waterId = await page.evaluate(() => state.topics.find((topic) => topic.name === 'Water').id);
@@ -140,6 +146,13 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     await page.waitForFunction(() => typeof window.releaseDataLock === 'function');
     const beforeUpdate = await page.evaluate(async () => (await CWDB.getAll('events')).length);
     await page.locator(`[data-quick="${waterId}"]`).click();
+    await page.evaluate((id) => {
+      renderCurrent();
+      const button = document.querySelector(`[data-quick="${id}"]`);
+      for (let i = 0; i < 5; i++) button.dispatchEvent(new Event('click'));
+    }, waterId);
+    assert.equal(await page.locator(`[data-quick="${waterId}"]`).isDisabled(), true);
+    assert.equal(await page.locator(`[data-quick="${waterId}"]`).getAttribute('aria-busy'), 'true');
     await page.locator('#installUpdate').click();
     assert.equal(await page.evaluate(() => window.workerActivated), false);
     await page.evaluate(() => window.releaseDataLock());
@@ -229,6 +242,124 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
           `${view} overflows at ${width}px`);
       }
     }
+    // A long history must not turn each local click into several full DB reads.
+    await page.evaluate(async (id) => {
+      setView('categories');
+      await CWMODEL.mutate(async () => {
+        const used = new Set(state.events.map((event) => event.id));
+        let next = 1;
+        const events = Array.from({ length: 17000 }, (_, i) => {
+          while (used.has(next)) next++;
+          return { id: next++, topicid: id, time: Date.now() - (i + 1) * 60000,
+            qant: 8, cost: 0, note: 'Synthetic history' };
+        });
+        await CWDB.putMany('events', events);
+      });
+      window.viewReads = 0;
+      window.originalGetViewData = CWDB.getViewData;
+      CWDB.getViewData = (...args) => { viewReads++; return originalGetViewData.apply(CWDB, args); };
+    }, waterId);
+    const responsiveness = await page.evaluate(async (id) => {
+      const start = performance.now();
+      const before = state.events.length;
+      document.querySelector(`[data-quick="${id}"]`).click();
+      await CWMODEL.whenIdle();
+      return { elapsed: performance.now() - start, added: state.events.length - before, reads: viewReads };
+    }, waterId);
+    assert.equal(responsiveness.added, 1);
+    assert.equal(responsiveness.reads, 1, 'one coherent UI snapshot per local mutation');
+    assert.ok(responsiveness.elapsed < 1500, `17000-event quick log took ${responsiveness.elapsed}ms`);
+    console.log(`17000-event local save: ${Math.round(responsiveness.elapsed)}ms`);
+    await page.evaluate(() => { CWDB.getViewData = originalGetViewData; });
+
+    // Real sync code with a stalled remote read/upload must not block UI edits.
+    await page.evaluate(async () => {
+      window.syncHooks = { getTokenSilent, findOrCreateFolder, statSyncFile, readSyncFile,
+        updateSyncFile, createSyncFile, rotateVersions, maybeCleanupLegacyArtifacts };
+      window.originalAutoSync = CW_CONFIG.autoSyncOnChange;
+      CW_CONFIG.autoSyncOnChange = false;
+      window.fakeRemote = await CWIO.buildExportObject();
+      window.fakeRevision = 1;
+      await CWDB.setMeta('driveSyncBase', fakeRemote);
+      await CWDB.setMeta('driveEnabled', true);
+      getTokenSilent = async () => 'synthetic-token';
+      findOrCreateFolder = async () => 'synthetic-folder';
+      window.fakeModifiedTime = new Date().toISOString();
+      statSyncFile = async () => ({ id: 'synthetic-file', version: String(fakeRevision),
+        modifiedTime: fakeModifiedTime, md5Checksum: String(fakeRevision) });
+      window.pauseNetwork = async (phase) => {
+        if (window.blockedPhase !== phase) return;
+        window.blockedPhase = null;
+        await new Promise((resolve) => { window.releaseNetwork = resolve; });
+      };
+      readSyncFile = async () => {
+        await pauseNetwork('read');
+        return JSON.parse(JSON.stringify(fakeRemote));
+      };
+      updateSyncFile = async (id, data) => {
+        await pauseNetwork('write');
+        fakeRemote = JSON.parse(JSON.stringify(data));
+        fakeRevision++;
+        return statSyncFile();
+      };
+      createSyncFile = async (folder, data) => updateSyncFile('synthetic-file', data);
+      rotateVersions = async () => {};
+      maybeCleanupLegacyArtifacts = async () => {};
+      window.originalSafetyBackup = CWIO.safetyBackup;
+      CWIO.safetyBackup = async () => {};
+    });
+    for (const phase of ['read', 'write']) {
+      await page.evaluate((value) => {
+        window.releaseNetwork = null;
+        window.blockedPhase = value;
+        window.syncFailure = null;
+        window.pendingSlowSync = CWDRIVE.syncNow().catch((error) => { syncFailure = error.message; });
+      }, phase);
+      await page.waitForFunction(() => typeof window.releaseNetwork === 'function');
+      const removedId = await page.evaluate(() => state.events.find((event) => event.note === 'Synthetic history').id);
+      const logged = await page.evaluate(async (id) => {
+        const start = performance.now();
+        document.querySelector(`[data-quick="${id}"]`).click();
+        let timeout;
+        try {
+          await Promise.race([CWMODEL.whenIdle(), new Promise((resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error('Local save blocked by remote sync')), 1500);
+          })]);
+        } finally { clearTimeout(timeout); }
+        return { elapsed: performance.now() - start, id: state.latestByTopic.get(id).id };
+      }, waterId);
+      assert.ok(logged.elapsed < 1500, `local add waited ${logged.elapsed}ms during remote ${phase}`);
+      await page.evaluate(({ topicId, eventId }) => openAddEvent(state.topics.find((topic) => topic.id === topicId),
+        state.events.find((event) => event.id === eventId)), { topicId: waterId, eventId: logged.id });
+      await page.locator('#evNote').fill(`Saved during remote ${phase}`);
+      await page.locator('#dialogSave').click();
+      await page.waitForFunction(() => !document.querySelector('.dialog'), null, { timeout: 1500 });
+      await page.evaluate(() => CWMODEL.whenIdle());
+      await page.evaluate(({ topicId, eventId }) => openAddEvent(state.topics.find((topic) => topic.id === topicId),
+        state.events.find((event) => event.id === eventId)), { topicId: waterId, eventId: removedId });
+      await page.locator('#dialogDelete').click();
+      await page.locator('#confirmYes').click();
+      await page.waitForFunction(() => !document.querySelector('.dialog'), null, { timeout: 1500 });
+      await page.evaluate(() => CWMODEL.whenIdle());
+      await page.evaluate(async () => { releaseNetwork(); await pendingSlowSync; });
+      assert.equal(await page.evaluate(() => syncFailure), null);
+      const preserved = await page.evaluate(async ({ added, removed }) => {
+        const events = await CWDB.getAll('events');
+        return { added: events.find((event) => event.id === added)?.note,
+          removed: events.some((event) => event.id === removed) };
+      }, { added: logged.id, removed: removedId });
+      assert.deepEqual(preserved, { added: `Saved during remote ${phase}`, removed: false });
+      await page.evaluate(() => CWDRIVE.syncNow());
+      assert.equal(await page.evaluate((id) => fakeRemote.events.some((event) => event.id === id), removedId), false);
+      assert.equal(await page.evaluate((id) => fakeRemote.events.find((event) => event.id === id)?.note, logged.id),
+        `Saved during remote ${phase}`);
+    }
+    await page.evaluate(async () => {
+      await CWDRIVE.disconnect();
+      Object.assign(window, syncHooks);
+      CW_CONFIG.autoSyncOnChange = originalAutoSync;
+      CWIO.safetyBackup = originalSafetyBackup;
+    });
     await page.evaluate(async () => {
       for (const topic of state.topics) await CWDB.put('topics', { ...topic, archived: true });
       await reload(); setView('stats');
@@ -236,6 +367,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     await page.locator('#manageArchived').waitFor();
 
     // Local reset must not call any Drive write operation.
+    const beforeResetRevision = await page.evaluate(() => CWAPP.dataRevision());
     await page.evaluate(() => {
       window.remoteWrites = 0;
       CWIO.safetyBackup = async () => {};
@@ -247,6 +379,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     assert.equal(await page.evaluate(() => window.remoteWrites), 0);
     assert.equal(await page.evaluate(async () => (await CWDB.getAll('events')).length), 0);
     assert.equal(await page.evaluate(async () => CWDB.getMeta('driveEnabled')), false);
+    assert.ok(await page.evaluate(async (before) => (await CWDB.getMeta('dataRevision')) > before, beforeResetRevision));
     assert.deepEqual(errors, []);
     await context.close();
     console.log('browser workflows passing');

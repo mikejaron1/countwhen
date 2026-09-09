@@ -57,12 +57,14 @@ let _autoSyncTimer = null;
 let _consecutiveSilentFailures = 0;
 let _syncPendingForeground = false;
 let _syncQueue = Promise.resolve();
+const _backgroundSync = new Map();
 let _dataQueue = Promise.resolve();
 let _pendingOperations = 0;
 let _connectionEpoch = 0;
 let _cancelTokenRequest = null;
 let _disconnecting = 0;
-let _lastStatus = { status: '', message: '' };
+let _requestedStatus = { status: '', message: '' };
+let _lastStatus = { ..._requestedStatus, pending: false, phase: 'idle' };
 
 /* Background sync gives up after this many consecutive silent failures.
  * An unauthorised or misconfigured token fails identically every time, so
@@ -146,18 +148,26 @@ function wifiOk() {
 }
 
 function setStatus(status, msg) {
-  _lastStatus = { status, message: msg || '' };
+  const message = msg || '';
+  _requestedStatus = { status, message };
+  const pending = _pendingOperations > 0;
+  // Keep older message-based listeners alive until the entire operation queue
+  // drains. New listeners can use pending/phase without interpreting text.
+  _lastStatus = { status,
+    message: pending && !/syncing/i.test(message) ? `${message}${message ? ' — ' : ''}syncing…` : message,
+    pending, phase: pending ? 'syncing' : 'idle' };
+  // Update the small sync pill in the header if present
+  const el = document.getElementById('syncPill');
+  if (el) {
+    el.classList.remove('ok', 'error');
+    if (status === 'ok') el.classList.add('ok');
+    if (status === 'error') el.classList.add('error');
+    el.textContent = document.getElementById('syncActivity') && /syncing/i.test(message) ? '☁ Sync' : message;
+    el.style.display = message ? '' : 'none';
+  }
   if (typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
     window.dispatchEvent(new CustomEvent('plotline:sync-status', { detail: _lastStatus }));
   }
-  // Update the small sync pill in the header if present
-  const el = document.getElementById('syncPill');
-  if (!el) return;
-  el.classList.remove('ok', 'error');
-  if (status === 'ok') el.classList.add('ok');
-  if (status === 'error') el.classList.add('error');
-  el.textContent = msg || '';
-  el.style.display = msg ? '' : 'none';
 }
 
 /* ---------- token / OAuth ---------- */
@@ -561,6 +571,7 @@ function mergeValue(b, l, r, preferRemote, stats, key = '') {
 function remapConcurrentAdds(base, local, remote, stats, localIdMaps) {
   local = JSON.parse(JSON.stringify(local));
   const app = readApp(local);
+  if (app) local[APP_META_KEY] = app;
   for (const collection of ['measurements', 'pendtimes', 'topics', 'events']) {
     const b = new Set((base[collection] || []).map((v) => v.id));
     const r = new Map((remote[collection] || []).map((v) => [v.id, v]));
@@ -723,7 +734,7 @@ function mergeBackups(base, local, remote, { preferRemote = false } = {}) {
 }
 
 function identityMaps(backup) {
-  return Object.fromEntries(['topics', 'measurements']
+  return Object.fromEntries(['topics', 'measurements', 'pendtimes', 'events']
     .map((key) => [key, Object.fromEntries((backup[key] || []).map((row) => [row.id, row.id]))]));
 }
 
@@ -754,6 +765,72 @@ function recoveryIdMaps(local, pending, mergedMaps) {
     }
   }
   return mergedMaps;
+}
+
+/* Only used after a local race. Project both sides of the local delta into
+ * the candidate's ID space before merging: otherwise a deleted legacy ID can
+ * resurrect its moved copy, or an edited timer topic can become a new topic. */
+function rebaseLocalChanges(before, current, candidate, maps) {
+  const project = (obj) => {
+    const out = JSON.parse(JSON.stringify(obj));
+    const mapped = (key, id) => Object.hasOwn(maps[key] || {}, id) ? maps[key][id] : id;
+    for (const key of ['topics', 'measurements', 'pendtimes', 'events']) {
+      out[key] = (out[key] || []).filter((row) => mapped(key, row.id) != null);
+      for (const row of out[key]) {
+        row.id = mapped(key, row.id);
+        for (const [ref, collection] of [['topicid', 'topics'], ['msureid', 'measurements'], ['pendtimeid', 'pendtimes']]) {
+          if (row[ref] != null) row[ref] = mapped(collection, row[ref]);
+        }
+      }
+      if (new Set(out[key].map((row) => row.id)).size !== out[key].length) {
+        throw new Error('LOCAL_CONFLICT: Local IDs changed ambiguously. Recovery retained; retry sync.');
+      }
+    }
+    const app = readApp(out);
+    if (app) {
+      out[APP_META_KEY] = app;
+      for (const key of ['topicKinds', 'topicMeta', 'topicRoles', 'topicGoals', 'topicPrefs']) {
+        if (app[key]) app[key] = Object.fromEntries(Object.entries(app[key])
+          .filter(([id]) => mapped('topics', id) != null)
+          .map(([id, value]) => [mapped('topics', id), value]));
+      }
+      for (const key of ['topicOrder', 'quickBar']) {
+        if (Array.isArray(app[key])) app[key] = app[key].map((id) => mapped('topics', id)).filter((id) => id != null);
+      }
+      if (Array.isArray(app.favorites)) app.favorites = app.favorites
+        .filter((row) => mapped('topics', row.topicid) != null)
+        .map((row) => ({ ...row, topicid: mapped('topics', row.topicid) }));
+    }
+    return out;
+  };
+  for (const key of Object.keys(maps)) {
+    const old = new Map((before[key] || []).map((row) => [row.id, row]));
+    for (const row of current[key] || []) {
+      if (maps[key][row.id] === null && !sameRecord(row, old.get(row.id))) {
+        throw new Error('LOCAL_CONFLICT: A removed record was edited locally. Recovery retained; retry sync.');
+      }
+    }
+  }
+  const previous = project(before), latest = project(current);
+  const result = mergeBackups(previous, latest, candidate);
+  result.localDeletes = {};
+  // Deletes during network work cannot lose to an older remote edit. If
+  // dependent remote records make this unsafe, validation defers the sync.
+  for (const key of ['topics', 'measurements', 'pendtimes', 'events', 'appdata']) {
+    const idKey = key === 'appdata' ? 'name' : 'id';
+    const kept = new Set((latest[key] || []).map((row) => row[idKey]));
+    const deleted = new Set((previous[key] || []).filter((row) => !kept.has(row[idKey])).map((row) => row[idKey]));
+    result.localDeletes[key] = [...deleted];
+    result.merged[key] = result.merged[key].filter((row) => !deleted.has(row[idKey]));
+  }
+  const errors = CWIO.validateBackup(result.merged);
+  if (errors.length) throw new Error('LOCAL_CONFLICT: Local changes cannot safely merge. Recovery retained; retry sync. ' + errors[0]);
+  const currentMaps = identityMaps(current);
+  for (const [key, map] of Object.entries(currentMaps)) {
+    for (const id of Object.keys(map)) map[id] = Object.hasOwn(maps[key] || {}, id) ? maps[key][id] : Number(id);
+  }
+  result.localIdMaps = composeIdMaps(currentMaps, result.localIdMaps);
+  return result;
 }
 
 /* ---------- public sync ops ---------- */
@@ -797,8 +874,7 @@ function withDataLock(fn) {
   return result;
 }
 
-/* Serialize OAuth clients too (GIS has one mutable callback), but never hold
- * the data lock while an account picker is waiting for its user. */
+/* Serialize remote operations/OAuth, independently of the short local lock. */
 function runSync(interactive, operation) {
   if (_disconnecting) return Promise.reject(new Error('DISCONNECTED'));
   const epoch = _connectionEpoch;
@@ -811,11 +887,9 @@ function runSync(interactive, operation) {
     if (!isOnline()) throw new Error('OFFLINE');
     if (!interactive && !wifiOk()) throw new Error('CELLULAR_BLOCKED');
     await (interactive ? getTokenInteractive() : getTokenSilent());
-    return withDataLock(async () => {
-      if (epoch !== _connectionEpoch || !(await isEnabled())) throw new Error('DISCONNECTED');
-      return operation(() => {
-        if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
-      });
+    if (epoch !== _connectionEpoch || !(await isEnabled())) throw new Error('DISCONNECTED');
+    return operation(() => {
+      if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
     });
   };
   const wasPending = _pendingOperations++ > 0;
@@ -823,13 +897,42 @@ function runSync(interactive, operation) {
   const result = wasPending ? _syncQueue.then(authenticate) : authenticate();
   _syncQueue = result.catch(() => {}).finally(() => {
     _pendingOperations--;
-    setStatus(_lastStatus.status, _lastStatus.message);
+    setStatus(_requestedStatus.status, _requestedStatus.message);
   });
   setStatus('', '☁ syncing…');
   return result.catch((e) => {
     setStatus('error', e.message === 'DISCONNECTED' ? '☁ disconnected' : '☁ sync failed');
     throw e;
   });
+}
+
+/* Call only while owning plotline-data. The export fallback also detects
+ * callers that have not yet adopted the monotonic model revision stamp.
+ * Timers are device-only and deliberately absent from the export. */
+async function localSnapshot() {
+  const data = await CWIO.buildExportObject();
+  return {
+    data,
+    content: stableStringify(comparableBackup(data)),
+    revision: await CWDB.getMeta('dataRevision', 0),
+    timers: await CWDB.getMeta('activeTimers'),
+    lastChange: await CWDB.getMeta('lastLocalChangeAt', 0),
+  };
+}
+
+function sameLocal(a, b) {
+  return a.revision === b.revision && sameRecord(a.timers, b.timers) &&
+    a.content === b.content;
+}
+
+/* The caller owns plotline-data. Advance the same atomic change marker used
+ * by model mutations so cached UI state cannot survive a remote replacement. */
+async function replaceLocalFromSync(obj, options, revision) {
+  if (!Number.isSafeInteger(revision) || revision < 0 || revision === Number.MAX_SAFE_INTEGER) {
+    throw new Error('LOCAL_CONFLICT: Invalid data revision. Export a backup before continuing.');
+  }
+  await CWIO.importReplace(obj, options);
+  await CWDB.markChange(revision, { local: false });
 }
 
 function sameRemote(a, b) {
@@ -848,41 +951,83 @@ async function validatedRemote(id) {
 /* Keep a bounded local journal, including confirmed uploads: readback success
  * does not rule out a later concurrent overwrite. Entries are detached copies,
  * never edited in place. This is recovery, not a server-side write guarantee. */
-async function saveRecovery(snapshot, localSnapshot, status = 'pending', localIdMaps) {
+async function saveRecovery(snapshot, localSnapshot, status = 'pending', localIdMaps, provenance = {}) {
   const previous = await CWDB.getMeta('drivePendingSnapshot');
   const history = [...(previous?.history || (previous?.snapshot
     ? [{ savedAt: previous.savedAt, snapshot: previous.snapshot }] : []))];
+  const contents = new Set(history.map((entry) => stableStringify(comparableBackup(entry.snapshot))));
   const append = (obj) => {
-    if (!history.some((entry) => sameRecord(comparableBackup(entry.snapshot), comparableBackup(obj)))) {
+    const content = stableStringify(comparableBackup(obj));
+    if (!contents.has(content)) {
+      contents.add(content);
       history.push({ savedAt: Date.now(), snapshot: JSON.parse(JSON.stringify(obj)) });
     }
   };
   append(localSnapshot);
   append(snapshot);
   await CWDB.setMeta('drivePendingSnapshot', {
-    savedAt: Date.now(), status, snapshot, localSnapshot, localIdMaps, history: history.slice(-DRIVE_MAX_VERSIONS),
+    savedAt: Date.now(), status, snapshot, localSnapshot, localIdMaps, ...provenance,
+    history: history.slice(-DRIVE_MAX_VERSIONS),
   });
 }
 
 function syncNow({ interactive = false, allowMerge = true } = {}) {
-  return runSync(interactive, async (checkConnected) => {
+  if (_disconnecting) return Promise.reject(new Error('DISCONNECTED'));
+  if (!interactive && _backgroundSync.has(allowMerge)) return _backgroundSync.get(allowMerge);
+  const promise = runSync(interactive, async (checkConnected) => {
+    let localState = await withDataLock(async () => { checkConnected(); return localSnapshot(); });
     const folderId = await findOrCreateFolder();
+    checkConnected();
     await CWDB.setMeta('driveFolderId', folderId);
-    const local = await CWIO.buildExportObject();
     const base = await CWDB.getMeta('driveSyncBase');
-    const lastLocalChange = await CWDB.getMeta('lastLocalChangeAt', 0);
-    const pending = await CWDB.getMeta('drivePendingSnapshot');
+    const recovery = await CWDB.getMeta('drivePendingSnapshot');
+    const pending = recovery?.status !== 'confirmed' && recovery?.status !== 'restore' ? recovery : null;
+    let local = localState.data;
     let candidate = local, localIdMaps = identityMaps(local);
-    if (pending?.snapshot && pending.status !== 'confirmed' &&
-        !sameRecord(comparableBackup(local), comparableBackup(pending.snapshot))) {
-      const result = mergeBackups(pending.localSnapshot || base, local, pending.snapshot);
-      candidate = result.merged;
-      localIdMaps = recoveryIdMaps(local, pending, result.localIdMaps);
-    }
     let retryBase = base;
+    let recoveredSnapshot = pending?.snapshot;
+    let recoveredRemoteBase = pending?.remoteBase;
+    const localDeletes = { ...pending?.localDeletes };
+    const retainDeletes = (deletes) => {
+      for (const [key, ids] of Object.entries(deletes || {})) {
+        localDeletes[key] = [...new Set([...(localDeletes[key] || []), ...ids])];
+      }
+    };
+    if (pending?.snapshot &&
+        !sameRecord(comparableBackup(local), comparableBackup(pending.snapshot))) {
+      if (pending.localSnapshot && !pending.localIdMaps?.events &&
+          !sameRecord(comparableBackup(local), comparableBackup(pending.localSnapshot))) {
+        throw new Error('LOCAL_CONFLICT: An older recovery copy cannot identify newer local edits safely. Export recovery before restoring or retrying.');
+      }
+      const result = pending.localSnapshot && pending.localIdMaps?.events
+        ? rebaseLocalChanges(pending.localSnapshot, local, pending.snapshot, pending.localIdMaps)
+        : mergeBackups(pending.localSnapshot || base, local, pending.snapshot);
+      candidate = result.merged;
+      localIdMaps = pending.localIdMaps?.events ? result.localIdMaps : recoveryIdMaps(local, pending, result.localIdMaps);
+      retainDeletes(result.localDeletes);
+    }
     let resultStats = null;
     let hadRemote = false;
-    await saveRecovery(candidate, local, 'pending', localIdMaps);
+    let localRetries = 0;
+    const savePending = () => saveRecovery(candidate, local, 'pending', localIdMaps,
+      { remoteBase: recoveredRemoteBase || retryBase, localDeletes });
+    const acceptLocalChanges = async (next) => {
+      if (sameLocal(localState, next)) return false;
+      if (++localRetries > 3) {
+        throw new Error('LOCAL_CHANGED: Local data kept changing. Recovery retained; retry sync.');
+      }
+      if (localState.content !== next.content) {
+        const result = rebaseLocalChanges(local, next.data, candidate, localIdMaps);
+        candidate = result.merged;
+        localIdMaps = result.localIdMaps;
+        retainDeletes(result.localDeletes);
+      }
+      localState = next;
+      local = next.data;
+      await savePending();
+      return true;
+    };
+    await savePending();
     for (let attempt = 0; attempt < 3; attempt++) {
       checkConnected();
       const stat = await statSyncFile(folderId);
@@ -890,12 +1035,27 @@ function syncNow({ interactive = false, allowMerge = true } = {}) {
         hadRemote = true;
         const remote = await validatedRemote(stat.id);
         if (!sameRemote(stat, await statSyncFile(folderId))) continue;
+        // A prior request may have been accepted even though its response
+        // failed. Its exact candidate is now the ancestor, including moved IDs.
+        if (recoveredSnapshot && sameRecord(comparableBackup(remote), comparableBackup(recoveredSnapshot))) {
+          retryBase = recoveredSnapshot;
+        } else if (recoveredRemoteBase && sameRecord(comparableBackup(remote), comparableBackup(recoveredRemoteBase))) {
+          retryBase = recoveredRemoteBase;
+        }
+        recoveredSnapshot = null;
+        recoveredRemoteBase = null;
         if (!allowMerge && !sameRecord(comparableBackup(remote), comparableBackup(base || {}))) {
           throw new Error('REMOTE_CHANGED');
         }
         const result = mergeBackups(retryBase, candidate, remote, {
-          preferRemote: (Date.parse(stat.modifiedTime) || 0) > lastLocalChange,
+          preferRemote: (Date.parse(stat.modifiedTime) || 0) > localState.lastChange,
         });
+        for (const [key, ids] of Object.entries(localDeletes)) {
+          const deleted = new Set(ids), idKey = key === 'appdata' ? 'name' : 'id';
+          if (result.merged[key].some((row) => deleted.has(row[idKey]))) {
+            throw new Error('LOCAL_CONFLICT: Drive conflicts with a recent local deletion. Recovery retained; retry sync.');
+          }
+        }
         candidate = result.merged;
         localIdMaps = composeIdMaps(localIdMaps, result.localIdMaps);
         resultStats = result.stats;
@@ -907,10 +1067,16 @@ function syncNow({ interactive = false, allowMerge = true } = {}) {
       }
       const errors = CWIO.validateBackup(candidate);
       if (errors.length) throw new Error('INVALID_MERGE: ' + errors[0]);
-      await saveRecovery(candidate, local, 'pending', localIdMaps);
+      await savePending();
       const timerOptions = { preserveActiveTimers: true,
         topicIdMap: localIdMaps.topics, measurementIdMap: localIdMaps.measurements };
-      await CWIO.checkTimerReplacement(candidate, timerOptions);
+      const beforeWrite = await withDataLock(async () => {
+        checkConnected();
+        const next = await localSnapshot();
+        if (sameLocal(localState, next)) await CWIO.checkTimerReplacement(candidate, timerOptions);
+        return next;
+      });
+      if (await acceptLocalChanges(beforeWrite)) { attempt--; continue; }
       // Drive v3 does not document a browser-usable update precondition. These
       // checks detect races, not eliminate the final check-to-write window.
       // Never claim success until the uploaded content is read back unchanged.
@@ -924,19 +1090,46 @@ function syncNow({ interactive = false, allowMerge = true } = {}) {
       if (!sameRecord(contents, candidate) ||
           !sameRemote(verified, await statSyncFile(folderId))) continue;
       checkConnected();
-      const changedLocally = !sameRecord(comparableBackup(local), comparableBackup(candidate));
-      if (changedLocally) {
-        await CWIO.safetyBackup();
-        await CWIO.importReplace(candidate, timerOptions);
-      }
-      await rememberSyncPoint(verified, candidate);
-      await saveRecovery(candidate, local, 'confirmed', localIdMaps);
       await maybeCleanupLegacyArtifacts(folderId);
+      checkConnected();
+      const changedLocally = localState.content !== stableStringify(comparableBackup(candidate));
+      // Export/download UI may wait on storage or user interaction: never own
+      // the model lock here. Recheck *inside* the apply lock afterwards.
+      if (changedLocally) await CWIO.safetyBackup();
+      const beforeApply = await withDataLock(async () => {
+        checkConnected();
+        const next = await localSnapshot();
+        if (!sameLocal(localState, next)) return next;
+        checkConnected();
+        if (changedLocally) await replaceLocalFromSync(candidate, timerOptions, next.revision);
+        await rememberSyncPoint(verified, candidate);
+        // Requests after this commit need a new (coalesced) queue entry: their
+        // edits are no longer covered by this operation's optimistic checks.
+        if (_backgroundSync.get(allowMerge) === promise) _backgroundSync.delete(allowMerge);
+        return null;
+      });
+      if (beforeApply) {
+        // The remote now contains this candidate, not the earlier remote
+        // ancestor. Preserve that identity when rebasing a local delete/edit.
+        retryBase = candidate;
+        await acceptLocalChanges(beforeApply);
+        attempt--;
+        continue;
+      }
+      await saveRecovery(candidate, local, 'confirmed', localIdMaps);
+      checkConnected();
       setStatus('ok', changedLocally ? '☁ merged' : '☁ synced');
       return { action: hadRemote ? 'merged' : 'created', stats: resultStats, changedLocally };
     }
     throw new Error('REMOTE_CONFLICT: Drive kept changing. Local data is unchanged; a pending recovery copy is saved. Retry sync.');
   });
+  if (!interactive) {
+    _backgroundSync.set(allowMerge, promise);
+    promise.finally(() => {
+      if (_backgroundSync.get(allowMerge) === promise) _backgroundSync.delete(allowMerge);
+    }).catch(() => {});
+  }
+  return promise;
 }
 
 /* Record what we just wrote so the next sync can detect remote edits. */
@@ -959,6 +1152,7 @@ async function syncUp(opts = {}) {
 /* Explicit "throw away local, take what's on Drive". */
 function syncDown({ interactive = true } = {}) {
   return runSync(interactive, async (checkConnected) => {
+    const snapshot = await withDataLock(async () => { checkConnected(); return localSnapshot(); });
     const folderId = await findOrCreateFolder();
     for (let attempt = 0; attempt < 3; attempt++) {
       const stat = await statSyncFile(folderId);
@@ -966,12 +1160,19 @@ function syncDown({ interactive = true } = {}) {
       const obj = await validatedRemote(stat.id);
       if (!sameRemote(stat, await statSyncFile(folderId))) continue;
       checkConnected();
-      const local = await CWIO.buildExportObject();
-      await saveRecovery(obj, local);
+      await saveRecovery(obj, snapshot.data, 'restore');
       await CWIO.safetyBackup();
-      await CWIO.importReplace(obj);
-      await rememberSyncPoint(stat, obj);
-      await saveRecovery(obj, local, 'confirmed');
+      await withDataLock(async () => {
+        checkConnected();
+        const next = await localSnapshot();
+        if (!sameLocal(snapshot, next)) {
+          throw new Error('LOCAL_CHANGED: Local data changed during restore. Nothing replaced; confirm restore again.');
+        }
+        checkConnected();
+        await replaceLocalFromSync(obj, undefined, next.revision);
+        await rememberSyncPoint(stat, obj);
+      });
+      await saveRecovery(obj, snapshot.data, 'confirmed');
       setStatus('ok', '☁ restored');
       return obj;
     }
@@ -1019,8 +1220,11 @@ async function queueAutoSync(reason = 'change') {
 async function afterSync(res) {
   if (!res || res.action !== 'merged' || !res.changedLocally) return;
   try {
-    await window.CWAPP?.reload?.();
-    window.CWAPP?.renderCurrent?.();
+    if (window.CWMODEL) await window.CWMODEL.refresh();
+    else {
+      await window.CWAPP?.reload?.();
+      window.CWAPP?.renderCurrent?.();
+    }
     const s = res.stats || {};
     const bits = [];
     if (s.fromRemote) bits.push(`${s.fromRemote} pulled in`);
@@ -1038,8 +1242,8 @@ function handleAutoSyncFailure(e) {
   // Not a failure at all — the app went off-screen before we could ask for a
   // token. Retry when it comes back; don't burn a silent-failure slot.
   if (msg === 'BACKGROUNDED') { _syncPendingForeground = true; return; }
-  if (/^(REMOTE_|INVALID_|Drive |Failed to fetch|NetworkError)/.test(msg)) {
-    setStatus('error', msg.startsWith('REMOTE_') ? '☁ conflict — retry sync' : '☁ sync failed — retry');
+  if (/^(REMOTE_|LOCAL_|TIMER_|INVALID_|Drive |Failed to fetch|NetworkError)/.test(msg)) {
+    setStatus('error', /^(REMOTE_|LOCAL_|TIMER_)/.test(msg) ? '☁ conflict — retry sync' : '☁ sync failed — retry');
     return;
   }
   // Token / OAuth errors: silent prompt failed — needs user action.

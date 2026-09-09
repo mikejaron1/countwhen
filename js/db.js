@@ -207,6 +207,51 @@ async function datasetTransaction(builder, { keepDeviceMeta = true, readonly = f
 const db = {
   DEVICE_META_KEYS,
   randomId,
+  async getSnapshot(names, metaKeys) {
+    const { t, stores } = await tx([...names, 'meta']);
+    const data = { meta: {} };
+    const done = transactionDone(t, () => data);
+    for (const name of names) {
+      const req = stores[name].getAll();
+      req.onsuccess = () => { data[name] = req.result; };
+    }
+    // Recovery snapshots can contain several complete histories. UI refreshes
+    // must never load them just to read a few small preferences.
+    for (const key of metaKeys) {
+      const req = stores.meta.get(key);
+      req.onsuccess = () => { if (req.result) data.meta[key] = req.result.value; };
+    }
+    return done;
+  },
+  getViewData(metaKeys) {
+    return this.getSnapshot(['topics', 'events', 'measurements', 'favorites'], metaKeys);
+  },
+  async getExportDataset(metaKeys) {
+    const dataset = await this.getSnapshot(Object.keys(STORES).filter((name) => name !== 'meta'), metaKeys);
+    dataset.meta = Object.entries(dataset.meta).map(([key, value]) => ({ key, value }));
+    return dataset;
+  },
+  async markChange(minimumRevision = 0, { local = true } = {}) {
+    if (!Number.isSafeInteger(minimumRevision) || minimumRevision < 0 || minimumRevision === Number.MAX_SAFE_INTEGER) {
+      throw new Error('Invalid minimum data revision.');
+    }
+    const { t, stores } = await tx('meta', 'readwrite');
+    let revision, failure;
+    const done = transactionDone(t, () => revision).catch((error) => { throw failure || error; });
+    const req = stores.get('dataRevision');
+    req.onsuccess = () => {
+      const previous = req.result?.value ?? 0;
+      if (!Number.isSafeInteger(previous) || previous < 0 || previous === Number.MAX_SAFE_INTEGER) {
+        failure = new Error('Invalid data revision. Export a backup before continuing.');
+        t.abort();
+        return;
+      }
+      revision = Math.max(previous, minimumRevision) + 1;
+      stores.put({ key: 'dataRevision', value: revision });
+      if (local) stores.put({ key: 'lastLocalChangeAt', value: Date.now() });
+    };
+    return done;
+  },
   getDataset() { return datasetTransaction(null, { readonly: true }); },
   updateDataset: datasetTransaction,
   replaceDataset(dataset, options = {}) {
@@ -575,8 +620,8 @@ const db = {
   /* Insight / alert settings. */
   normalizeInsightSettings,
 
-  async getInsightSettings() {
-    const s = (await this.getMeta('insightSettings')) || {};
+  async getInsightSettings(settings) {
+    const s = settings ?? ((await this.getMeta('insightSettings')) || {});
     return normalizeInsightSettings({
       cutoffHour: 4,          // logical day rolls over at 4am
       windowDays: 7,          // "current" window for status detection

@@ -91,6 +91,10 @@ an update is offered; a failed download leaves the previous offline release inta
   open it offline and print it to PDF. It is not a replacement for a JSON backup.
 - **Accessible navigation:** keyboard-operable views, labeled controls, focused
   dialogs, visible focus, zoom support, and larger touch targets.
+- **Responsive local actions:** syncing activity stays beside the header pill,
+  not in a separate home-screen banner. Local edits do not wait for Drive network
+  requests, and pending actions remain disabled across view refreshes to prevent
+  repeated taps from queuing duplicate writes.
 
 ### Hosting notes
 

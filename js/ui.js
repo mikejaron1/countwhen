@@ -9,6 +9,19 @@
   let modalDismissible = true;
   let snackTimer = null;
   let snackUndo = null;
+  const pendingActions = new Map();
+
+  function actionKey(element) {
+    return element.dataset.actionKey || element.id || [...element.attributes]
+      .filter((attribute) => attribute.name.startsWith('data-'))
+      .map((attribute) => `${attribute.name}=${attribute.value}`).sort().join('|');
+  }
+
+  function showBusy(element, elements) {
+    if (!elements.has(element)) elements.set(element, element.disabled);
+    if ('disabled' in element) element.disabled = true;
+    element.setAttribute('aria-busy', 'true');
+  }
 
   function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, (char) =>
@@ -178,13 +191,13 @@
 
   function bindAction(element, handler, { event = 'click', mutation = false } = {}) {
     if (!element) return;
-    let busy = false;
+    const key = actionKey(element) || element;
+    if (pendingActions.has(key)) showBusy(element, pendingActions.get(key));
     element.addEventListener(event, async (e) => {
-      if (busy) return;
-      busy = true;
-      const wasDisabled = element.disabled;
-      if ('disabled' in element) element.disabled = true;
-      element.setAttribute('aria-busy', 'true');
+      if (pendingActions.has(key)) { e.preventDefault(); return; }
+      const elements = new Map();
+      pendingActions.set(key, elements);
+      showBusy(element, elements);
       const origin = element.closest('.dialog');
       const form = origin?.cloneNode(true) || null;
       if (form) {
@@ -196,6 +209,7 @@
       }
       const actionEvent = {
         target: e.target, currentTarget: element,
+        value: e.target.value, checked: e.target.checked,
         form, origin,
         preventDefault: () => e.preventDefault(),
         stopPropagation: () => e.stopPropagation(),
@@ -206,9 +220,11 @@
       } catch (error) {
         reportError(error, origin);
       } finally {
-        busy = false;
-        if ('disabled' in element) element.disabled = wasDisabled;
-        element.removeAttribute('aria-busy');
+        pendingActions.delete(key);
+        for (const [button, wasDisabled] of elements) {
+          if ('disabled' in button) button.disabled = wasDisabled;
+          button.removeAttribute('aria-busy');
+        }
       }
     });
   }
