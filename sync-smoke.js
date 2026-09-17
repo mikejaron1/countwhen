@@ -967,10 +967,57 @@ async function test(name, fn) {
     await assert.rejects(h.browser.window.originalTokenRequest(false), /BACKGROUNDED/);
     assert.equal(h.state.auth, 0);
   });
-  await test('OAuth rechecks foreground visibility after loading GIS', async () => {
+  await test('even explicit OAuth rechecks foreground visibility after loading GIS', async () => {
     const h = harness();
     vm.runInContext(`ensureGis = async () => { document.visibilityState = 'hidden'; };`, h.browser);
-    await assert.rejects(h.browser.window.originalTokenRequest(false), /BACKGROUNDED/);
+    await assert.rejects(h.browser.window.originalTokenRequest(true), /BACKGROUNDED/);
+  });
+  await test('startup and automatic sync never load GIS or open authorization screens', async () => {
+    const h = harness();
+    let gisLoads = 0;
+    h.browser.ensureGis = async () => { gisLoads++; };
+    vm.runInContext('getTokenSilent = () => window.originalTokenRequest(false);', h.browser);
+    for (let i = 0; i < 4; i++) await h.api.startupSync();
+    assert.equal(gisLoads, 0);
+    assert.equal(h.state.reads, 0);
+    assert.equal(h.state.writes, 0);
+    assert.equal(h.state.statuses.at(-1).detail.status, '');
+    assert.match(h.state.statuses.at(-1).detail.message, /tap to sync/);
+    assert.equal(vm.runInContext('autoSyncSuppressed()', h.browser), false);
+    let scheduled;
+    h.browser.setTimeout = (callback) => { scheduled = callback; return 1; };
+    h.browser.clearTimeout = () => {};
+    await h.api.queueAutoSync('marked-change');
+    await scheduled();
+    assert.equal(gisLoads, 0);
+    assert.equal(h.state.writes, 0);
+    assert.match(h.state.statuses.at(-1).detail.message, /tap to sync/);
+  });
+  await test('automatic sync reuses valid tokens but never renews expired ones', async () => {
+    const h = harness();
+    vm.runInContext(`_accessToken = 'synthetic-cached-token'; _tokenExpiry = Date.now() + 60000;
+      ensureGis = async () => { throw new Error('Unexpected GIS load'); };`, h.browser);
+    assert.equal(await h.browser.window.originalTokenRequest(false), 'synthetic-cached-token');
+    vm.runInContext('_tokenExpiry = Date.now() - 1;', h.browser);
+    await assert.rejects(h.browser.window.originalTokenRequest(false), /Tap Sync now to reconnect/);
+  });
+  await test('an explicit foreground tap can authorize, and rejected tokens require another tap', async () => {
+    const h = harness();
+    let requests = 0;
+    h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
+      return { requestAccessToken() {
+        requests++;
+        options.callback({ access_token: 'synthetic-token', expires_in: 3600 });
+      } };
+    } } } };
+    vm.runInContext('ensureGis = async () => {};', h.browser);
+    assert.equal(await h.browser.window.originalTokenRequest(true), 'synthetic-token');
+    assert.equal(await h.browser.window.originalTokenRequest(false), 'synthetic-token');
+    assert.equal(requests, 1);
+    h.browser.fetch = async () => ({ ok: false, status: 401 });
+    await assert.rejects(vm.runInContext("driveFetch('/drive/v3/files')", h.browser), /Tap Sync now to reconnect/);
+    await assert.rejects(h.browser.window.originalTokenRequest(false), /Tap Sync now to reconnect/);
+    assert.equal(requests, 1);
   });
   await test('every OAuth failure rejects its own request instead of hanging the queue', async () => {
     const h = harness();

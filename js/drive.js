@@ -3,7 +3,7 @@
  * Configuration lives in js/config.js — set window.CW_CONFIG.driveClientId
  * to your OAuth Client ID. Sync stays off until the user connects:
  *
- *   - Silent token request on startup for connected devices (after 2 min)
+ *   - Startup/background sync reuses valid in-memory authorization only
  *   - Debounced auto-sync after every save (configurable)
  *   - Skips sync when the device is on cellular if wifiOnly is true
  *
@@ -11,6 +11,7 @@
  */
 
 const DRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_AUTH_REQUIRED = 'Drive authorization is needed. Tap Sync now to reconnect.';
 const DRIVE_FOLDER_NAME = 'Plotline';
 const DRIVE_FILE_NAME = 'plotline.json';
 const SNAPSHOT_NAME = (i) => `plotline-${i}.json`;
@@ -111,16 +112,8 @@ function isOnline() {
   return navigator.onLine !== false;
 }
 
-/* True when the app is actually on screen.
- *
- * Every GIS token request — including a "silent" prompt: 'none' one — opens
- * a real popup window, which on Android is a Custom Tab stacked over the
- * installed app. Fired while the app is backgrounded (a throttled auto-sync
- * timer, an `online` event, a Wi-Fi/cellular flip) the handshake with the
- * frozen opener never completes: the popup's /gsi/transform POST aborts and
- * the resulting "This site can't be reached" tab is still sitting on top of
- * the app when the user comes back to it. So: no token requests off-screen.
- */
+/* Visibility alone is not permission to open an OAuth popup. Automatic
+ * requests never authorize; an explicit request must also stay foregrounded. */
 function appVisible() {
   if (typeof document === 'undefined') return true;
   return document.visibilityState !== 'hidden';
@@ -182,14 +175,13 @@ async function getTokenSilent() {
 async function _requestToken(interactive) {
   const epoch = _connectionEpoch;
   if (_accessToken && Date.now() < _tokenExpiry - 30000) return _accessToken;
-  // An interactive request always follows a tap, so the app is on screen by
-  // definition. A background one must wait — see appVisible().
-  if (!interactive && !appVisible()) throw new Error('BACKGROUNDED');
+  if (!appVisible()) throw new Error('BACKGROUNDED');
+  if (!interactive) throw new Error(DRIVE_AUTH_REQUIRED);
   const clientId = await getClientId();
   if (!clientId) throw new Error('NO_CLIENT_ID');
   await ensureGis();
   if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
-  if (!interactive && !appVisible()) throw new Error('BACKGROUNDED');
+  if (!appVisible()) throw new Error('BACKGROUNDED');
   return new Promise((resolve, reject) => {
     _cancelTokenRequest = () => reject(new Error('DISCONNECTED'));
     // Both callbacks must belong to this request. Reusing only `callback`
@@ -209,7 +201,7 @@ async function _requestToken(interactive) {
     });
     _tokenClient._clientId = clientId;
     try {
-      _tokenClient.requestAccessToken({ prompt: interactive ? '' : 'none' });
+      _tokenClient.requestAccessToken({ prompt: '' });
     } catch (e) { reject(e); }
   }).finally(() => { _cancelTokenRequest = null; });
 }
@@ -221,6 +213,11 @@ async function driveFetch(path, opts = {}) {
   const headers = { ...(opts.headers || {}), Authorization: `Bearer ${token}` };
   const resp = await fetch(`https://www.googleapis.com${path}`, { ...opts, headers });
   if (!resp.ok) {
+    if (resp.status === 401) {
+      _accessToken = null;
+      _tokenExpiry = 0;
+      throw new Error(DRIVE_AUTH_REQUIRED);
+    }
     const txt = await resp.text();
     throw new Error(`Drive ${resp.status}: ${txt.slice(0, 200)}`);
   }
@@ -1237,6 +1234,11 @@ function handleAutoSyncFailure(e) {
   const msg = String(e?.message || e);
   if (msg === 'NO_CLIENT_ID') { setStatus('', ''); return; }   // not configured
   if (msg === 'DISCONNECTED') { setStatus('', ''); return; }
+  if (msg === DRIVE_AUTH_REQUIRED) {
+    _syncPendingForeground = false;
+    setStatus('', '☁ tap to sync');
+    return;
+  }
   if (msg === 'CELLULAR_BLOCKED') { setStatus('error', '☁ off (cellular)'); return; }
   if (msg === 'OFFLINE') { setStatus('error', '☁ offline'); return; }
   // Not a failure at all — the app went off-screen before we could ask for a
@@ -1362,6 +1364,9 @@ function openSetupDialog(ctx) {
               value="${esc(idbId)}">
           </div>
         </details>
+        <p class="muted">Automatic sync uses your current authorization without opening sign-in screens.
+        After restarting the app or when authorization expires, tap <strong>Sync now</strong>
+        to reconnect. Your entries continue saving on this device.</p>
         <p class="muted">Restore from Drive <em>replaces</em> everything on
         this device with the Drive copy (a safety backup downloads first). Normal
         <strong>Sync now</strong> merges instead.</p>

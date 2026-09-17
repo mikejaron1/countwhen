@@ -33,7 +33,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       ? route.continue() : route.abort());
     const page = await context.newPage();
     const errors = [];
+    let authorizationRequests = 0, authorizationPopups = 0;
     page.on('pageerror', (error) => errors.push(error.message));
+    page.on('request', (request) => {
+      if (new URL(request.url()).hostname === 'accounts.google.com') authorizationRequests++;
+    });
+    page.on('popup', () => { authorizationPopups++; });
     await page.goto(`http://127.0.0.1:${server.address().port}/app/`);
     await page.locator('[data-preset="habits"]').click();
     await page.waitForFunction(() => document.querySelectorAll('#main .card').length === 5);
@@ -82,6 +87,19 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     assert.equal(await page.locator('#drawer').getAttribute('aria-hidden'), 'true');
     assert.equal(await page.evaluate(() => document.activeElement.id), 'menuBtn');
     assert.ok(!(await page.locator('meta[name=viewport]').getAttribute('content')).includes('maximum-scale'));
+
+    // Returning to a connected app without a token must never open Google UI.
+    await page.evaluate(async () => {
+      await CWDB.setMeta('driveEnabled', true);
+      await CWDRIVE.startupSync();
+      _syncPendingForeground = true;
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await page.waitForFunction(() => document.querySelector('#syncPill').textContent.includes('tap to sync')
+      && document.querySelector('#syncActivity').hidden);
+    assert.equal(authorizationRequests, 0);
+    assert.equal(authorizationPopups, 0);
+    await page.evaluate(() => CWDRIVE.disconnect());
 
     // Goal revisions persist rather than overwrite historical configuration.
     await page.evaluate((id) => openGoalEdit(state.topics.find((topic) => topic.id === id)), waterId);
