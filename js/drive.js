@@ -3,7 +3,7 @@
  * Configuration lives in js/config.js — set window.CW_CONFIG.driveClientId
  * to your OAuth Client ID. Sync stays off until the user connects:
  *
- *   - Startup/background sync reuses valid in-memory authorization only
+ *   - Startup sync reuses cached authorization; local edits auto-sync to Drive
  *   - Debounced auto-sync after every save (configurable)
  *   - Skips sync when the device is on cellular if wifiOnly is true
  *
@@ -54,7 +54,9 @@ let _gisLoaded = false;
 let _tokenClient = null;
 let _accessToken = null;
 let _tokenExpiry = 0;
+let _inflightTokenPromise = null;
 let _autoSyncTimer = null;
+let _autoSyncAllowAuth = false;
 let _consecutiveSilentFailures = 0;
 let _syncPendingForeground = false;
 let _syncQueue = Promise.resolve();
@@ -64,8 +66,9 @@ let _pendingOperations = 0;
 let _connectionEpoch = 0;
 let _cancelTokenRequest = null;
 let _disconnecting = 0;
+let _lastSyncAt = 0;
 let _requestedStatus = { status: '', message: '' };
-let _lastStatus = { ..._requestedStatus, pending: false, phase: 'idle' };
+let _lastStatus = { ..._requestedStatus, pending: false, phase: 'idle', lastSync: 0 };
 
 /* Background sync gives up after this many consecutive silent failures.
  * An unauthorised or misconfigured token fails identically every time, so
@@ -148,7 +151,7 @@ function setStatus(status, msg) {
   // drains. New listeners can use pending/phase without interpreting text.
   _lastStatus = { status,
     message: pending && !/syncing/i.test(message) ? `${message}${message ? ' — ' : ''}syncing…` : message,
-    pending, phase: pending ? 'syncing' : 'idle' };
+    pending, phase: pending ? 'syncing' : 'idle', lastSync: _lastSyncAt };
   // Update the small sync pill in the header if present
   const el = document.getElementById('syncPill');
   if (el) {
@@ -165,45 +168,75 @@ function setStatus(status, msg) {
 
 /* ---------- token / OAuth ---------- */
 
-async function getTokenInteractive() {
-  return _requestToken(true);
-}
-async function getTokenSilent() {
-  return _requestToken(false);
+async function getCachedToken(clientId) {
+  if (_accessToken && Date.now() < _tokenExpiry - 30000) return _accessToken;
+  const saved = await CWDB.getMeta('driveToken');
+  if (saved?.accessToken && saved.tokenExpiry && Date.now() < saved.tokenExpiry - 30000) {
+    const activeClientId = clientId || await getClientId();
+    if (!saved.clientId || saved.clientId === activeClientId) {
+      _accessToken = saved.accessToken;
+      _tokenExpiry = saved.tokenExpiry;
+      return _accessToken;
+    }
+  }
+  return null;
 }
 
-async function _requestToken(interactive) {
+async function clearCachedToken() {
+  _accessToken = null;
+  _tokenExpiry = 0;
+  try { await CWDB.setMeta('driveToken', null); } catch (_) {}
+}
+
+async function getTokenInteractive() {
+  return _requestToken(true, { allowAuth: true });
+}
+async function getTokenSilent(opts = {}) {
+  return _requestToken(false, opts);
+}
+
+async function _requestToken(interactive, { allowAuth = interactive } = {}) {
   const epoch = _connectionEpoch;
-  if (_accessToken && Date.now() < _tokenExpiry - 30000) return _accessToken;
+  const cached = await getCachedToken();
+  if (cached) return cached;
   if (!appVisible()) throw new Error('BACKGROUNDED');
-  if (!interactive) throw new Error(DRIVE_AUTH_REQUIRED);
+  if (!allowAuth) throw new Error(DRIVE_AUTH_REQUIRED);
   const clientId = await getClientId();
   if (!clientId) throw new Error('NO_CLIENT_ID');
-  await ensureGis();
-  if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
-  if (!appVisible()) throw new Error('BACKGROUNDED');
-  return new Promise((resolve, reject) => {
-    _cancelTokenRequest = () => reject(new Error('DISCONNECTED'));
-    // Both callbacks must belong to this request. Reusing only `callback`
-    // leaves error_callback rejecting an already-settled previous promise.
-    _tokenClient = google.accounts.oauth2.initTokenClient({
-      client_id: clientId,
-      scope: DRIVE_SCOPES,
-      callback: (resp) => {
-        if (epoch !== _connectionEpoch) return reject(new Error('DISCONNECTED'));
-        if (resp.error) return reject(new Error(resp.error));
-        _accessToken = resp.access_token;
-        _tokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
-        _consecutiveSilentFailures = 0;
-        resolve(_accessToken);
-      },
-      error_callback: (err) => reject(new Error(err.type || 'oauth_error')),
-    });
-    _tokenClient._clientId = clientId;
-    try {
-      _tokenClient.requestAccessToken({ prompt: '' });
-    } catch (e) { reject(e); }
-  }).finally(() => { _cancelTokenRequest = null; });
+  if (_inflightTokenPromise) return _inflightTokenPromise;
+  _inflightTokenPromise = (async () => {
+    await ensureGis();
+    if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
+    if (!appVisible()) throw new Error('BACKGROUNDED');
+    return new Promise((resolve, reject) => {
+      _cancelTokenRequest = () => reject(new Error('DISCONNECTED'));
+      // Both callbacks must belong to this request. Reusing only `callback`
+      // leaves error_callback rejecting an already-settled previous promise.
+      _tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: DRIVE_SCOPES,
+        callback: (resp) => {
+          if (epoch !== _connectionEpoch) return reject(new Error('DISCONNECTED'));
+          if (resp.error) return reject(new Error(resp.error));
+          _accessToken = resp.access_token;
+          _tokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
+          _consecutiveSilentFailures = 0;
+          CWDB.setMeta('driveToken', {
+            accessToken: _accessToken,
+            tokenExpiry: _tokenExpiry,
+            clientId,
+          }).catch(() => {});
+          resolve(_accessToken);
+        },
+        error_callback: (err) => reject(new Error(err.type || 'oauth_error')),
+      });
+      _tokenClient._clientId = clientId;
+      try {
+        _tokenClient.requestAccessToken({ prompt: '' });
+      } catch (e) { reject(e); }
+    }).finally(() => { _cancelTokenRequest = null; });
+  })().finally(() => { _inflightTokenPromise = null; });
+  return _inflightTokenPromise;
 }
 
 /* ---------- Drive REST ---------- */
@@ -214,8 +247,7 @@ async function driveFetch(path, opts = {}) {
   const resp = await fetch(`https://www.googleapis.com${path}`, { ...opts, headers });
   if (!resp.ok) {
     if (resp.status === 401) {
-      _accessToken = null;
-      _tokenExpiry = 0;
+      await clearCachedToken();
       throw new Error(DRIVE_AUTH_REQUIRED);
     }
     const txt = await resp.text();
@@ -872,7 +904,7 @@ function withDataLock(fn) {
 }
 
 /* Serialize remote operations/OAuth, independently of the short local lock. */
-function runSync(interactive, operation) {
+function runSync(interactive, operation, { allowAuth = interactive } = {}) {
   if (_disconnecting) return Promise.reject(new Error('DISCONNECTED'));
   const epoch = _connectionEpoch;
   const authenticate = async () => {
@@ -883,7 +915,7 @@ function runSync(interactive, operation) {
     } else if (!(await isEnabled())) throw new Error('DISCONNECTED');
     if (!isOnline()) throw new Error('OFFLINE');
     if (!interactive && !wifiOk()) throw new Error('CELLULAR_BLOCKED');
-    await (interactive ? getTokenInteractive() : getTokenSilent());
+    await (interactive ? getTokenInteractive() : getTokenSilent({ allowAuth }));
     if (epoch !== _connectionEpoch || !(await isEnabled())) throw new Error('DISCONNECTED');
     return operation(() => {
       if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
@@ -968,7 +1000,7 @@ async function saveRecovery(snapshot, localSnapshot, status = 'pending', localId
   });
 }
 
-function syncNow({ interactive = false, allowMerge = true } = {}) {
+function syncNow({ interactive = false, allowMerge = true, allowAuth = interactive } = {}) {
   if (_disconnecting) return Promise.reject(new Error('DISCONNECTED'));
   if (!interactive && _backgroundSync.has(allowMerge)) return _backgroundSync.get(allowMerge);
   const promise = runSync(interactive, async (checkConnected) => {
@@ -1119,7 +1151,7 @@ function syncNow({ interactive = false, allowMerge = true } = {}) {
       return { action: hadRemote ? 'merged' : 'created', stats: resultStats, changedLocally };
     }
     throw new Error('REMOTE_CONFLICT: Drive kept changing. Local data is unchanged; a pending recovery copy is saved. Retry sync.');
-  });
+  }, { allowAuth });
   if (!interactive) {
     _backgroundSync.set(allowMerge, promise);
     promise.finally(() => {
@@ -1138,7 +1170,9 @@ async function rememberSyncPoint(fileMeta, obj) {
     version: fileMeta.version || null,
   });
   await CWDB.setMeta('driveSyncBase', obj);
-  await CWDB.setMeta('lastDriveSync', Date.now());
+  const syncedAt = Date.now();
+  _lastSyncAt = syncedAt;
+  await CWDB.setMeta('lastDriveSync', syncedAt);
 }
 
 /* Upload-only (kept for the "Sync Now" button and older call sites). */
@@ -1185,15 +1219,24 @@ async function markLocalChange() {
 
 async function queueAutoSync(reason = 'change') {
   const epoch = _connectionEpoch;
+  const isLocalMutation = !['online', 'connection', 'startup', 'visibility', 'retry'].includes(reason);
   // Always stamp the local change, even if auto-sync is off — the timestamp
   // is what breaks conflict ties on the next manual sync.
-  if (!['online', 'connection', 'startup', 'visibility', 'retry', 'marked-change'].includes(reason)) {
+  if (isLocalMutation && reason !== 'marked-change') {
     await markLocalChange();
   }
   if (!(await isEnabled())) return;
   if (_disconnecting || epoch !== _connectionEpoch) return;
   if (!CFG().autoSyncOnChange) return;
   if (autoSyncSuppressed()) return;
+  if (isLocalMutation) _autoSyncAllowAuth = true;
+  if (isLocalMutation && navigator.userActivation?.isActive && appVisible() && isOnline() && wifiOk()) {
+    getCachedToken().then((token) => {
+      if (!token && !_disconnecting && epoch === _connectionEpoch && appVisible()) {
+        getTokenSilent({ allowAuth: true }).catch(() => {});
+      }
+    }).catch(() => {});
+  }
   const debounce = Math.max(1000, Number(CFG().autoSyncDebounceMs) || 5000);
   if (_autoSyncTimer) clearTimeout(_autoSyncTimer);
   setStatus('', '☁ queued…');
@@ -1203,10 +1246,13 @@ async function queueAutoSync(reason = 'change') {
     // The timer may well have been throttled while the app sat in the
     // background and only fired now, still off-screen. Hold it over.
     if (!appVisible()) { _syncPendingForeground = true; return; }
+    const allowAuth = _autoSyncAllowAuth;
+    _autoSyncAllowAuth = false;
     try {
-      const res = await syncNow({ interactive: false });
+      const res = await syncNow({ interactive: false, allowAuth });
       await afterSync(res);
     } catch (e) {
+      if (String(e?.message || e) === 'BACKGROUNDED' && allowAuth) _autoSyncAllowAuth = true;
       handleAutoSyncFailure(e);
     }
   }, debounce);
@@ -1260,19 +1306,29 @@ async function startupSync() {
   if (!(await isEnabled())) return;
   const clientId = await getClientId();
   if (!clientId) return;
+  const last = await CWDB.getMeta('lastDriveSync', 0);
+  const lastChange = await CWDB.getMeta('lastLocalChangeAt', 0);
+  if (last) _lastSyncAt = last;
   // Surface the pill even when suppressed, or a fresh launch would show no
   // sign at all that sync is broken.
   if (autoSyncSuppressed()) { setStatus('error', '☁ tap to fix'); return; }
-  const last = await CWDB.getMeta('lastDriveSync', 0);
+  const hasUnsyncedChanges = !last || lastChange > last;
   const gap = Date.now() - (last || 0);
   // Short gap only: sync is two-way now, so opening the app is how we find
   // out about edits made on the other device.
-  if (gap < 2 * 60 * 1000) return;
+  if (!hasUnsyncedChanges && gap < 2 * 60 * 1000) {
+    setStatus('ok', '☁ synced');
+    return;
+  }
   if (!appVisible()) { _syncPendingForeground = true; return; }
   try {
-    const res = await syncNow({ interactive: false });
+    const res = await syncNow({ interactive: false, allowAuth: false });
     await afterSync(res);
   } catch (e) {
+    if (String(e?.message || e) === DRIVE_AUTH_REQUIRED && !hasUnsyncedChanges) {
+      setStatus('ok', '☁ synced');
+      return;
+    }
     handleAutoSyncFailure(e);
   }
 }
@@ -1285,6 +1341,7 @@ async function disconnect() {
   // operation instead, then allow a caller to reset local data under the lock.
   if (_autoSyncTimer) clearTimeout(_autoSyncTimer);
   _autoSyncTimer = null;
+  _autoSyncAllowAuth = false;
   _syncPendingForeground = false;
   try {
     await CWDB.setMeta('driveEnabled', false);
@@ -1300,7 +1357,9 @@ function resetTokenClient() {
   _tokenClient = null;
   _accessToken = null;
   _tokenExpiry = 0;
+  _inflightTokenPromise = null;
   _consecutiveSilentFailures = 0;
+  CWDB?.setMeta?.('driveToken', null)?.catch?.(() => {});
 }
 
 function esc(s) {
@@ -1364,9 +1423,9 @@ function openSetupDialog(ctx) {
               value="${esc(idbId)}">
           </div>
         </details>
-        <p class="muted">Automatic sync uses your current authorization without opening sign-in screens.
-        After restarting the app or when authorization expires, tap <strong>Sync now</strong>
-        to reconnect. Your entries continue saving on this device.</p>
+        <p class="muted">Automatic sync reuses your current authorization and refreshes it when you log or edit entries.
+        If background renewal is blocked by your browser, tap the <strong>☁</strong> pill or <strong>Sync now</strong>
+        to reconnect. Your entries always save on this device first.</p>
         <p class="muted">Restore from Drive <em>replaces</em> everything on
         this device with the Drive copy (a safety backup downloads first). Normal
         <strong>Sync now</strong> merges instead.</p>
@@ -1495,14 +1554,17 @@ if (typeof window !== 'undefined') {
     if (!appVisible() || !_syncPendingForeground) return;
     _syncPendingForeground = false;
     if (autoSyncSuppressed()) return;
+    const allowAuth = _autoSyncAllowAuth;
+    _autoSyncAllowAuth = false;
     // Straight through rather than via queueAutoSync(): this is a deferred
     // sync, not a fresh local edit, so it must not restamp lastLocalChangeAt
     // and hand every conflict tie to this device.
     (async () => {
       try {
-        const res = await syncNow({ interactive: false });
+        const res = await syncNow({ interactive: false, allowAuth });
         await afterSync(res);
       } catch (e) {
+        if (String(e?.message || e) === 'BACKGROUNDED' && allowAuth) _autoSyncAllowAuth = true;
         handleAutoSyncFailure(e);
       }
     })();

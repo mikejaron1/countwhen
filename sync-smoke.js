@@ -972,11 +972,16 @@ async function test(name, fn) {
     vm.runInContext(`ensureGis = async () => { document.visibilityState = 'hidden'; };`, h.browser);
     await assert.rejects(h.browser.window.originalTokenRequest(true), /BACKGROUNDED/);
   });
-  await test('startup and automatic sync never load GIS or open authorization screens', async () => {
+  await test('startup sync never opens authorization screens, while local edits auto-sync to Drive', async () => {
     const h = harness();
     let gisLoads = 0;
     h.browser.ensureGis = async () => { gisLoads++; };
-    vm.runInContext('getTokenSilent = () => window.originalTokenRequest(false);', h.browser);
+    h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
+      return { requestAccessToken() {
+        options.callback({ access_token: 'auto-token', expires_in: 3600 });
+      } };
+    } } } };
+    vm.runInContext('getTokenSilent = (opts) => window.originalTokenRequest(false, opts);', h.browser);
     for (let i = 0; i < 4; i++) await h.api.startupSync();
     assert.equal(gisLoads, 0);
     assert.equal(h.state.reads, 0);
@@ -984,24 +989,46 @@ async function test(name, fn) {
     assert.equal(h.state.statuses.at(-1).detail.status, '');
     assert.match(h.state.statuses.at(-1).detail.message, /tap to sync/);
     assert.equal(vm.runInContext('autoSyncSuppressed()', h.browser), false);
+    // When all local data is already synced (lastDriveSync >= lastLocalChangeAt),
+    // startup without an in-memory token shows synced rather than tap to sync.
+    h.meta.set('lastDriveSync', Date.now() - 5 * 60 * 1000);
+    h.meta.set('lastLocalChangeAt', Date.now() - 10 * 60 * 1000);
+    await h.api.startupSync();
+    assert.equal(gisLoads, 0);
+    assert.equal(h.state.statuses.at(-1).detail.status, 'ok');
+    assert.equal(h.state.statuses.at(-1).detail.message, '☁ synced');
+    // Creating a new event (queueAutoSync) renews authorization and auto-syncs.
     let scheduled;
     h.browser.setTimeout = (callback) => { scheduled = callback; return 1; };
     h.browser.clearTimeout = () => {};
+    h.state.local.events.push(event(10));
     await h.api.queueAutoSync('marked-change');
     await scheduled();
-    assert.equal(gisLoads, 0);
-    assert.equal(h.state.writes, 0);
-    assert.match(h.state.statuses.at(-1).detail.message, /tap to sync/);
+    assert.equal(gisLoads, 1);
+    assert.equal(h.state.writes, 1);
+    assert.equal(h.state.statuses.at(-1).detail.status, 'ok');
+    assert.equal(h.state.statuses.at(-1).detail.message, '☁ synced');
+    assert.ok(h.state.statuses.at(-1).detail.lastSync > 0);
   });
-  await test('automatic sync reuses valid tokens but never renews expired ones', async () => {
+  await test('cached tokens persist in device meta across reloads and renew on local edits when expired', async () => {
     const h = harness();
-    vm.runInContext(`_accessToken = 'synthetic-cached-token'; _tokenExpiry = Date.now() + 60000;
+    vm.runInContext(`_accessToken = null; _tokenExpiry = 0;
       ensureGis = async () => { throw new Error('Unexpected GIS load'); };`, h.browser);
-    assert.equal(await h.browser.window.originalTokenRequest(false), 'synthetic-cached-token');
-    vm.runInContext('_tokenExpiry = Date.now() - 1;', h.browser);
+    h.meta.set('driveToken', {
+      accessToken: 'persisted-token',
+      tokenExpiry: Date.now() + 60000,
+      clientId: 'test',
+    });
+    assert.equal(await h.browser.window.originalTokenRequest(false), 'persisted-token');
+    vm.runInContext('_accessToken = null; _tokenExpiry = 0;', h.browser);
+    h.meta.set('driveToken', {
+      accessToken: 'expired-token',
+      tokenExpiry: Date.now() - 1,
+      clientId: 'test',
+    });
     await assert.rejects(h.browser.window.originalTokenRequest(false), /Tap Sync now to reconnect/);
   });
-  await test('an explicit foreground tap can authorize, and rejected tokens require another tap', async () => {
+  await test('an explicit foreground tap can authorize, and rejected tokens clear persisted token state', async () => {
     const h = harness();
     let requests = 0;
     h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
@@ -1012,10 +1039,13 @@ async function test(name, fn) {
     } } } };
     vm.runInContext('ensureGis = async () => {};', h.browser);
     assert.equal(await h.browser.window.originalTokenRequest(true), 'synthetic-token');
+    assert.equal(h.meta.get('driveToken').accessToken, 'synthetic-token');
+    vm.runInContext('_accessToken = null; _tokenExpiry = 0;', h.browser);
     assert.equal(await h.browser.window.originalTokenRequest(false), 'synthetic-token');
     assert.equal(requests, 1);
     h.browser.fetch = async () => ({ ok: false, status: 401 });
     await assert.rejects(vm.runInContext("driveFetch('/drive/v3/files')", h.browser), /Tap Sync now to reconnect/);
+    assert.equal(h.meta.get('driveToken'), null);
     await assert.rejects(h.browser.window.originalTokenRequest(false), /Tap Sync now to reconnect/);
     assert.equal(requests, 1);
   });

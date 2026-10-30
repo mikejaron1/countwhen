@@ -93,7 +93,7 @@ function reqToPromise(req) {
 /* Meta keys that belong to *this device*, not to the data set. They survive
  * a replace-import so a Drive restore doesn't disconnect Drive. */
 const DEVICE_META_KEYS = [
-  'driveClientId', 'driveSyncBase', 'driveRemoteMeta',
+  'driveClientId', 'driveSyncBase', 'driveRemoteMeta', 'driveToken',
   'driveLegacyCleanupAt', 'driveLegacyCleanupDone',
   'lastDriveSync', 'lastLocalChangeAt', 'lastFlareAlert', 'onboarded',
   'driveEnabled', 'deviceId', 'syncDeviceId', 'syncCounter',

@@ -99,7 +99,20 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       && document.querySelector('#syncActivity').hidden);
     assert.equal(authorizationRequests, 0);
     assert.equal(authorizationPopups, 0);
+
+    // Once synced, the header shows both the synced pill and when it was last synced.
+    await page.evaluate(async () => {
+      const fiveMinAgo = Date.now() - 5 * 60 * 1000;
+      await CWDB.setMeta('lastDriveSync', fiveMinAgo);
+      await CWDB.setMeta('lastLocalChangeAt', fiveMinAgo - 1000);
+      await CWMODEL.refresh();
+      await CWDRIVE.startupSync();
+    });
+    assert.equal(await page.locator('#syncPill').textContent(), '☁ synced');
+    assert.equal(await page.locator('#syncActivity').isHidden(), false);
+    assert.equal(await page.locator('#syncActivity').textContent(), 'Last synced 5m ago');
     await page.evaluate(() => CWDRIVE.disconnect());
+    assert.equal(await page.locator('#syncActivity').isHidden(), true);
 
     // Goal revisions persist rather than overwrite historical configuration.
     await page.evaluate((id) => openGoalEdit(state.topics.find((topic) => topic.id === id)), waterId);

@@ -209,6 +209,7 @@ async function reload() {
   state.activeTimers = activeTimers || {};
   state.backup = { lastExport, lastDriveSync, lastLocalChangeAt,
     driveEnabled: driveEnabled ?? !!lastDriveSync };
+  renderSyncActivity();
   state.reorderHintHidden = reorderHintHidden;
   state.insightSettings = insightSettings;
   state.dataRevision = meta.dataRevision ?? 0;
@@ -307,11 +308,51 @@ function measuredValue(events, topic) {
   return total / (aggregation === 'mean' ? events.length : 1);
 }
 
-function renderSyncActivity(detail) {
+let lastSyncDetail = { status: '', message: '', pending: false, phase: 'idle', lastSync: 0 };
+
+function fmtLastSynced(ts) {
+  if (!ts) return '';
+  const delta = Math.max(0, Date.now() - ts);
+  const sec = Math.floor(delta / 1000);
+  if (sec < 60) return 'Last synced just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `Last synced ${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `Last synced ${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 60) return `Last synced ${day}d ago`;
+  return `Last synced ${fmtDateLong(ts)}`;
+}
+
+function renderSyncActivity(detail = lastSyncDetail) {
+  if (detail) lastSyncDetail = detail;
+  if (detail?.lastSync) {
+    state.backup.lastDriveSync = detail.lastSync;
+    state.backup.driveEnabled = true;
+  }
+  if (detail?.message === '☁ disconnected') {
+    state.backup.driveEnabled = false;
+  }
   const activity = $('#syncActivity');
-  const syncing = /syncing/.test(detail.message || '');
-  activity.hidden = !syncing;
-  activity.textContent = syncing ? 'Syncing now' : '';
+  if (!activity) return;
+  const syncing = /syncing/.test(lastSyncDetail?.message || '');
+  if (syncing) {
+    activity.hidden = false;
+    if (activity.textContent !== 'Syncing now') activity.textContent = 'Syncing now';
+    activity.removeAttribute('title');
+    return;
+  }
+  const lastSync = Number(state.backup?.lastDriveSync || 0);
+  if (state.backup?.driveEnabled && lastSync > 0) {
+    const label = fmtLastSynced(lastSync);
+    activity.hidden = false;
+    if (activity.textContent !== label) activity.textContent = label;
+    activity.title = `Last synced ${new Date(lastSync).toLocaleString()}`;
+    return;
+  }
+  activity.hidden = true;
+  if (activity.textContent !== '') activity.textContent = '';
+  activity.removeAttribute('title');
 }
 
 function dayCheckHtml(key) {
@@ -374,6 +415,7 @@ function refreshLiveLabels() {
   $$('[data-timer-start]').forEach((element) => {
     element.textContent = `${CWSTATS.fmtIntervalShort(Date.now() - Number(element.dataset.timerStart))} running`;
   });
+  renderSyncActivity();
 }
 
 /* ======== VIEW: CATEGORIES (default home) ======== */
@@ -2979,8 +3021,10 @@ function openOnboarding() {
 
 let waitingWorker = null;
 let updatingApp = false;
+let swRegistration = null;
 
 function watchUpdates(registration) {
+  swRegistration = registration;
   const announce = () => {
     if (!registration.waiting) return;
     waitingWorker = registration.waiting;
@@ -2993,6 +3037,7 @@ function watchUpdates(registration) {
       if (installing.state === 'installed') announce();
     });
   });
+  registration.update?.()?.catch?.(() => {});
 }
 
 /* ======== INIT ======== */
@@ -3076,6 +3121,7 @@ async function init() {
   setInterval(() => { if (document.visibilityState !== 'hidden') refreshLiveLabels(); }, 30000);
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState !== 'visible') return;
+    swRegistration?.update?.()?.catch?.(() => {});
     try {
       if (!$('#modalRoot .dialog')) await CWMODEL.refresh();
       refreshLiveLabels();

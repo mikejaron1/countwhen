@@ -386,12 +386,13 @@ Self-hosting for a group and want *everyone* on your own project? Set
 `driveClientId` in `js/config.js` instead — that becomes the default for
 that deployment (set it to `''` to ship with Drive sync off entirely).
 
-Once you explicitly connect, the app attempts background sync after changes and
-at launch using a valid in-memory access token. It never opens an authorization
-screen automatically, even when the app is visible or resumes from the background.
-After an app restart or token expiry, the pill shows **tap to sync**; tap **Sync now**
-to authorize again. Local logging works without Drive authorization. Disconnecting
-disables automatic sync on that device without deleting the remote backup.
+Once you explicitly connect, the app caches your Drive access token on that
+device until it expires, syncs at launch when a cached token is still valid, and
+auto-syncs after local changes (creating or editing events/settings), renewing the
+token when needed without opening popups on passive startups. If silent renewal is
+blocked, the pill shows **tap to sync**; tap it or **Sync now** to authorize again.
+Local logging works without Drive authorization. Disconnecting disables automatic
+sync on that device without deleting the remote backup.
 
 ### Sync behavior
 
