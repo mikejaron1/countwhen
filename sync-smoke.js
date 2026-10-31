@@ -989,22 +989,34 @@ async function test(name, fn) {
     assert.equal(h.state.statuses.at(-1).detail.status, '');
     assert.match(h.state.statuses.at(-1).detail.message, /tap to sync/);
     assert.equal(vm.runInContext('autoSyncSuppressed()', h.browser), false);
-    // When all local data is already synced (lastDriveSync >= lastLocalChangeAt),
-    // startup without an in-memory token shows synced rather than tap to sync.
+    // Even when unsynced local changes exist on a previously synced device,
+    // startup without an in-memory token keeps the synced pill (next to Last
+    // synced ...) and arms gesture-backed sync rather than nagging tap to sync.
     h.meta.set('lastDriveSync', Date.now() - 5 * 60 * 1000);
-    h.meta.set('lastLocalChangeAt', Date.now() - 10 * 60 * 1000);
+    h.meta.set('lastLocalChangeAt', Date.now() - 1 * 60 * 1000);
     await h.api.startupSync();
     assert.equal(gisLoads, 0);
     assert.equal(h.state.statuses.at(-1).detail.status, 'ok');
     assert.equal(h.state.statuses.at(-1).detail.message, '☁ synced');
-    // Creating a new event (queueAutoSync) renews authorization and auto-syncs.
+    // When GIS is already loaded, warmTokenOnGesture starts requestAccessToken
+    // synchronously on the click call stack before any async work.
+    let syncRequested = false;
+    h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
+      return { requestAccessToken() {
+        syncRequested = true;
+        options.callback({ access_token: 'auto-token', expires_in: 3600 });
+      } };
+    } } } };
+    vm.runInContext('_gisLoaded = true; getTokenSilent = _defaultGetTokenSilent;', h.browser);
+    h.api.warmTokenOnGesture();
+    assert.equal(syncRequested, true);
+    // Creating a new event (queueAutoSync) uses the warmed token and auto-syncs.
     let scheduled;
     h.browser.setTimeout = (callback) => { scheduled = callback; return 1; };
     h.browser.clearTimeout = () => {};
     h.state.local.events.push(event(10));
     await h.api.queueAutoSync('marked-change');
     await scheduled();
-    assert.equal(gisLoads, 1);
     assert.equal(h.state.writes, 1);
     assert.equal(h.state.statuses.at(-1).detail.status, 'ok');
     assert.equal(h.state.statuses.at(-1).detail.message, '☁ synced');

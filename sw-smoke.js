@@ -58,6 +58,14 @@ function worker({ fail = null } = {}) {
   }
   await good.dispatch('message', { data: { type: 'ACTIVATE_UPDATE' } });
   assert.equal(good.context.activated, true);
+  // When Request is available in the browser, install bypasses the HTTP cache.
+  const cachedModes = [];
+  const reloadWorker = worker();
+  reloadWorker.context.Request = class Request {
+    constructor(url, opts = {}) { this.url = url; this.cache = opts.cache; cachedModes.push(opts.cache); }
+  };
+  await reloadWorker.dispatch('install');
+  assert.ok(cachedModes.length > 0 && cachedModes.every((mode) => mode === 'reload'));
   const html = fs.readFileSync('app/index.html', 'utf8');
   for (const [, src] of html.matchAll(/<script[^>]*src="([^"]+)"/g)) {
     assert.ok(fs.readFileSync('sw.js', 'utf8').includes(`'${src}'`), `${src} must be in the offline shell`);

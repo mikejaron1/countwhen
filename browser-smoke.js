@@ -100,11 +100,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     assert.equal(authorizationRequests, 0);
     assert.equal(authorizationPopups, 0);
 
-    // Once synced, the header shows both the synced pill and when it was last synced.
+    // Once synced, the header shows both the synced pill and when it was last
+    // synced — even if local edits happened since the last sync.
     await page.evaluate(async () => {
       const fiveMinAgo = Date.now() - 5 * 60 * 1000;
       await CWDB.setMeta('lastDriveSync', fiveMinAgo);
-      await CWDB.setMeta('lastLocalChangeAt', fiveMinAgo - 1000);
+      await CWDB.setMeta('lastLocalChangeAt', fiveMinAgo + 1000);
       await CWMODEL.refresh();
       await CWDRIVE.startupSync();
     });

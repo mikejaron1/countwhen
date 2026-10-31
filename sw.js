@@ -29,9 +29,10 @@ const OPTIONAL = ['/favicon.ico', '/icons/icon-192.png', '/icons/icon-512.png', 
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_VERSION);
-    await cache.addAll(SHELL);
+    const toRequest = (url) => typeof Request === 'function' ? new Request(url, { cache: 'reload' }) : url;
+    await cache.addAll(SHELL.map(toRequest));
     await Promise.all(OPTIONAL.map((url) =>
-      cache.add(url).catch((error) => console.warn('Optional offline asset unavailable', url, error))));
+      cache.add(toRequest(url)).catch((error) => console.warn('Optional offline asset unavailable', url, error))));
   })());
 });
 

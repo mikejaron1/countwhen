@@ -40,5 +40,5 @@ window.CW_CONFIG = {
   autoSyncOnStartup: true,
 
   // Minimum gap between auto-syncs (ms). Acts as a debounce.
-  autoSyncDebounceMs: 5000,
+  autoSyncDebounceMs: 1500,
 };

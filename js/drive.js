@@ -55,6 +55,9 @@ let _tokenClient = null;
 let _accessToken = null;
 let _tokenExpiry = 0;
 let _inflightTokenPromise = null;
+let _driveEnabled = false;
+let _cachedClientId = '';
+let _needsGestureSync = false;
 let _autoSyncTimer = null;
 let _autoSyncAllowAuth = false;
 let _consecutiveSilentFailures = 0;
@@ -107,7 +110,8 @@ function getClientId() {
   // built-in default for everyone else.
   return CWDB.getMeta('driveClientId').then((v) => {
     const own = (v || '').trim();
-    return own || (CFG().driveClientId || '').trim();
+    _cachedClientId = own || (CFG().driveClientId || '').trim();
+    return _cachedClientId;
   });
 }
 
@@ -168,8 +172,12 @@ function setStatus(status, msg) {
 
 /* ---------- token / OAuth ---------- */
 
+function hasValidMemoryToken() {
+  return Boolean(_accessToken && Date.now() < _tokenExpiry - 30000);
+}
+
 async function getCachedToken(clientId) {
-  if (_accessToken && Date.now() < _tokenExpiry - 30000) return _accessToken;
+  if (hasValidMemoryToken()) return _accessToken;
   const saved = await CWDB.getMeta('driveToken');
   if (saved?.accessToken && saved.tokenExpiry && Date.now() < saved.tokenExpiry - 30000) {
     const activeClientId = clientId || await getClientId();
@@ -188,26 +196,11 @@ async function clearCachedToken() {
   try { await CWDB.setMeta('driveToken', null); } catch (_) {}
 }
 
-async function getTokenInteractive() {
-  return _requestToken(true, { allowAuth: true });
-}
-async function getTokenSilent(opts = {}) {
-  return _requestToken(false, opts);
-}
-
-async function _requestToken(interactive, { allowAuth = interactive } = {}) {
-  const epoch = _connectionEpoch;
-  const cached = await getCachedToken();
-  if (cached) return cached;
-  if (!appVisible()) throw new Error('BACKGROUNDED');
-  if (!allowAuth) throw new Error(DRIVE_AUTH_REQUIRED);
-  const clientId = await getClientId();
-  if (!clientId) throw new Error('NO_CLIENT_ID');
+function _beginOAuthRequest(clientId, epoch = _connectionEpoch) {
   if (_inflightTokenPromise) return _inflightTokenPromise;
-  _inflightTokenPromise = (async () => {
-    await ensureGis();
-    if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
-    if (!appVisible()) throw new Error('BACKGROUNDED');
+  const startClient = () => {
+    if (epoch !== _connectionEpoch) return Promise.reject(new Error('DISCONNECTED'));
+    if (!appVisible()) return Promise.reject(new Error('BACKGROUNDED'));
     return new Promise((resolve, reject) => {
       _cancelTokenRequest = () => reject(new Error('DISCONNECTED'));
       // Both callbacks must belong to this request. Reusing only `callback`
@@ -221,6 +214,7 @@ async function _requestToken(interactive, { allowAuth = interactive } = {}) {
           _accessToken = resp.access_token;
           _tokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
           _consecutiveSilentFailures = 0;
+          _needsGestureSync = false;
           CWDB.setMeta('driveToken', {
             accessToken: _accessToken,
             tokenExpiry: _tokenExpiry,
@@ -235,8 +229,51 @@ async function _requestToken(interactive, { allowAuth = interactive } = {}) {
         _tokenClient.requestAccessToken({ prompt: '' });
       } catch (e) { reject(e); }
     }).finally(() => { _cancelTokenRequest = null; });
-  })().finally(() => { _inflightTokenPromise = null; });
+  };
+  const p = (_gisLoaded && typeof google !== 'undefined' && google.accounts?.oauth2)
+    ? startClient()
+    : ensureGis().then(startClient);
+  _inflightTokenPromise = p.finally(() => { _inflightTokenPromise = null; });
   return _inflightTokenPromise;
+}
+
+/* Start token renewal synchronously inside a user click/tap gesture before any
+ * IndexedDB or Web Lock awaits can expire transient popup activation. */
+function warmTokenOnGesture({ force = false } = {}) {
+  if (_disconnecting) return null;
+  if (!force && (!_driveEnabled || !CFG().autoSyncOnChange || autoSyncSuppressed())) return null;
+  _autoSyncAllowAuth = true;
+  if (!appVisible() || !isOnline() || (!force && !wifiOk())) return null;
+  if (hasValidMemoryToken()) return Promise.resolve(_accessToken);
+  if (_inflightTokenPromise) return _inflightTokenPromise;
+  if (!force && getTokenSilent !== _defaultGetTokenSilent) return null;
+  const clientId = _cachedClientId || (CFG().driveClientId || '').trim();
+  if (!clientId) return null;
+  const p = _beginOAuthRequest(clientId, _connectionEpoch);
+  p.catch(() => {});
+  return p;
+}
+
+function _defaultGetTokenInteractive() {
+  return _requestToken(true, { allowAuth: true });
+}
+function _defaultGetTokenSilent(opts = {}) {
+  return _requestToken(false, opts);
+}
+let getTokenInteractive = _defaultGetTokenInteractive;
+let getTokenSilent = _defaultGetTokenSilent;
+
+async function _requestToken(interactive, { allowAuth = interactive } = {}) {
+  const epoch = _connectionEpoch;
+  if (_inflightTokenPromise) return _inflightTokenPromise;
+  const cached = await getCachedToken();
+  if (cached) return cached;
+  if (_inflightTokenPromise) return _inflightTokenPromise;
+  if (!appVisible()) throw new Error('BACKGROUNDED');
+  if (!allowAuth) throw new Error(DRIVE_AUTH_REQUIRED);
+  const clientId = await getClientId();
+  if (!clientId) throw new Error('NO_CLIENT_ID');
+  return _beginOAuthRequest(clientId, epoch);
 }
 
 /* ---------- Drive REST ---------- */
@@ -880,7 +917,8 @@ function rebaseLocalChanges(before, current, candidate, maps) {
  */
 async function isEnabled() {
   const enabled = await CWDB.getMeta('driveEnabled');
-  return enabled == null ? !!(await CWDB.getMeta('lastDriveSync')) : enabled === true;
+  _driveEnabled = enabled == null ? !!(await CWDB.getMeta('lastDriveSync')) : enabled === true;
+  return _driveEnabled;
 }
 
 async function getConnectionState() {
@@ -906,11 +944,15 @@ function withDataLock(fn) {
 /* Serialize remote operations/OAuth, independently of the short local lock. */
 function runSync(interactive, operation, { allowAuth = interactive } = {}) {
   if (_disconnecting) return Promise.reject(new Error('DISCONNECTED'));
+  if (interactive && getTokenInteractive === _defaultGetTokenInteractive) {
+    warmTokenOnGesture({ force: true });
+  }
   const epoch = _connectionEpoch;
   const authenticate = async () => {
     if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
     if (interactive) {
       _consecutiveSilentFailures = 0;
+      _driveEnabled = true;
       await CWDB.setMeta('driveEnabled', true);
     } else if (!(await isEnabled())) throw new Error('DISCONNECTED');
     if (!isOnline()) throw new Error('OFFLINE');
@@ -1229,23 +1271,23 @@ async function queueAutoSync(reason = 'change') {
   if (_disconnecting || epoch !== _connectionEpoch) return;
   if (!CFG().autoSyncOnChange) return;
   if (autoSyncSuppressed()) return;
-  if (isLocalMutation) _autoSyncAllowAuth = true;
-  if (isLocalMutation && navigator.userActivation?.isActive && appVisible() && isOnline() && wifiOk()) {
-    getCachedToken().then((token) => {
-      if (!token && !_disconnecting && epoch === _connectionEpoch && appVisible()) {
-        getTokenSilent({ allowAuth: true }).catch(() => {});
-      }
-    }).catch(() => {});
+  if (isLocalMutation) {
+    _autoSyncAllowAuth = true;
+    _needsGestureSync = false;
   }
-  const debounce = Math.max(1000, Number(CFG().autoSyncDebounceMs) || 5000);
+  if (isLocalMutation && navigator.userActivation?.isActive && appVisible() && isOnline() && wifiOk()) {
+    warmTokenOnGesture();
+  }
+  const debounce = Math.max(1000, Number(CFG().autoSyncDebounceMs) || 1500);
   if (_autoSyncTimer) clearTimeout(_autoSyncTimer);
   setStatus('', '☁ queued…');
   _autoSyncTimer = setTimeout(async () => {
     _autoSyncTimer = null;
     if (_disconnecting || epoch !== _connectionEpoch) return;
     // The timer may well have been throttled while the app sat in the
-    // background and only fired now, still off-screen. Hold it over.
-    if (!appVisible()) { _syncPendingForeground = true; return; }
+    // background and only fired now, still off-screen. Hold it over unless an
+    // OAuth popup started by this gesture is currently in flight.
+    if (!appVisible() && !_inflightTokenPromise) { _syncPendingForeground = true; return; }
     const allowAuth = _autoSyncAllowAuth;
     _autoSyncAllowAuth = false;
     try {
@@ -1280,8 +1322,13 @@ function handleAutoSyncFailure(e) {
   const msg = String(e?.message || e);
   if (msg === 'NO_CLIENT_ID') { setStatus('', ''); return; }   // not configured
   if (msg === 'DISCONNECTED') { setStatus('', ''); return; }
-  if (msg === DRIVE_AUTH_REQUIRED) {
+  if (msg === DRIVE_AUTH_REQUIRED || msg === 'popup_failed_to_open') {
     _syncPendingForeground = false;
+    if (_lastSyncAt) {
+      _needsGestureSync = true;
+      setStatus('ok', '☁ synced');
+      return;
+    }
     setStatus('', '☁ tap to sync');
     return;
   }
@@ -1309,6 +1356,10 @@ async function startupSync() {
   const last = await CWDB.getMeta('lastDriveSync', 0);
   const lastChange = await CWDB.getMeta('lastLocalChangeAt', 0);
   if (last) _lastSyncAt = last;
+  await getCachedToken(clientId);
+  if (window.CWAPP && typeof navigator !== 'undefined' && !navigator.webdriver && isOnline()) {
+    ensureGis().catch(() => {});
+  }
   // Surface the pill even when suppressed, or a fresh launch would show no
   // sign at all that sync is broken.
   if (autoSyncSuppressed()) { setStatus('error', '☁ tap to fix'); return; }
@@ -1325,7 +1376,8 @@ async function startupSync() {
     const res = await syncNow({ interactive: false, allowAuth: false });
     await afterSync(res);
   } catch (e) {
-    if (String(e?.message || e) === DRIVE_AUTH_REQUIRED && !hasUnsyncedChanges) {
+    if (String(e?.message || e) === DRIVE_AUTH_REQUIRED && last) {
+      if (hasUnsyncedChanges) _needsGestureSync = true;
       setStatus('ok', '☁ synced');
       return;
     }
@@ -1336,6 +1388,8 @@ async function startupSync() {
 async function disconnect() {
   _disconnecting++;
   _connectionEpoch++;
+  _driveEnabled = false;
+  _needsGestureSync = false;
   _cancelTokenRequest?.();
   // An HTTP abort cannot undo a write already accepted by Drive. Drain the
   // operation instead, then allow a caller to reset local data under the lock.
@@ -1358,6 +1412,7 @@ function resetTokenClient() {
   _accessToken = null;
   _tokenExpiry = 0;
   _inflightTokenPromise = null;
+  _cachedClientId = '';
   _consecutiveSilentFailures = 0;
   CWDB?.setMeta?.('driveToken', null)?.catch?.(() => {});
 }
@@ -1569,12 +1624,32 @@ if (typeof window !== 'undefined') {
       }
     })();
   });
+
+  /* Preload GIS on pointer/key contact and flush any pending unsynced changes
+   * synchronously on the user's next click gesture. */
+  const preloadGisOnContact = () => {
+    if (!_driveEnabled || _disconnecting || _gisLoaded || !isOnline()) return;
+    if (typeof navigator !== 'undefined' && navigator.webdriver) return;
+    ensureGis().catch(() => {});
+  };
+  document.addEventListener?.('pointerdown', preloadGisOnContact, true);
+  document.addEventListener?.('touchstart', preloadGisOnContact, true);
+  document.addEventListener?.('keydown', preloadGisOnContact, true);
+  document.addEventListener?.('click', (e) => {
+    if (!_driveEnabled || _disconnecting || !_needsGestureSync) return;
+    const target = e?.target && typeof e.target.closest === 'function' ? e.target : null;
+    if (target?.closest('#syncPill, #driveSyncUp, #driveSyncDown, #driveDisconnect')) return;
+    if (!appVisible() || !isOnline() || !wifiOk()) return;
+    _needsGestureSync = false;
+    warmTokenOnGesture();
+    queueAutoSync('marked-change').catch(() => {});
+  }, true);
 }
 
 window.CWDRIVE = {
   syncNow, syncUp, syncDown, openSetupDialog, afterSync,
   mergeBackups, mergeCollection,
-  queueAutoSync, startupSync,
+  queueAutoSync, startupSync, warmTokenOnGesture,
   disconnect, getConnectionState, markLocalChange, withDataLock,
   isOnWifi, wifiOk,
   hasClientId: async () => !!(await getClientId()),

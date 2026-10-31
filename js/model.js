@@ -15,6 +15,7 @@
 
   function mutate(action) {
     if (!acceptingChanges) return Promise.reject(new Error('An update is being prepared. Please wait for the app to reload.'));
+    window.CWDRIVE?.warmTokenOnGesture?.();
     const run = pending.then(() => lock(async () => {
       const revision = await CWDB.getMeta('dataRevision', 0);
       if (refreshNeeded || window.CWAPP.dataRevision() !== revision) {
