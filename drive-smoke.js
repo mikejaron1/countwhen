@@ -50,7 +50,7 @@ global.fetch = async (url, opts = {}) => {
   const u = new URL(url);
   const p = u.pathname;
   const body = opts.body ? JSON.parse(opts.body) : null;
-  const ok = (obj) => ({ ok: true, status: 200, json: async () => obj, text: async () => '' });
+  const ok = (obj) => new Response(JSON.stringify(obj));
 
   if (p === '/drive/v3/files' && (!opts.method || opts.method === 'GET')) {
     const q = decodeURIComponent(u.searchParams.get('q') || '');

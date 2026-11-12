@@ -32,11 +32,26 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     await context.route('**/*', (route) => new URL(route.request().url()).hostname === '127.0.0.1'
       ? route.continue() : route.abort());
     const page = await context.newPage();
+    await page.route('https://accounts.google.com/gsi/client', (route) => route.fulfill({
+      contentType: 'text/javascript',
+      body: `window.google = { accounts: { oauth2: { initTokenClient(options) {
+        return { requestAccessToken() {
+          window.oauthGesture = navigator.userActivation.isActive;
+          window.oauthRequests = (window.oauthRequests || 0) + 1;
+          if (!window.oauthGesture) throw new Error('Authorization lost the user gesture');
+          window.oauthReply = () => options.callback({ access_token: 'gesture-token', expires_in: 3600 });
+        } };
+      } } } };`,
+    }));
     const errors = [];
-    let authorizationRequests = 0, authorizationPopups = 0;
+    let authorizationRequests = 0, authorizationPopups = 0, gisRequests = 0;
     page.on('pageerror', (error) => errors.push(error.message));
     page.on('request', (request) => {
-      if (new URL(request.url()).hostname === 'accounts.google.com') authorizationRequests++;
+      const url = new URL(request.url());
+      if (url.hostname === 'accounts.google.com') {
+        if (url.pathname === '/gsi/client') gisRequests++;
+        else authorizationRequests++;
+      }
     });
     page.on('popup', () => { authorizationPopups++; });
     await page.goto(`http://127.0.0.1:${server.address().port}/app/`);
@@ -99,9 +114,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       && document.querySelector('#syncActivity').hidden);
     assert.equal(authorizationRequests, 0);
     assert.equal(authorizationPopups, 0);
+    await page.waitForFunction(() => !!window.google?.accounts?.oauth2);
+    assert.equal(gisRequests, 1);
+    assert.equal(await page.evaluate(() => window.oauthRequests || 0), 0);
 
-    // Once synced, the header shows both the synced pill and when it was last
-    // synced — even if local edits happened since the last sync.
+    // Pending local edits must not be labelled synced just because an older
+    // successful sync exists. The last-synced timestamp remains visible.
     await page.evaluate(async () => {
       const fiveMinAgo = Date.now() - 5 * 60 * 1000;
       await CWDB.setMeta('lastDriveSync', fiveMinAgo);
@@ -109,9 +127,45 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       await CWMODEL.refresh();
       await CWDRIVE.startupSync();
     });
-    assert.equal(await page.locator('#syncPill').textContent(), '☁ synced');
+    assert.equal(await page.locator('#syncPill').textContent(), '☁ waiting to sync');
     assert.equal(await page.locator('#syncActivity').isHidden(), false);
     assert.equal(await page.locator('#syncActivity').textContent(), 'Last synced 5m ago');
+
+    // Token renewal starts in the actual event tap, and local saves complete
+    // while authorization is waiting. The debounced upload uses its result.
+    await page.evaluate(async (id) => {
+      window.gestureSyncHooks = { findOrCreateFolder, statSyncFile, readSyncFile,
+        updateSyncFile, createSyncFile, rotateVersions, maybeCleanupLegacyArtifacts };
+      window.gestureRemote = await CWIO.buildExportObject();
+      await CWDB.setMeta('driveSyncBase', gestureRemote);
+      window.gestureRevision = 1;
+      findOrCreateFolder = async () => 'gesture-folder';
+      statSyncFile = async () => ({ id: 'gesture-file', version: String(gestureRevision),
+        md5Checksum: String(gestureRevision), modifiedTime: '2026-01-01T00:00:00Z' });
+      readSyncFile = async () => JSON.parse(JSON.stringify(gestureRemote));
+      updateSyncFile = async (id, obj) => {
+        gestureRemote = JSON.parse(JSON.stringify(obj));
+        gestureRevision++;
+        return statSyncFile();
+      };
+      createSyncFile = async (folder, obj) => updateSyncFile('gesture-file', obj);
+      rotateVersions = async () => {};
+      maybeCleanupLegacyArtifacts = async () => {};
+      await CWDB.setQuickBar([id]);
+      await CWMODEL.refresh();
+    }, waterId);
+    const beforeGestureEvents = await page.evaluate(() => state.events.length);
+    await page.locator(`[data-quick="${waterId}"]`).click();
+    await page.evaluate(() => CWMODEL.whenIdle());
+    assert.equal(await page.evaluate(() => state.events.length), beforeGestureEvents + 1);
+    assert.equal(await page.evaluate(() => window.oauthRequests), 1);
+    assert.equal(await page.evaluate(() => window.oauthGesture), true);
+    await page.waitForFunction(() => _pendingOperations > 0);
+    await page.evaluate(() => window.oauthReply());
+    await page.waitForFunction(() => _pendingOperations === 0
+      && document.querySelector('#syncPill').textContent === '☁ synced');
+    assert.equal(await page.evaluate(() => gestureRemote.events.length), beforeGestureEvents + 1);
+    await page.evaluate(() => Object.assign(window, gestureSyncHooks));
     await page.evaluate(() => CWDRIVE.disconnect());
     assert.equal(await page.locator('#syncActivity').isHidden(), true);
 

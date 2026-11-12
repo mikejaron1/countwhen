@@ -24,6 +24,25 @@ function deferred() {
   return { promise, resolve };
 }
 
+function manualTimers(h) {
+  const timers = new Map();
+  let nextId = 0;
+  h.browser.setTimeout = (callback, delay) => {
+    timers.set(++nextId, { callback, delay });
+    return nextId;
+  };
+  h.browser.clearTimeout = (id) => timers.delete(id);
+  return {
+    expire(delay) {
+      const entry = [...timers].find(([, timer]) => timer.delay === delay);
+      assert.ok(entry, `expected a ${delay}ms timeout`);
+      timers.delete(entry[0]);
+      entry[1].callback();
+    },
+    timers,
+  };
+}
+
 async function completesWhileBlocked(promise) {
   let timer;
   try {
@@ -52,7 +71,7 @@ function harness(initial = backup(), remote = clone(initial)) {
     md5Checksum: String(state.revision),
   } : null;
   const browser = {
-    console, setTimeout, clearTimeout, URL, Blob,
+    console, setTimeout, clearTimeout, URL, Blob, AbortController, Response,
     navigator: { onLine: true, locks: { request(name, opts, fn) {
       state.locks.push([name, opts.mode]);
       const result = lockQueue.then(async () => {
@@ -148,10 +167,20 @@ async function storageHarness() {
 }
 
 let failures = 0;
+let runningTest = null;
+process.once('beforeExit', () => {
+  if (!runningTest) return;
+  console.error('FAIL  unfinished async test: ' + runningTest);
+  process.exitCode = 1;
+});
 async function test(name, fn) {
+  runningTest = name;
   try { await fn(); console.log('  ok  ' + name); }
   catch (e) { failures++; console.error('FAIL  ' + name + '\n' + e.stack); }
-  finally { while (storageWindows.length) storageWindows.pop().close(); }
+  finally {
+    while (storageWindows.length) storageWindows.pop().close();
+    runningTest = null;
+  }
 }
 
 (async () => {
@@ -990,14 +1019,13 @@ async function test(name, fn) {
     assert.match(h.state.statuses.at(-1).detail.message, /tap to sync/);
     assert.equal(vm.runInContext('autoSyncSuppressed()', h.browser), false);
     // Even when unsynced local changes exist on a previously synced device,
-    // startup without an in-memory token keeps the synced pill (next to Last
-    // synced ...) and arms gesture-backed sync rather than nagging tap to sync.
+    // startup without a token must not label pending local changes as synced.
     h.meta.set('lastDriveSync', Date.now() - 5 * 60 * 1000);
     h.meta.set('lastLocalChangeAt', Date.now() - 1 * 60 * 1000);
     await h.api.startupSync();
     assert.equal(gisLoads, 0);
-    assert.equal(h.state.statuses.at(-1).detail.status, 'ok');
-    assert.equal(h.state.statuses.at(-1).detail.message, '☁ synced');
+    assert.equal(h.state.statuses.at(-1).detail.status, '');
+    assert.equal(h.state.statuses.at(-1).detail.message, '☁ waiting to sync');
     // When GIS is already loaded, warmTokenOnGesture starts requestAccessToken
     // synchronously on the click call stack before any async work.
     let syncRequested = false;
@@ -1072,6 +1100,126 @@ async function test(name, fn) {
     await assert.rejects(h.browser.window.originalTokenRequest(true), /popup_closed/);
     await assert.rejects(h.browser.window.originalTokenRequest(true), /popup_closed/);
     assert.equal(initialized, 2);
+  });
+  await test('concurrent GIS loads wait for readiness; failed and stalled scripts can retry', async () => {
+    for (const failure of ['error', 'timeout', 'missing-api']) {
+      const h = harness();
+      const clock = manualTimers(h);
+      const dom = new JSDOM('');
+      storageWindows.push(dom.window);
+      h.browser.document = dom.window.document;
+      const first = vm.runInContext('ensureGis()', h.browser);
+      const second = vm.runInContext('ensureGis()', h.browser);
+      const rejected = assert.rejects(first, /Failed to load Google sign-in/);
+      assert.equal(first, second, 'concurrent callers must share the load, not assume script presence means ready');
+      const script = dom.window.document.querySelector('script');
+      assert.ok(script);
+      assert.equal(vm.runInContext('_gisLoaded', h.browser), false);
+      if (failure === 'timeout') clock.expire(15000);
+      else script.dispatchEvent(new dom.window.Event(failure === 'error' ? 'error' : 'load'));
+      await rejected;
+      assert.equal(dom.window.document.querySelector('script'), null);
+      const retry = vm.runInContext('ensureGis()', h.browser);
+      h.browser.google = { accounts: { oauth2: {} } };
+      dom.window.document.querySelector('script').dispatchEvent(new dom.window.Event('load'));
+      await retry;
+      assert.equal(vm.runInContext('_gisLoaded', h.browser), true);
+      assert.equal(clock.timers.size, 0);
+    }
+  });
+  await test('a missing OAuth callback times out, releases sync, and ignores late popup responses', async () => {
+    const h = harness();
+    const clock = manualTimers(h), requests = [];
+    h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
+      requests.push(options);
+      return { requestAccessToken() {} };
+    } } } };
+    vm.runInContext(`_gisLoaded = true;
+      getTokenInteractive = _defaultGetTokenInteractive; getTokenSilent = _defaultGetTokenSilent;`, h.browser);
+    const failed = assert.rejects(h.api.syncNow({ interactive: true }), /Drive sign-in timed out/);
+    assert.equal(requests.length, 1);
+    await new Promise(setImmediate);
+    clock.expire(120000);
+    await failed;
+    await vm.runInContext('_syncQueue', h.browser);
+    assert.equal(h.state.statuses.at(-1).detail.pending, false);
+    assert.equal(h.state.writes, 0);
+    const retry = h.api.syncNow({ interactive: true });
+    assert.equal(requests.length, 2);
+    requests[0].callback({ access_token: 'stale-token', expires_in: 3600 });
+    requests[0].error_callback({ type: 'popup_closed' });
+    assert.equal(h.meta.get('driveToken'), undefined);
+    requests[1].callback({ access_token: 'retry-token', expires_in: 3600 });
+    await retry;
+    await vm.runInContext('_syncQueue', h.browser);
+    assert.equal(h.meta.get('driveToken').accessToken, 'retry-token');
+    assert.equal(h.state.writes, 1);
+    assert.equal(h.state.statuses.at(-1).detail.pending, false);
+    assert.equal(clock.timers.size, 0);
+  });
+  await test('disconnect cancels OAuth while GIS is still loading without opening a late popup', async () => {
+    const h = harness();
+    const clock = manualTimers(h);
+    const loading = deferred();
+    h.browser.loading = loading.promise;
+    vm.runInContext(`ensureGis = () => loading; getTokenInteractive = _defaultGetTokenInteractive;`, h.browser);
+    const failed = assert.rejects(h.api.syncNow({ interactive: true }), /DISCONNECTED/);
+    await h.api.disconnect();
+    await failed;
+    let popups = 0;
+    h.browser.google = { accounts: { oauth2: { initTokenClient() {
+      popups++;
+      return { requestAccessToken() {} };
+    } } } };
+    loading.resolve();
+    await Promise.resolve();
+    assert.equal(popups, 0);
+    assert.equal(h.state.writes, 0);
+    assert.equal(clock.timers.size, 0);
+  });
+  await test('stalled Drive headers and bodies abort, release the queue, and preserve upload recovery', async () => {
+    for (const phase of ['headers', 'body', 'error-body', 'accepted-body']) {
+      const h = harness();
+      h.state.local.events.push(event(20));
+      const clock = manualTimers(h), started = deferred();
+      let signal;
+      h.browser.fetch = async (url, opts) => {
+        signal = opts.signal;
+        if (phase === 'accepted-body') {
+          h.state.remote = JSON.parse(opts.body);
+          h.state.revision++;
+        }
+        const stalled = () => new Promise((resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+          started.resolve();
+        });
+        if (phase === 'headers') return stalled();
+        if (phase === 'error-body') return { ok: false, status: 503, text: stalled };
+        return { ok: true, status: 200, arrayBuffer: stalled };
+      };
+      vm.runInContext(`updateSyncFile = (id, obj) => driveFetch('/upload/drive/v3/files/' + id,
+        { method: 'PATCH', body: JSON.stringify(obj) });`, h.browser);
+      const failed = assert.rejects(h.api.syncNow(), /Drive request timed out/);
+      await started.promise;
+      clock.expire(30000);
+      await failed;
+      await vm.runInContext('_syncQueue', h.browser);
+      assert.equal(signal.aborted, true);
+      assert.equal(h.state.statuses.at(-1).detail.pending, false);
+      assert.equal(h.meta.get('lastDriveSync'), undefined);
+      assert.equal(h.meta.get('drivePendingSnapshot').status, 'pending');
+      assert.equal(h.meta.get('driveSyncBase').events.length, 0);
+      assert.equal(vm.runInContext('_backgroundSync.size', h.browser), 0);
+      vm.runInContext(`handleAutoSyncFailure(new Error('Drive request timed out. Tap Sync to retry.'));
+        updateSyncFile = hooks.write;`, h.browser);
+      assert.equal(vm.runInContext('autoSyncSuppressed()', h.browser), false);
+      await h.api.syncNow();
+      await vm.runInContext('_syncQueue', h.browser);
+      assert.equal(h.meta.get('drivePendingSnapshot').status, 'confirmed');
+      assert.deepEqual(h.state.remote.events, [event(20)]);
+      assert.equal(h.state.statuses.at(-1).detail.pending, false);
+      assert.equal(clock.timers.size, 0);
+    }
   });
   await test('status event dispatch does not require a header pill', async () => {
     const h = harness(); await h.api.syncNow();

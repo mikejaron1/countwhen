@@ -390,7 +390,10 @@ Once you explicitly connect, the app caches your Drive access token on that
 device until it expires, syncs at launch when a cached token is still valid, and
 auto-syncs after local changes (creating or editing events/settings), renewing the
 token when needed without opening popups on passive startups. If silent renewal is
-blocked, the pill shows **tap to sync**; tap it or **Sync now** to authorize again.
+blocked, pending changes show **waiting to sync** (or **tap to sync** before the
+first successful sync); tap the pill or **Sync now** to authorize again.
+Stalled sign-in and network requests time out so you can retry instead of leaving
+sync stuck. Pending changes and recovery copies are retained for the next attempt.
 Local logging works without Drive authorization. Disconnecting disables automatic
 sync on that device without deleting the remote backup.
 

@@ -51,6 +51,7 @@ const LEGACY_APP_META_KEYS = ['_countwhen', '_wdapp'];
 const CFG = () => window.CW_CONFIG || {};
 
 let _gisLoaded = false;
+let _gisPromise = null;
 let _tokenClient = null;
 let _accessToken = null;
 let _tokenExpiry = 0;
@@ -79,6 +80,9 @@ let _lastStatus = { ..._requestedStatus, pending: false, phase: 'idle', lastSync
  * status pill churning. Cleared by a successful token grant, by an explicit
  * interactive sync, or by a client ID change. */
 const MAX_SILENT_AUTH_FAILURES = 2;
+const GIS_LOAD_TIMEOUT_MS = 15000;
+const DRIVE_AUTH_TIMEOUT_MS = 120000;
+const DRIVE_REQUEST_TIMEOUT_MS = 30000;
 
 function autoSyncSuppressed() {
   return _consecutiveSilentFailures >= MAX_SILENT_AUTH_FAILURES;
@@ -86,22 +90,44 @@ function autoSyncSuppressed() {
 
 /* ---------- helpers ---------- */
 
-function loadScript(src) {
-  return new Promise((resolve, reject) => {
+function ensureGis() {
+  if (typeof google !== 'undefined' && google.accounts?.oauth2) {
+    _gisLoaded = true;
+    return Promise.resolve();
+  }
+  if (_gisPromise) return _gisPromise;
+  _gisLoaded = false;
+  const src = 'https://accounts.google.com/gsi/client';
+  const pending = new Promise((resolve, reject) => {
     const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) return resolve();
-    const s = document.createElement('script');
-    s.src = src; s.async = true; s.defer = true;
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error('Failed to load ' + src));
-    document.head.appendChild(s);
+    const script = existing || document.createElement('script');
+    const finish = (error) => {
+      clearTimeout(timer);
+      script.removeEventListener('load', loaded);
+      script.removeEventListener('error', failed);
+      if (error) {
+        script.remove();
+        reject(error);
+      } else {
+        _gisLoaded = true;
+        resolve();
+      }
+    };
+    const failed = () => finish(new Error('Failed to load Google sign-in. Tap Sync to retry.'));
+    const loaded = () => {
+      if (typeof google === 'undefined' || !google.accounts?.oauth2) failed();
+      else finish();
+    };
+    const timer = setTimeout(failed, GIS_LOAD_TIMEOUT_MS);
+    script.addEventListener('load', loaded);
+    script.addEventListener('error', failed);
+    if (!existing) {
+      script.src = src; script.async = true; script.defer = true;
+      document.head.appendChild(script);
+    }
   });
-}
-
-async function ensureGis() {
-  if (_gisLoaded) return;
-  await loadScript('https://accounts.google.com/gsi/client');
-  _gisLoaded = true;
+  _gisPromise = pending.finally(() => { _gisPromise = null; });
+  return _gisPromise;
 }
 
 function getClientId() {
@@ -198,42 +224,61 @@ async function clearCachedToken() {
 
 function _beginOAuthRequest(clientId, epoch = _connectionEpoch) {
   if (_inflightTokenPromise) return _inflightTokenPromise;
-  const startClient = () => {
-    if (epoch !== _connectionEpoch) return Promise.reject(new Error('DISCONNECTED'));
-    if (!appVisible()) return Promise.reject(new Error('BACKGROUNDED'));
-    return new Promise((resolve, reject) => {
-      _cancelTokenRequest = () => reject(new Error('DISCONNECTED'));
-      // Both callbacks must belong to this request. Reusing only `callback`
-      // leaves error_callback rejecting an already-settled previous promise.
-      _tokenClient = google.accounts.oauth2.initTokenClient({
-        client_id: clientId,
-        scope: DRIVE_SCOPES,
-        callback: (resp) => {
-          if (epoch !== _connectionEpoch) return reject(new Error('DISCONNECTED'));
-          if (resp.error) return reject(new Error(resp.error));
-          _accessToken = resp.access_token;
-          _tokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
-          _consecutiveSilentFailures = 0;
-          _needsGestureSync = false;
-          CWDB.setMeta('driveToken', {
-            accessToken: _accessToken,
-            tokenExpiry: _tokenExpiry,
-            clientId,
-          }).catch(() => {});
-          resolve(_accessToken);
-        },
-        error_callback: (err) => reject(new Error(err.type || 'oauth_error')),
-      });
-      _tokenClient._clientId = clientId;
+  let cancel;
+  const pending = new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, token) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (_cancelTokenRequest === cancel) _cancelTokenRequest = null;
+      if (error) reject(error);
+      else resolve(token);
+    };
+    const timer = setTimeout(() => finish(new Error('Drive sign-in timed out. Tap Sync to retry.')),
+      DRIVE_AUTH_TIMEOUT_MS);
+    cancel = () => finish(new Error('DISCONNECTED'));
+    _cancelTokenRequest = cancel;
+    const startClient = () => {
+      if (settled) return;
+      if (epoch !== _connectionEpoch) { cancel(); return; }
+      if (!appVisible()) { finish(new Error('BACKGROUNDED')); return; }
       try {
+        // Both callbacks must belong to this request. Reusing only `callback`
+        // leaves error_callback rejecting an already-settled previous promise.
+        _tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: DRIVE_SCOPES,
+          callback: (resp) => {
+            // A timed-out popup may answer after a retry has already succeeded.
+            if (settled) return;
+            if (epoch !== _connectionEpoch) { cancel(); return; }
+            if (resp.error) { finish(new Error(resp.error)); return; }
+            if (!resp.access_token) { finish(new Error('oauth_error')); return; }
+            _accessToken = resp.access_token;
+            _tokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
+            _consecutiveSilentFailures = 0;
+            _needsGestureSync = false;
+            CWDB.setMeta('driveToken', {
+              accessToken: _accessToken,
+              tokenExpiry: _tokenExpiry,
+              clientId,
+            }).catch(() => {});
+            finish(null, _accessToken);
+          },
+          error_callback: (err) => finish(new Error(err.type || 'oauth_error')),
+        });
+        _tokenClient._clientId = clientId;
         _tokenClient.requestAccessToken({ prompt: '' });
-      } catch (e) { reject(e); }
-    }).finally(() => { _cancelTokenRequest = null; });
-  };
-  const p = (_gisLoaded && typeof google !== 'undefined' && google.accounts?.oauth2)
-    ? startClient()
-    : ensureGis().then(startClient);
-  _inflightTokenPromise = p.finally(() => { _inflightTokenPromise = null; });
+      } catch (e) { finish(e); }
+    };
+    if (_gisLoaded && typeof google !== 'undefined' && google.accounts?.oauth2) startClient();
+    else ensureGis().then(startClient, (error) => finish(error));
+  });
+  const request = pending.finally(() => {
+    if (_inflightTokenPromise === request) _inflightTokenPromise = null;
+  });
+  _inflightTokenPromise = request;
   return _inflightTokenPromise;
 }
 
@@ -250,7 +295,10 @@ function warmTokenOnGesture({ force = false } = {}) {
   const clientId = _cachedClientId || (CFG().driveClientId || '').trim();
   if (!clientId) return null;
   const p = _beginOAuthRequest(clientId, _connectionEpoch);
-  p.catch(() => {});
+  const epoch = _connectionEpoch;
+  p.catch((error) => {
+    if (epoch === _connectionEpoch && !_pendingOperations) handleAutoSyncFailure(error);
+  });
   return p;
 }
 
@@ -281,16 +329,35 @@ async function _requestToken(interactive, { allowAuth = interactive } = {}) {
 async function driveFetch(path, opts = {}) {
   const token = _accessToken;
   const headers = { ...(opts.headers || {}), Authorization: `Bearer ${token}` };
-  const resp = await fetch(`https://www.googleapis.com${path}`, { ...opts, headers });
-  if (!resp.ok) {
-    if (resp.status === 401) {
-      await clearCachedToken();
-      throw new Error(DRIVE_AUTH_REQUIRED);
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, DRIVE_REQUEST_TIMEOUT_MS);
+  try {
+    const resp = await fetch(`https://www.googleapis.com${path}`, {
+      ...opts, headers, signal: controller.signal,
+    });
+    if (!resp.ok) {
+      if (resp.status === 401) {
+        await clearCachedToken();
+        throw new Error(DRIVE_AUTH_REQUIRED);
+      }
+      const txt = await resp.text();
+      throw new Error(`Drive ${resp.status}: ${txt.slice(0, 200)}`);
     }
-    const txt = await resp.text();
-    throw new Error(`Drive ${resp.status}: ${txt.slice(0, 200)}`);
+    // Keep the timeout active through the body download, not just the headers.
+    const body = await resp.arrayBuffer();
+    return new Response(resp.status === 204 || resp.status === 205 ? null : body, {
+      status: resp.status, statusText: resp.statusText, headers: resp.headers,
+    });
+  } catch (error) {
+    if (timedOut) throw new Error('Drive request timed out. Tap Sync to retry.');
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  return resp;
 }
 
 async function findOrCreateFolder() {
@@ -955,6 +1022,7 @@ function runSync(interactive, operation, { allowAuth = interactive } = {}) {
       _driveEnabled = true;
       await CWDB.setMeta('driveEnabled', true);
     } else if (!(await isEnabled())) throw new Error('DISCONNECTED');
+    if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
     if (!isOnline()) throw new Error('OFFLINE');
     if (!interactive && !wifiOk()) throw new Error('CELLULAR_BLOCKED');
     await (interactive ? getTokenInteractive() : getTokenSilent({ allowAuth }));
@@ -1326,7 +1394,7 @@ function handleAutoSyncFailure(e) {
     _syncPendingForeground = false;
     if (_lastSyncAt) {
       _needsGestureSync = true;
-      setStatus('ok', '☁ synced');
+      setStatus('', '☁ waiting to sync');
       return;
     }
     setStatus('', '☁ tap to sync');
@@ -1337,7 +1405,7 @@ function handleAutoSyncFailure(e) {
   // Not a failure at all — the app went off-screen before we could ask for a
   // token. Retry when it comes back; don't burn a silent-failure slot.
   if (msg === 'BACKGROUNDED') { _syncPendingForeground = true; return; }
-  if (/^(REMOTE_|LOCAL_|TIMER_|INVALID_|Drive |Failed to fetch|NetworkError)/.test(msg)) {
+  if (/^(REMOTE_|LOCAL_|TIMER_|INVALID_|Drive |Failed to fetch|Failed to load Google|NetworkError)/.test(msg)) {
     setStatus('error', /^(REMOTE_|LOCAL_|TIMER_)/.test(msg) ? '☁ conflict — retry sync' : '☁ sync failed — retry');
     return;
   }
@@ -1357,8 +1425,8 @@ async function startupSync() {
   const lastChange = await CWDB.getMeta('lastLocalChangeAt', 0);
   if (last) _lastSyncAt = last;
   await getCachedToken(clientId);
-  if (window.CWAPP && typeof navigator !== 'undefined' && !navigator.webdriver && isOnline()) {
-    ensureGis().catch(() => {});
+  if (window.CWAPP && isOnline()) {
+    ensureGis().catch((error) => console.warn('Drive sign-in preload failed:', error));
   }
   // Surface the pill even when suppressed, or a fresh launch would show no
   // sign at all that sync is broken.
@@ -1378,7 +1446,7 @@ async function startupSync() {
   } catch (e) {
     if (String(e?.message || e) === DRIVE_AUTH_REQUIRED && last) {
       if (hasUnsyncedChanges) _needsGestureSync = true;
-      setStatus('ok', '☁ synced');
+      setStatus(hasUnsyncedChanges ? '' : 'ok', hasUnsyncedChanges ? '☁ waiting to sync' : '☁ synced');
       return;
     }
     handleAutoSyncFailure(e);
@@ -1597,11 +1665,13 @@ function openSetupDialog(ctx) {
 if (typeof window !== 'undefined') {
   window.addEventListener('online', () => {
     if (_autoSyncTimer) return;
-    queueAutoSync('online');
+    window.CWDRIVE.queueAutoSync('online').catch(handleAutoSyncFailure);
   });
   const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
   conn?.addEventListener?.('change', () => {
-    if (wifiOk() && !_autoSyncTimer) queueAutoSync('connection');
+    if (wifiOk() && !_autoSyncTimer) {
+      window.CWDRIVE.queueAutoSync('connection').catch(handleAutoSyncFailure);
+    }
   });
 
   /* ---------- back on screen → run whatever we held over ---------- */
@@ -1629,8 +1699,7 @@ if (typeof window !== 'undefined') {
    * synchronously on the user's next click gesture. */
   const preloadGisOnContact = () => {
     if (!_driveEnabled || _disconnecting || _gisLoaded || !isOnline()) return;
-    if (typeof navigator !== 'undefined' && navigator.webdriver) return;
-    ensureGis().catch(() => {});
+    ensureGis().catch((error) => console.warn('Drive sign-in preload failed:', error));
   };
   document.addEventListener?.('pointerdown', preloadGisOnContact, true);
   document.addEventListener?.('touchstart', preloadGisOnContact, true);
@@ -1642,7 +1711,7 @@ if (typeof window !== 'undefined') {
     if (!appVisible() || !isOnline() || !wifiOk()) return;
     _needsGestureSync = false;
     warmTokenOnGesture();
-    queueAutoSync('marked-change').catch(() => {});
+    window.CWDRIVE.queueAutoSync('marked-change').catch(handleAutoSyncFailure);
   }, true);
 }
 
