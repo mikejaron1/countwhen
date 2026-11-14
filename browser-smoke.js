@@ -10,6 +10,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
   '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.ico': 'image/x-icon' };
 
 (async () => {
+  let shellRelease = null;
   const server = http.createServer((request, response) => {
     const pathname = new URL(request.url, 'http://localhost').pathname;
     const file = path.resolve(ROOT, '.' + (pathname.endsWith('/') ? pathname + 'index.html' : pathname));
@@ -17,6 +18,13 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       response.writeHead(404); response.end(); return;
     }
     response.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    if (shellRelease && ['/js/version.js', '/js/drive.js'].includes(pathname)) {
+      const source = fs.readFileSync(file, 'utf8');
+      response.end(pathname === '/js/version.js'
+        ? source.replace(/CW_RELEASE = '[^']+'/, `CW_RELEASE = '${shellRelease}'`)
+        : `globalThis.__smokeDriveRelease = ${JSON.stringify(shellRelease)};\n${source}`);
+      return;
+    }
     fs.createReadStream(file).pipe(response);
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -175,12 +183,14 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       topicid: waterId, time: Date.now() - 60000, qant: 3, note: 'Pulled in after retry' };
     restRemote.events.push(remoteEvent);
     restRemote.eventcount = restRemote.events.length;
-    let restRevision = 1, restWrites = 0, transientReads = 0, restModifiedAt = Date.now();
+    let restRevision = 1, restWrites = 0, transientReads = 0, restModifiedAt = Date.now(), rejectUpload = false;
     const restMeta = (name = 'plotline.json') => ({
       id: name === 'plotline.json' ? 'rest-primary' : 'rest-snapshot', name,
       version: String(restRevision), modifiedTime: new Date(restModifiedAt).toISOString(),
+      parents: ['rest-folder'], mimeType: 'application/json', trashed: false,
       md5Checksum: require('node:crypto').createHash('md5').update(JSON.stringify(restRemote)).digest('hex'),
     });
+    const indexedMeta = restMeta();
     await page.route('https://www.googleapis.com/**', async (route) => {
       const request = route.request(), url = new URL(request.url());
       const reply = (data, status = 200) => route.fulfill({ status,
@@ -195,14 +205,25 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       }
       if (url.pathname === '/drive/v3/files') {
         const name = /name='([^']+)'/.exec(url.searchParams.get('q') || '')?.[1];
+        if (!url.searchParams.has('pageToken')) {
+          return reply({ files: [], nextPageToken: 'second-page' });
+        }
         const files = name === 'Plotline' ? [{ id: 'rest-folder', name }]
-          : ['plotline.json', 'plotline-1.json'].includes(name) ? [restMeta(name)] : [];
+          : name === 'plotline.json' ? [indexedMeta]
+            : name === 'plotline-1.json' ? [restMeta(name)] : [];
         return reply({ files });
       }
-      if (url.pathname === '/drive/v3/files/rest-primary' && url.searchParams.get('alt') === 'media') {
-        return reply(restRemote);
+      if (url.pathname === '/drive/v3/files/rest-folder') {
+        return reply({ id: 'rest-folder', mimeType: 'application/vnd.google-apps.folder', trashed: false });
+      }
+      if (url.pathname === '/drive/v3/files/rest-primary') {
+        return reply(url.searchParams.get('alt') === 'media' ? restRemote : restMeta());
+      }
+      if (/^\/drive\/v3\/files\/[^/]+$/.test(url.pathname)) {
+        return reply({ error: { message: 'File not found', errors: [{ reason: 'notFound' }] } }, 404);
       }
       if (url.pathname === '/upload/drive/v3/files/rest-primary' && request.method() === 'PATCH') {
+        if (rejectUpload) return reply({ error: { message: 'The backup could not be uploaded.' } }, 400);
         restRemote = request.postDataJSON();
         restRevision++;
         restModifiedAt++;
@@ -217,6 +238,7 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       await CWDB.setMeta('driveToken', { accessToken: _accessToken, tokenExpiry: _tokenExpiry });
       await CWDB.setMeta('lastDriveSync', last);
       await CWDB.setMeta('lastLocalChangeAt', last + 1000);
+      await CWDB.setMeta('driveFolderId', 'rest-folder');
       await CWDB.setMeta('driveLegacyCleanupDone', true);
       await CWMODEL.refresh();
       await CWDRIVE.startupSync();
@@ -244,6 +266,29 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     assert.equal(await page.locator('#syncActivity').textContent(), 'Last synced just now');
     assert.equal(await page.evaluate(async () => (await CWDRIVE.getConnectionState()).error), '');
     assert.equal(await page.evaluate(async () => (await CWDB.getMeta('drivePendingSnapshot')).status), 'confirmed');
+    rejectUpload = true;
+    await page.locator('#syncPill').click();
+    await page.getByRole('dialog').waitFor();
+    assert.match(await page.locator('#driveError').textContent(), /The backup could not be uploaded/);
+    assert.match(await page.locator('#driveFailureStep').textContent(), /uploading the backup/);
+    assert.equal(await page.evaluate(async () => (await CWDB.getMeta('driveLastFailure')).step), 'uploading the backup');
+    await page.keyboard.press('Escape');
+    await page.evaluate(() => {
+      window.headerSyncOriginal = CWDRIVE.syncNow;
+      CWDRIVE.syncNow = () => new Promise((resolve, reject) => { window.rejectHeaderSync = reject; });
+    });
+    await page.locator('#syncPill').click();
+    await page.evaluate((id) => openAddEvent(state.topics.find((topic) => topic.id === id)), waterId);
+    await page.locator('#evNote').fill('Unsaved editor must survive a late sync failure');
+    await page.evaluate(() => rejectHeaderSync(new Error('Synthetic late sync failure')));
+    assert.equal(await page.locator('#evNote').inputValue(), 'Unsaved editor must survive a late sync failure');
+    await page.keyboard.press('Escape');
+    await page.evaluate(() => { CWDRIVE.syncNow = headerSyncOriginal; });
+    rejectUpload = false;
+    await page.locator('#syncPill').click();
+    await page.waitForFunction(() => _pendingOperations === 0
+      && document.querySelector('#syncPill').textContent === '☁ synced');
+    assert.equal(await page.evaluate(() => CWDB.getMeta('driveLastFailure')), null);
     await page.unroute('https://www.googleapis.com/**');
     await page.evaluate(() => CWDRIVE.disconnect());
     assert.equal(await page.locator('#syncActivity').isHidden(), true);
@@ -547,6 +592,51 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     assert.ok(await page.evaluate(async (before) => (await CWDB.getMeta('dataRevision')) > before, beforeResetRevision));
     assert.deepEqual(errors, []);
     await context.close();
+
+    // Install a complete old shell, update it, and reload offline through the
+    // real service worker. Existing data and authorization must survive.
+    const currentRelease = /CW_RELEASE = '([^']+)'/.exec(
+      fs.readFileSync(path.join(ROOT, 'js/version.js'), 'utf8'))[1];
+    shellRelease = '8.0.7';
+    const upgradeContext = await browser.newContext();
+    await upgradeContext.route('**/*', (route) => new URL(route.request().url()).hostname === '127.0.0.1'
+      ? route.continue() : route.abort());
+    const upgradePage = await upgradeContext.newPage(), upgradeErrors = [];
+    upgradePage.on('pageerror', (error) => upgradeErrors.push(error.message));
+    await upgradePage.goto(`http://127.0.0.1:${server.address().port}/app/`);
+    await upgradePage.locator('[data-preset="habits"]').click();
+    await upgradePage.evaluate(() => CWMODEL.whenIdle());
+    await upgradePage.evaluate(() => navigator.serviceWorker.ready);
+    await upgradePage.reload();
+    await upgradePage.waitForFunction(() => !!navigator.serviceWorker.controller && !!window.CWMODEL);
+    assert.equal(await upgradePage.evaluate(() => globalThis.CW_RELEASE), '8.0.7');
+    assert.equal(await upgradePage.evaluate(() => globalThis.__smokeDriveRelease), '8.0.7');
+    const upgradeWater = await upgradePage.evaluate(() => state.topics.find((topic) => topic.name === 'Water').id);
+    await upgradePage.evaluate((id) => CWMODEL.mutate(() => saveQuickBar([id])), upgradeWater);
+    await upgradePage.locator(`[data-quick="${upgradeWater}"]`).click();
+    await upgradePage.evaluate(() => CWMODEL.whenIdle());
+    shellRelease = currentRelease;
+    await upgradePage.evaluate(async () => (await navigator.serviceWorker.getRegistration()).update());
+    await upgradePage.locator('#installUpdate').waitFor({ state: 'visible' });
+    const beforeUpgrade = await upgradePage.evaluate(async () => {
+      await CWDB.setMeta('driveEnabled', true);
+      await CWDB.setMeta('driveToken', { accessToken: 'upgrade-token', tokenExpiry: Date.now() + 3600000,
+        clientId: CW_CONFIG.driveClientId });
+      await CWDB.setMeta('lastDriveSync', Date.now() - 86400000);
+      return JSON.stringify(await CWDB.getAll('events'));
+    });
+    await upgradeContext.setOffline(true);
+    await Promise.all([upgradePage.waitForNavigation(), upgradePage.locator('#installUpdate').click()]);
+    await upgradePage.waitForFunction((release) => window.CWMODEL && globalThis.CW_RELEASE === release, currentRelease);
+    await upgradePage.evaluate(() => CWMODEL.whenIdle());
+    assert.equal(await upgradePage.evaluate(() => globalThis.__smokeDriveRelease), currentRelease);
+    assert.equal(await upgradePage.evaluate(async () => JSON.stringify(await CWDB.getAll('events'))), beforeUpgrade);
+    assert.equal(await upgradePage.evaluate(() => CWDB.getMeta('driveEnabled')), true);
+    assert.equal(await upgradePage.evaluate(async () => (await CWDB.getMeta('driveToken')).accessToken), 'upgrade-token');
+    assert.deepEqual(await upgradePage.evaluate(() => caches.keys()), [`plotline-${currentRelease}`]);
+    assert.deepEqual(upgradeErrors, []);
+    await upgradeContext.close();
+    console.log('offline shell upgrade preserves entries and Drive authorization');
     console.log('browser workflows passing');
   } finally {
     await browser?.close();

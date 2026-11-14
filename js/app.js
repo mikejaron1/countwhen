@@ -3080,6 +3080,7 @@ async function init() {
       }
     } catch (err) {
       snack('Sync failed: ' + err.message);
+      if (!$('#modalRoot .dialog') && !$('#drawer.open')) openDrive();
     }
   });
 

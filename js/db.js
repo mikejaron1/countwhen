@@ -97,7 +97,7 @@ const DEVICE_META_KEYS = [
   'driveLegacyCleanupAt', 'driveLegacyCleanupDone',
   'lastDriveSync', 'lastLocalChangeAt', 'lastFlareAlert', 'onboarded',
   'driveEnabled', 'deviceId', 'syncDeviceId', 'syncCounter',
-  'driveFolderId', 'drivePendingSnapshot', 'dataRevision',
+  'driveFolderId', 'drivePendingSnapshot', 'driveLastFailure', 'dataRevision',
 ];
 
 function normalizeInsightSettings(settings) {

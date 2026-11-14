@@ -333,6 +333,7 @@ npm run test:browser                        # Chromium workflows; install it wit
 node insights-smoke.js                     # statistics engine + role migration
 node goals-smoke.js                        # streak rules and edge cases
 node drive-smoke.js                        # Drive snapshot rotation + legacy cleanup
+node drive-rest-smoke.js                   # Full Drive REST + IndexedDB sync and recovery
 node ui-smoke.js                           # onboarding, every tab, goal + role editors
 node smoke-test.js <path-to-backup.json>   # import → DB → export round-trip
 ```
@@ -398,6 +399,11 @@ Tokens missing Drive permission are discarded; the next sync tap asks for consen
 again. Temporary read failures get bounded retries, while uncertain uploads use
 the recovery journal rather than blindly repeating writes. The sync dialog keeps
 the underlying error visible, including permission and storage-quota failures.
+Drive searches follow every result page and reject incomplete searches instead
+of treating them as missing backups. Once a backup is identified, sync and upload
+verification use that file's ID rather than repeatedly searching by name.
+Failed manual retries open the sync dialog with a device-only error record,
+the failed step and release version; these diagnostics never travel in backups.
 Local logging works without Drive authorization. Disconnecting disables automatic
 sync on that device without deleting the remote backup.
 

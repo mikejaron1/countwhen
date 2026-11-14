@@ -74,6 +74,8 @@ let _cancelTokenRequest = null;
 let _disconnecting = 0;
 let _lastSyncAt = 0;
 let _lastSyncError = '';
+let _lastSyncFailure = null;
+let _syncStep = 'idle';
 let _requestedStatus = { status: '', message: '' };
 let _lastStatus = { ..._requestedStatus, pending: false, phase: 'idle', lastSync: 0 };
 
@@ -182,7 +184,7 @@ function setStatus(status, msg) {
   const pending = _pendingOperations > 0;
   // Keep older message-based listeners alive until the entire operation queue
   // drains. New listeners can use pending/phase without interpreting text.
-  _lastStatus = { status, error: _lastSyncError,
+  _lastStatus = { status, error: _lastSyncError, step: _syncStep,
     message: pending && !/syncing/i.test(message) ? `${message}${message ? ' — ' : ''}syncing…` : message,
     pending, phase: pending ? 'syncing' : 'idle', lastSync: _lastSyncAt };
   // Update the small sync pill in the header if present
@@ -342,6 +344,8 @@ async function _requestToken(interactive, { allowAuth = interactive } = {}) {
 class DriveRequestError extends Error {
   constructor(status, reason, message) {
     super(`Drive ${status}${reason ? ` (${reason})` : ''}: ${message}`);
+    this.status = status;
+    this.reason = reason;
     this.retryable = [429, 500, 502, 503, 504].includes(status) ||
       (status === 403 && ['rateLimitExceeded', 'userRateLimitExceeded'].includes(reason));
   }
@@ -414,14 +418,48 @@ async function driveFetchOnce(path, opts = {}) {
   }
 }
 
+async function listDriveFiles(query, fields) {
+  const files = [], seen = new Set();
+  let pageToken = '';
+  do {
+    const params = new URLSearchParams({
+      q: query, fields: `nextPageToken,incompleteSearch,files(${fields})`,
+      spaces: 'drive', pageSize: '1000',
+    });
+    if (pageToken) params.set('pageToken', pageToken);
+    const data = await (await driveFetch(`/drive/v3/files?${params}`)).json();
+    if (data.incompleteSearch) throw new Error('Drive search is incomplete. No backup was replaced; retry sync.');
+    if (data.files != null && !Array.isArray(data.files)) throw new Error('Drive returned an invalid file list.');
+    files.push(...(data.files || []));
+    pageToken = data.nextPageToken || '';
+    if (pageToken && seen.has(pageToken)) throw new Error('Drive search repeated a page. No backup was replaced; retry sync.');
+    seen.add(pageToken);
+  } while (pageToken);
+  return files;
+}
+
+async function getDriveFileMetadata(id, fields = FILE_FIELDS + ',parents,trashed,mimeType') {
+  try {
+    const response = await driveFetch(`/drive/v3/files/${encodeURIComponent(id)}?fields=${fields}`);
+    const metadata = await response.json();
+    if (metadata?.id !== id) throw new Error('Drive returned invalid file metadata. No backup was replaced; retry sync.');
+    return metadata;
+  } catch (error) {
+    if (error.status === 404) return null;
+    throw error;
+  }
+}
+
 async function findOrCreateFolder() {
+  const cachedId = await CWDB.getMeta('driveFolderId');
+  if (cachedId) {
+    const cached = await getDriveFileMetadata(cachedId, 'id,mimeType,trashed');
+    if (cached && !cached.trashed && cached.mimeType === 'application/vnd.google-apps.folder') return cached.id;
+  }
   const findByName = async (name) => {
-    const q = encodeURIComponent(
-      `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`
-    );
-    const resp = await driveFetch(`/drive/v3/files?q=${q}&fields=files(id,name)&spaces=drive`);
-    const data = await resp.json();
-    return (data.files && data.files[0]) || null;
+    const files = await listDriveFiles(
+      `mimeType='application/vnd.google-apps.folder' and name='${name}' and trashed=false`, 'id,name');
+    return files[0] || null;
   };
 
   const current = await findByName(DRIVE_FOLDER_NAME);
@@ -455,13 +493,9 @@ async function findOrCreateFolder() {
 }
 
 async function findFileInFolder(folderId, name) {
-  const q = encodeURIComponent(
-    `name='${name}' and '${folderId}' in parents and trashed=false`
-  );
-  const resp = await driveFetch(
-    `/drive/v3/files?q=${q}&fields=files(id,name,modifiedTime,md5Checksum)&spaces=drive`);
-  const data = await resp.json();
-  return (data.files && data.files[0]) || null;
+  const files = await listDriveFiles(
+    `name='${name}' and '${folderId}' in parents and trashed=false`, 'id,name,modifiedTime,md5Checksum');
+  return files[0] || null;
 }
 
 async function copyDriveFile(srcId, newName, parents) {
@@ -572,20 +606,14 @@ async function cleanupLegacyArtifacts(folderId) {
       if (stale) { found++; await trashDriveFile(stale.id); }
     }
 
-    const folderQ = encodeURIComponent(
+    const folderQ =
       `mimeType='application/vnd.google-apps.folder' and ` +
-      `name='${DRIVE_LEGACY_FOLDER_NAME}' and trashed=false`
-    );
-    const folderResp = await driveFetch(
-      `/drive/v3/files?q=${folderQ}&fields=files(id)&spaces=drive`);
-    const legacyFolders = (await folderResp.json()).files || [];
+      `name='${DRIVE_LEGACY_FOLDER_NAME}' and trashed=false`;
+    const legacyFolders = await listDriveFiles(folderQ, 'id');
     for (const f of legacyFolders) {
       if (f.id === folderId) continue;
       found++;
-      const childQ = encodeURIComponent(`'${f.id}' in parents and trashed=false`);
-      const childResp = await driveFetch(
-        `/drive/v3/files?q=${childQ}&fields=files(id)&pageSize=1&spaces=drive`);
-      const children = (await childResp.json()).files || [];
+      const children = await listDriveFiles(`'${f.id}' in parents and trashed=false`, 'id');
       // Anything still inside is data we'd rather strand than destroy.
       if (!children.length) await trashDriveFile(f.id);
     }
@@ -659,33 +687,44 @@ async function renameDriveFile(fileId, name) {
   });
 }
 
-async function statSyncFile(folderId) {
+async function statSyncFile(folderId, fileId) {
+  const usable = (file) => file && !file.trashed && file.parents?.includes(folderId) &&
+    [DRIVE_FILE_NAME, DRIVE_LEGACY_FILE_NAME].includes(file.name);
+  const migrate = async (file) => {
+    if (file.name !== DRIVE_LEGACY_FILE_NAME) return file;
+    try {
+      await renameDriveFile(file.id, DRIVE_FILE_NAME);
+      const renamed = await getDriveFileMetadata(file.id);
+      if (usable(renamed)) return renamed;
+    } catch (e) {
+      console.warn('Could not rename legacy Drive sync file; using it as-is.', e);
+    }
+    return file;
+  };
+  const knownId = fileId || (await CWDB.getMeta('driveRemoteMeta'))?.fileId;
+  if (knownId) {
+    const known = await getDriveFileMetadata(knownId);
+    if (usable(known)) return migrate(known);
+  }
   const lookup = async (name) => {
-    const q = encodeURIComponent(
-      `name='${name}' and '${folderId}' in parents and trashed=false`
-    );
-    const resp = await driveFetch(
-      `/drive/v3/files?q=${q}&fields=files(${FILE_FIELDS})&spaces=drive`);
-    const data = await resp.json();
-    return (data.files && data.files[0]) || null;
+    const files = await listDriveFiles(
+      `name='${name}' and '${folderId}' in parents and trashed=false`, FILE_FIELDS);
+    for (const file of files) {
+      // Search discovers identity, not a read-after-write version. Fetch the
+      // actual file so a stale search index cannot keep sync in a retry loop.
+      const current = await getDriveFileMetadata(file.id);
+      if (usable(current)) return current;
+    }
+    return null;
   };
 
   const current = await lookup(DRIVE_FILE_NAME);
-  if (current) return current;
+  if (current) return migrate(current);
 
   // Pre-rebrand sync file: rename in place so its id and revision history
   // carry over. If the rename fails we still sync against the legacy file.
   const legacy = await lookup(DRIVE_LEGACY_FILE_NAME);
-  if (legacy) {
-    try {
-      await renameDriveFile(legacy.id, DRIVE_FILE_NAME);
-      legacy.name = DRIVE_FILE_NAME;
-    } catch (e) {
-      console.warn('Could not rename legacy Drive sync file; using it as-is.', e);
-    }
-    return legacy;
-  }
-  return null;
+  return legacy ? migrate(legacy) : null;
 }
 
 async function downloadSyncFile() {
@@ -1044,14 +1083,18 @@ async function isEnabled() {
 
 async function getConnectionState() {
   const recovery = await CWDB.getMeta('drivePendingSnapshot');
+  const failure = _lastSyncFailure || await CWDB.getMeta('driveLastFailure');
+  const lastSync = await CWDB.getMeta('lastDriveSync', 0);
   return {
     enabled: await isEnabled(),
-    lastSync: await CWDB.getMeta('lastDriveSync', 0),
     lastChange: await CWDB.getMeta('lastLocalChangeAt', 0),
-    pending: _pendingOperations > 0,
     recoveryPending: !!recovery?.snapshot && recovery.status !== 'confirmed',
     recoveryAvailable: !!recovery?.snapshot,
     ..._lastStatus,
+    pending: _pendingOperations > 0,
+    lastSync: Math.max(Number(lastSync) || 0, _lastSyncAt),
+    error: _lastSyncError || failure?.message || '',
+    failure,
   };
 }
 
@@ -1070,6 +1113,7 @@ function runSync(interactive, operation, { allowAuth = interactive } = {}) {
   }
   const epoch = _connectionEpoch;
   const authenticate = async () => {
+    _syncStep = 'authorizing Drive';
     if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
     if (interactive) {
       _consecutiveSilentFailures = 0;
@@ -1087,19 +1131,26 @@ function runSync(interactive, operation, { allowAuth = interactive } = {}) {
   };
   const wasPending = _pendingOperations++ > 0;
   // Start immediately when idle rather than waiting for a Web Lock before OAuth.
-  const result = wasPending ? _syncQueue.then(authenticate) : authenticate();
-  _syncQueue = result.catch(() => {}).finally(() => {
-    _pendingOperations--;
-    setStatus(_requestedStatus.status, _requestedStatus.message);
-  });
-  setStatus('', '☁ syncing…');
-  return result.catch((e) => {
+  const result = (wasPending ? _syncQueue.then(authenticate) : authenticate()).catch(async (e) => {
     _lastSyncError = e.message === 'DISCONNECTED' ? '' : String(e.message || e);
-    if (_lastSyncError) console.warn('Drive sync failed:', _lastSyncError);
+    if (_lastSyncError) {
+      _lastSyncFailure = { message: _lastSyncError, step: _syncStep, at: Date.now(),
+        release: globalThis.CW_RELEASE || '' };
+      console.warn('Drive sync failed:', _lastSyncFailure);
+      try { await CWDB.setMeta('driveLastFailure', _lastSyncFailure); }
+      catch (storageError) { console.warn('Could not retain Drive error details:', storageError); }
+    }
     setStatus('error', e.message === 'DISCONNECTED' ? '☁ disconnected'
       : e.message === DRIVE_PERMISSION_REQUIRED ? '☁ reconnect Drive' : '☁ sync failed');
     throw e;
   });
+  _syncQueue = result.catch(() => {}).finally(() => {
+    _pendingOperations--;
+    if (!_pendingOperations) _syncStep = 'idle';
+    setStatus(_requestedStatus.status, _requestedStatus.message);
+  });
+  setStatus('', '☁ syncing…');
+  return result;
 }
 
 /* Call only while owning plotline-data. The export fallback also detects
@@ -1171,13 +1222,16 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
   if (_disconnecting) return Promise.reject(new Error('DISCONNECTED'));
   if (!interactive && _backgroundSync.has(allowMerge)) return _backgroundSync.get(allowMerge);
   const promise = runSync(interactive, async (checkConnected) => {
+    _syncStep = 'reading the local backup';
     let localState = await withDataLock(async () => { checkConnected(); return localSnapshot(); });
+    _syncStep = 'finding the Drive folder';
     const folderId = await findOrCreateFolder();
     checkConnected();
     await CWDB.setMeta('driveFolderId', folderId);
     const base = await CWDB.getMeta('driveSyncBase');
     const recovery = await CWDB.getMeta('drivePendingSnapshot');
     const pending = recovery?.status !== 'confirmed' && recovery?.status !== 'restore' ? recovery : null;
+    let syncFileId = pending?.folderId === folderId ? pending.fileId : null;
     let local = localState.data;
     let candidate = local, localIdMaps = identityMaps(local);
     let retryBase = base;
@@ -1205,8 +1259,11 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
     let resultStats = null;
     let hadRemote = false;
     let localRetries = 0;
-    const savePending = () => saveRecovery(candidate, local, 'pending', localIdMaps,
-      { remoteBase: recoveredRemoteBase || retryBase, localDeletes });
+    const savePending = () => {
+      _syncStep = 'saving a recovery copy';
+      return saveRecovery(candidate, local, 'pending', localIdMaps,
+        { remoteBase: recoveredRemoteBase || retryBase, localDeletes, folderId, fileId: syncFileId });
+    };
     const acceptLocalChanges = async (next) => {
       if (sameLocal(localState, next)) return false;
       if (++localRetries > 3) {
@@ -1226,11 +1283,13 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
     await savePending();
     for (let attempt = 0; attempt < 3; attempt++) {
       checkConnected();
-      const stat = await statSyncFile(folderId);
+      _syncStep = 'reading the Drive backup';
+      const stat = await statSyncFile(folderId, syncFileId);
       if (stat) {
+        syncFileId = stat.id;
         hadRemote = true;
         const remote = await validatedRemote(stat.id);
-        if (!sameRemote(stat, await statSyncFile(folderId))) continue;
+        if (!sameRemote(stat, await statSyncFile(folderId, syncFileId))) continue;
         // A prior request may have been accepted even though its response
         // failed. Its exact candidate is now the ancestor, including moved IDs.
         if (recoveredSnapshot && sameRecord(comparableBackup(remote), comparableBackup(recoveredSnapshot))) {
@@ -1243,6 +1302,7 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
         if (!allowMerge && !sameRecord(comparableBackup(remote), comparableBackup(base || {}))) {
           throw new Error('REMOTE_CHANGED');
         }
+        _syncStep = 'merging changes';
         const result = mergeBackups(retryBase, candidate, remote, {
           preferRemote: (Date.parse(stat.modifiedTime) || 0) > localState.lastChange,
         });
@@ -1276,18 +1336,26 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
       // Drive v3 does not document a browser-usable update precondition. These
       // checks detect races, not eliminate the final check-to-write window.
       // Never claim success until the uploaded content is read back unchanged.
-      if (!sameRemote(stat, await statSyncFile(folderId))) continue;
+      if (!sameRemote(stat, await statSyncFile(folderId, syncFileId))) continue;
       checkConnected();
+      _syncStep = 'uploading the backup';
       const written = stat ? await updateSyncFile(stat.id, candidate) :
         await createSyncFile(folderId, candidate);
-      const verified = await statSyncFile(folderId);
+      if (typeof written?.id !== 'string' || (stat && written.id !== stat.id)) {
+        throw new Error('Drive returned an invalid upload confirmation. Your recovery copy is saved; retry sync.');
+      }
+      syncFileId = written.id;
+      await savePending();
+      _syncStep = 'verifying the uploaded backup';
+      const verified = await statSyncFile(folderId, syncFileId);
       if (!sameRemote(written, verified)) continue;
       const contents = await validatedRemote(written.id);
       if (!sameRecord(contents, candidate) ||
-          !sameRemote(verified, await statSyncFile(folderId))) continue;
+          !sameRemote(verified, await statSyncFile(folderId, syncFileId))) continue;
       checkConnected();
       await maybeCleanupLegacyArtifacts(folderId);
       checkConnected();
+      _syncStep = 'applying the verified backup';
       const changedLocally = localState.content !== stableStringify(comparableBackup(candidate));
       // Export/download UI may wait on storage or user interaction: never own
       // the model lock here. Recheck *inside* the apply lock afterwards.
@@ -1312,7 +1380,7 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
         attempt--;
         continue;
       }
-      await saveRecovery(candidate, local, 'confirmed', localIdMaps);
+      await saveRecovery(candidate, local, 'confirmed', localIdMaps, { folderId, fileId: syncFileId });
       checkConnected();
       setStatus('ok', changedLocally ? '☁ merged' : '☁ synced');
       return { action: hadRemote ? 'merged' : 'created', stats: resultStats, changedLocally };
@@ -1337,10 +1405,12 @@ async function rememberSyncPoint(fileMeta, obj) {
     version: fileMeta.version || null,
   });
   await CWDB.setMeta('driveSyncBase', obj);
+  await CWDB.setMeta('driveLastFailure', null);
   const syncedAt = Date.now();
-  _lastSyncAt = syncedAt;
   await CWDB.setMeta('lastDriveSync', syncedAt);
+  _lastSyncAt = syncedAt;
   _lastSyncError = '';
+  _lastSyncFailure = null;
 }
 
 /* Upload-only (kept for the "Sync Now" button and older call sites). */
@@ -1351,16 +1421,24 @@ async function syncUp(opts = {}) {
 /* Explicit "throw away local, take what's on Drive". */
 function syncDown({ interactive = true } = {}) {
   return runSync(interactive, async (checkConnected) => {
+    _syncStep = 'reading the local backup';
     const snapshot = await withDataLock(async () => { checkConnected(); return localSnapshot(); });
+    _syncStep = 'finding the Drive folder';
     const folderId = await findOrCreateFolder();
+    await CWDB.setMeta('driveFolderId', folderId);
+    let syncFileId;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const stat = await statSyncFile(folderId);
+      _syncStep = 'reading the Drive backup';
+      const stat = await statSyncFile(folderId, syncFileId);
       if (!stat) throw new Error('NO_REMOTE_FILE');
+      syncFileId = stat.id;
       const obj = await validatedRemote(stat.id);
-      if (!sameRemote(stat, await statSyncFile(folderId))) continue;
+      if (!sameRemote(stat, await statSyncFile(folderId, syncFileId))) continue;
       checkConnected();
+      _syncStep = 'saving a recovery copy';
       await saveRecovery(obj, snapshot.data, 'restore');
       await CWIO.safetyBackup();
+      _syncStep = 'applying the verified backup';
       await withDataLock(async () => {
         checkConnected();
         const next = await localSnapshot();
@@ -1533,7 +1611,9 @@ async function disconnect() {
     await CWDB.setMeta('driveEnabled', false);
     await _syncQueue;
     resetTokenClient();
+    await CWDB.setMeta('driveLastFailure', null);
     _lastSyncError = '';
+    _lastSyncFailure = null;
     setStatus('', '☁ disconnected');
   } finally { _disconnecting--; }
 }
@@ -1627,6 +1707,9 @@ function openSetupDialog(ctx) {
           <select id="driveRecoveryVersion">${recoveryCopies.map((entry, index) =>
             `<option value="${index}" ${index === recoveryCopies.length - 1 ? 'selected' : ''}>${esc(new Date(entry.savedAt || 0).toLocaleString())} — ${entry.snapshot?.events?.length || 0} events</option>`).join('')}</select>` : ''}
         <p id="driveError" role="alert">${esc(connection.error || '')}</p>
+        <p id="driveFailureStep" class="muted-small">${connection.error && connection.failure
+          ? esc(`Failed while ${connection.failure.step} · ${connection.failure.release || window.CW_VERSION || 'unknown version'}`)
+          : ''}</p>
       </div>
       <div class="actions">
         <button class="btn secondary" id="driveSaveId">Save ID</button>
@@ -1656,6 +1739,9 @@ function openSetupDialog(ctx) {
         busy(_pendingOperations > 0);
         const error = document.getElementById('driveError');
         if (error) error.textContent = _lastSyncError;
+        const step = document.getElementById('driveFailureStep');
+        if (step) step.textContent = _lastSyncError && _lastSyncFailure
+          ? `Failed while ${_lastSyncFailure.step} · ${_lastSyncFailure.release || window.CW_VERSION || 'unknown version'}` : '';
       }
     };
     window.addEventListener('plotline:sync-status', refreshBusy);
