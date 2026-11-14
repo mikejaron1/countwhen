@@ -35,11 +35,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
     await page.route('https://accounts.google.com/gsi/client', (route) => route.fulfill({
       contentType: 'text/javascript',
       body: `window.google = { accounts: { oauth2: { initTokenClient(options) {
-        return { requestAccessToken() {
+        return { requestAccessToken(request) {
           window.oauthGesture = navigator.userActivation.isActive;
+          window.oauthPrompt = request.prompt;
           window.oauthRequests = (window.oauthRequests || 0) + 1;
           if (!window.oauthGesture) throw new Error('Authorization lost the user gesture');
-          window.oauthReply = () => options.callback({ access_token: 'gesture-token', expires_in: 3600 });
+          window.oauthReply = () => options.callback({ access_token: 'gesture-token', scope: options.scope, expires_in: 3600 });
         } };
       } } } };`,
     }));
@@ -166,6 +167,84 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       && document.querySelector('#syncPill').textContent === '☁ synced');
     assert.equal(await page.evaluate(() => gestureRemote.events.length), beforeGestureEvents + 1);
     await page.evaluate(() => Object.assign(window, gestureSyncHooks));
+
+    // Exercise the real REST helpers, not sync hook replacements: rejected
+    // cached authorization must recover on a tap without losing either side.
+    let restRemote = await page.evaluate(() => CWIO.buildExportObject());
+    const remoteEvent = { id: Math.max(...restRemote.events.map((event) => event.id)) + 1,
+      topicid: waterId, time: Date.now() - 60000, qant: 3, note: 'Pulled in after retry' };
+    restRemote.events.push(remoteEvent);
+    restRemote.eventcount = restRemote.events.length;
+    let restRevision = 1, restWrites = 0, transientReads = 0, restModifiedAt = Date.now();
+    const restMeta = (name = 'plotline.json') => ({
+      id: name === 'plotline.json' ? 'rest-primary' : 'rest-snapshot', name,
+      version: String(restRevision), modifiedTime: new Date(restModifiedAt).toISOString(),
+      md5Checksum: require('node:crypto').createHash('md5').update(JSON.stringify(restRemote)).digest('hex'),
+    });
+    await page.route('https://www.googleapis.com/**', async (route) => {
+      const request = route.request(), url = new URL(request.url());
+      const reply = (data, status = 200) => route.fulfill({ status,
+        contentType: 'application/json', body: JSON.stringify(data) });
+      if (request.headers().authorization === 'Bearer rejected-token') {
+        return reply({ error: { message: 'Request had insufficient authentication scopes.',
+          details: [{ reason: 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' }] } }, 403);
+      }
+      assert.equal(request.headers().authorization, 'Bearer gesture-token');
+      if (request.method() === 'GET' && transientReads++ === 0) {
+        return reply({ error: { message: 'Backend error' } }, 503);
+      }
+      if (url.pathname === '/drive/v3/files') {
+        const name = /name='([^']+)'/.exec(url.searchParams.get('q') || '')?.[1];
+        const files = name === 'Plotline' ? [{ id: 'rest-folder', name }]
+          : ['plotline.json', 'plotline-1.json'].includes(name) ? [restMeta(name)] : [];
+        return reply({ files });
+      }
+      if (url.pathname === '/drive/v3/files/rest-primary' && url.searchParams.get('alt') === 'media') {
+        return reply(restRemote);
+      }
+      if (url.pathname === '/upload/drive/v3/files/rest-primary' && request.method() === 'PATCH') {
+        restRemote = request.postDataJSON();
+        restRevision++;
+        restModifiedAt++;
+        restWrites++;
+        return reply(restMeta());
+      }
+      throw new Error('Unhandled sync recovery request: ' + request.method() + ' ' + url.pathname);
+    });
+    const previousSync = Date.now() - 14 * 60 * 60 * 1000;
+    await page.evaluate(async (last) => {
+      _accessToken = 'rejected-token'; _tokenExpiry = Date.now() + 3600000;
+      await CWDB.setMeta('driveToken', { accessToken: _accessToken, tokenExpiry: _tokenExpiry });
+      await CWDB.setMeta('lastDriveSync', last);
+      await CWDB.setMeta('lastLocalChangeAt', last + 1000);
+      await CWDB.setMeta('driveLegacyCleanupDone', true);
+      await CWMODEL.refresh();
+      await CWDRIVE.startupSync();
+    }, previousSync);
+    assert.equal(await page.locator('#syncPill').textContent(), '☁ reconnect Drive');
+    assert.equal(await page.locator('#syncActivity').textContent(), 'Last synced 14h ago');
+    assert.equal(await page.evaluate(() => CWDB.getMeta('driveToken')), null);
+    assert.equal(restWrites, 0);
+    await page.locator('#menuBtn').click();
+    await page.locator('#navDrive').click();
+    await page.getByRole('dialog').waitFor();
+    assert.match(await page.locator('#driveError').textContent(), /Drive permission is missing/);
+    await page.keyboard.press('Escape');
+    await page.locator('#syncPill').click();
+    assert.equal(await page.evaluate(() => window.oauthGesture), true);
+    assert.equal(await page.evaluate(() => window.oauthPrompt), 'consent');
+    await page.evaluate(() => window.oauthReply());
+    await page.waitForFunction(() => _pendingOperations === 0
+      && document.querySelector('#syncPill').textContent === '☁ merged');
+    await page.evaluate(() => CWMODEL.whenIdle());
+    assert.equal(restWrites, 1);
+    assert.ok(restRemote.events.some((event) => event.note === 'Pulled in after retry'));
+    assert.equal(restRemote.events.length, beforeGestureEvents + 2);
+    assert.equal(await page.evaluate(async () => (await CWDB.getAll('events')).length), restRemote.events.length);
+    assert.equal(await page.locator('#syncActivity').textContent(), 'Last synced just now');
+    assert.equal(await page.evaluate(async () => (await CWDRIVE.getConnectionState()).error), '');
+    assert.equal(await page.evaluate(async () => (await CWDB.getMeta('drivePendingSnapshot')).status), 'confirmed');
+    await page.unroute('https://www.googleapis.com/**');
     await page.evaluate(() => CWDRIVE.disconnect());
     assert.equal(await page.locator('#syncActivity').isHidden(), true);
 

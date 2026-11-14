@@ -1007,7 +1007,7 @@ async function test(name, fn) {
     h.browser.ensureGis = async () => { gisLoads++; };
     h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
       return { requestAccessToken() {
-        options.callback({ access_token: 'auto-token', expires_in: 3600 });
+        options.callback({ access_token: 'auto-token', scope: options.scope, expires_in: 3600 });
       } };
     } } } };
     vm.runInContext('getTokenSilent = (opts) => window.originalTokenRequest(false, opts);', h.browser);
@@ -1032,7 +1032,7 @@ async function test(name, fn) {
     h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
       return { requestAccessToken() {
         syncRequested = true;
-        options.callback({ access_token: 'auto-token', expires_in: 3600 });
+        options.callback({ access_token: 'auto-token', scope: options.scope, expires_in: 3600 });
       } };
     } } } };
     vm.runInContext('_gisLoaded = true; getTokenSilent = _defaultGetTokenSilent;', h.browser);
@@ -1074,7 +1074,7 @@ async function test(name, fn) {
     h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
       return { requestAccessToken() {
         requests++;
-        options.callback({ access_token: 'synthetic-token', expires_in: 3600 });
+        options.callback({ access_token: 'synthetic-token', scope: options.scope, expires_in: 3600 });
       } };
     } } } };
     vm.runInContext('ensureGis = async () => {};', h.browser);
@@ -1088,6 +1088,124 @@ async function test(name, fn) {
     assert.equal(h.meta.get('driveToken'), null);
     await assert.rejects(h.browser.window.originalTokenRequest(false), /Tap Sync now to reconnect/);
     assert.equal(requests, 1);
+  });
+  await test('missing Drive consent is rejected before sync and the next tap requests consent again', async () => {
+    const h = harness(), prompts = [];
+    h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
+      return { requestAccessToken(request) {
+        prompts.push(request.prompt);
+        options.callback({ access_token: prompts.length === 1 ? 'denied-token' : 'granted-token',
+          scope: prompts.length === 1 ? 'openid email' : options.scope, expires_in: 3600 });
+      } };
+    } } } };
+    vm.runInContext(`_gisLoaded = true;
+      getTokenInteractive = _defaultGetTokenInteractive; getTokenSilent = _defaultGetTokenSilent;`, h.browser);
+    await assert.rejects(h.api.syncNow({ interactive: true }), /Drive permission is missing/);
+    await vm.runInContext('_syncQueue', h.browser);
+    assert.equal(h.meta.get('driveToken'), null);
+    assert.equal(h.state.writes, 0);
+    assert.match((await h.api.getConnectionState()).error, /Drive permission is missing/);
+    await h.api.syncNow({ interactive: true });
+    assert.deepEqual(prompts, ['', 'consent']);
+    assert.equal(h.meta.get('driveToken').accessToken, 'granted-token');
+    assert.equal(h.state.writes, 1);
+    assert.equal((await h.api.getConnectionState()).error, '');
+  });
+  await test('a cached token rejected for insufficient scope is discarded and retry reauthorizes', async () => {
+    for (const reason of ['insufficientPermissions', 'ACCESS_TOKEN_SCOPE_INSUFFICIENT']) {
+      const h = harness();
+      const lastSync = Date.now() - 14 * 60 * 60 * 1000;
+      h.meta.set('lastDriveSync', lastSync);
+      h.meta.set('driveToken', { accessToken: 'rejected-token', tokenExpiry: Date.now() + 60000,
+        clientId: 'test' });
+      h.state.local.events.push(event(20));
+      let requests = 0, authorizations = 0;
+      h.browser.fetch = async (url, options) => {
+        requests++;
+        if (options.headers.Authorization === 'Bearer rejected-token') {
+          const error = reason === 'insufficientPermissions'
+            ? { message: 'Insufficient Permission', errors: [{ reason }] }
+            : { message: 'Request had insufficient authentication scopes.', details: [{ reason }] };
+          return new Response(JSON.stringify({ error }), { status: 403 });
+        }
+        assert.equal(options.headers.Authorization, 'Bearer repaired-token');
+        return new Response('{}');
+      };
+      h.browser.google = { accounts: { oauth2: { initTokenClient(options) {
+        return { requestAccessToken(request) {
+          authorizations++;
+          assert.equal(request.prompt, 'consent');
+          options.callback({ access_token: 'repaired-token', scope: options.scope, expires_in: 3600 });
+        } };
+      } } } };
+      vm.runInContext(`_gisLoaded = true;
+        getTokenInteractive = _defaultGetTokenInteractive; getTokenSilent = _defaultGetTokenSilent;
+        findOrCreateFolder = async () => { await driveFetch('/drive/v3/files'); return 'folder'; };`, h.browser);
+      await assert.rejects(h.api.syncNow(), /Drive permission is missing/);
+      await vm.runInContext('_syncQueue', h.browser);
+      assert.equal(h.meta.get('driveToken'), null);
+      assert.equal(h.meta.get('lastDriveSync'), lastSync);
+      assert.equal(h.state.writes, 0);
+      vm.runInContext('handleAutoSyncFailure(new Error(DRIVE_PERMISSION_REQUIRED));', h.browser);
+      assert.equal(h.state.statuses.at(-1).detail.message, '☁ reconnect Drive');
+      assert.equal(vm.runInContext('autoSyncSuppressed()', h.browser), false);
+      await h.api.syncNow({ interactive: true });
+      assert.equal(authorizations, 1);
+      assert.equal(requests, 2);
+      assert.deepEqual(h.state.remote.events, [event(20)]);
+      assert.ok(h.meta.get('lastDriveSync') > lastSync);
+      assert.equal((await h.api.getConnectionState()).error, '');
+    }
+  });
+  await test('transient Drive read failures retry with a bounded budget without renewing authorization', async () => {
+    for (const status of [403, 429, 503, 'network']) {
+      const h = harness(), delays = [];
+      const nativeTimeout = h.browser.setTimeout;
+      h.browser.setTimeout = (callback, delay) => {
+        if (delay < 10000) { delays.push(delay); return nativeTimeout(callback, 0); }
+        return nativeTimeout(callback, delay);
+      };
+      let requests = 0;
+      h.browser.fetch = async () => {
+        if (++requests === 3) return new Response('{"files":[]}');
+        if (status === 'network') throw new TypeError('Failed to fetch');
+        return new Response(JSON.stringify({ error: { message: 'Temporarily unavailable',
+          errors: [{ reason: 'userRateLimitExceeded' }] } }), { status });
+      };
+      const response = await vm.runInContext("driveFetch('/drive/v3/files')", h.browser);
+      assert.deepEqual(await response.json(), { files: [] });
+      assert.equal(requests, 3);
+      assert.equal(delays.length, 2);
+      assert.ok(delays[1] > delays[0]);
+      assert.equal(h.state.auth, 0);
+      h.browser.fetch = async () => {
+        requests++;
+        return new Response('{"error":{"message":"Backend error"}}', { status: 503 });
+      };
+      requests = 0;
+      await assert.rejects(vm.runInContext("driveFetch('/drive/v3/files')", h.browser), /Drive 503: Backend error/);
+      assert.equal(requests, 3);
+    }
+  });
+  await test('writes and permanent Drive errors are not blindly retried and retain readable failure details', async () => {
+    for (const [method, status, reason] of [
+      ['POST', 503, 'backendError'], ['PATCH', 429, 'rateLimitExceeded'],
+      ['GET', 403, 'storageQuotaExceeded'], ['GET', 403, 'insufficientFilePermissions'],
+    ]) {
+      const h = harness();
+      const token = { accessToken: 'working-token', tokenExpiry: Date.now() + 60000, clientId: 'test' };
+      h.meta.set('driveToken', token);
+      let requests = 0;
+      h.browser.fetch = async () => {
+        requests++;
+        return new Response(JSON.stringify({ error: { message: 'The request cannot complete.',
+          errors: [{ reason }] } }), { status });
+      };
+      await assert.rejects(vm.runInContext(`driveFetch('/drive/v3/files', { method: '${method}' })`, h.browser),
+        new RegExp(reason));
+      assert.equal(requests, 1);
+      assert.deepEqual(h.meta.get('driveToken'), token, 'file permissions and quota errors must not discard authorization');
+    }
   });
   await test('every OAuth failure rejects its own request instead of hanging the queue', async () => {
     const h = harness();
@@ -1149,7 +1267,7 @@ async function test(name, fn) {
     requests[0].callback({ access_token: 'stale-token', expires_in: 3600 });
     requests[0].error_callback({ type: 'popup_closed' });
     assert.equal(h.meta.get('driveToken'), undefined);
-    requests[1].callback({ access_token: 'retry-token', expires_in: 3600 });
+    requests[1].callback({ access_token: 'retry-token', scope: requests[1].scope, expires_in: 3600 });
     await retry;
     await vm.runInContext('_syncQueue', h.browser);
     assert.equal(h.meta.get('driveToken').accessToken, 'retry-token');

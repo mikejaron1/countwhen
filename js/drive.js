@@ -12,6 +12,7 @@
 
 const DRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
 const DRIVE_AUTH_REQUIRED = 'Drive authorization is needed. Tap Sync now to reconnect.';
+const DRIVE_PERMISSION_REQUIRED = 'Drive permission is missing. Tap Sync now and allow access to Plotline files.';
 const DRIVE_FOLDER_NAME = 'Plotline';
 const DRIVE_FILE_NAME = 'plotline.json';
 const SNAPSHOT_NAME = (i) => `plotline-${i}.json`;
@@ -55,6 +56,7 @@ let _gisPromise = null;
 let _tokenClient = null;
 let _accessToken = null;
 let _tokenExpiry = 0;
+let _needsDriveConsent = false;
 let _inflightTokenPromise = null;
 let _driveEnabled = false;
 let _cachedClientId = '';
@@ -71,6 +73,7 @@ let _connectionEpoch = 0;
 let _cancelTokenRequest = null;
 let _disconnecting = 0;
 let _lastSyncAt = 0;
+let _lastSyncError = '';
 let _requestedStatus = { status: '', message: '' };
 let _lastStatus = { ..._requestedStatus, pending: false, phase: 'idle', lastSync: 0 };
 
@@ -179,7 +182,7 @@ function setStatus(status, msg) {
   const pending = _pendingOperations > 0;
   // Keep older message-based listeners alive until the entire operation queue
   // drains. New listeners can use pending/phase without interpreting text.
-  _lastStatus = { status,
+  _lastStatus = { status, error: _lastSyncError,
     message: pending && !/syncing/i.test(message) ? `${message}${message ? ' — ' : ''}syncing…` : message,
     pending, phase: pending ? 'syncing' : 'idle', lastSync: _lastSyncAt };
   // Update the small sync pill in the header if present
@@ -190,6 +193,7 @@ function setStatus(status, msg) {
     if (status === 'error') el.classList.add('error');
     el.textContent = document.getElementById('syncActivity') && /syncing/i.test(message) ? '☁ Sync' : message;
     el.style.display = message ? '' : 'none';
+    el.title = _lastSyncError;
   }
   if (typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
     window.dispatchEvent(new CustomEvent('plotline:sync-status', { detail: _lastStatus }));
@@ -255,10 +259,19 @@ function _beginOAuthRequest(clientId, epoch = _connectionEpoch) {
             if (epoch !== _connectionEpoch) { cancel(); return; }
             if (resp.error) { finish(new Error(resp.error)); return; }
             if (!resp.access_token) { finish(new Error('oauth_error')); return; }
+            const granted = google.accounts.oauth2.hasGrantedAllScopes
+              ? google.accounts.oauth2.hasGrantedAllScopes(resp, DRIVE_SCOPES)
+              : typeof resp.scope === 'string' && resp.scope.split(/\s+/).includes(DRIVE_SCOPES);
+            if (!granted) {
+              _needsDriveConsent = true;
+              clearCachedToken().then(() => finish(new Error(DRIVE_PERMISSION_REQUIRED)), finish);
+              return;
+            }
             _accessToken = resp.access_token;
             _tokenExpiry = Date.now() + (resp.expires_in || 3600) * 1000;
             _consecutiveSilentFailures = 0;
             _needsGestureSync = false;
+            _needsDriveConsent = false;
             CWDB.setMeta('driveToken', {
               accessToken: _accessToken,
               tokenExpiry: _tokenExpiry,
@@ -269,7 +282,7 @@ function _beginOAuthRequest(clientId, epoch = _connectionEpoch) {
           error_callback: (err) => finish(new Error(err.type || 'oauth_error')),
         });
         _tokenClient._clientId = clientId;
-        _tokenClient.requestAccessToken({ prompt: '' });
+        _tokenClient.requestAccessToken({ prompt: _needsDriveConsent ? 'consent' : '' });
       } catch (e) { finish(e); }
     };
     if (_gisLoaded && typeof google !== 'undefined' && google.accounts?.oauth2) startClient();
@@ -326,7 +339,33 @@ async function _requestToken(interactive, { allowAuth = interactive } = {}) {
 
 /* ---------- Drive REST ---------- */
 
+class DriveRequestError extends Error {
+  constructor(status, reason, message) {
+    super(`Drive ${status}${reason ? ` (${reason})` : ''}: ${message}`);
+    this.retryable = [429, 500, 502, 503, 504].includes(status) ||
+      (status === 403 && ['rateLimitExceeded', 'userRateLimitExceeded'].includes(reason));
+  }
+}
+
 async function driveFetch(path, opts = {}) {
+  const epoch = _connectionEpoch;
+  for (let attempt = 0; ; attempt++) {
+    try { return await driveFetchOnce(path, opts); }
+    catch (error) {
+      const transient = error.retryable || /Failed to fetch|Load failed|NetworkError/.test(error.message);
+      // Retrying a write can duplicate a create or overwrite a concurrent edit
+      // after Drive accepted it but its response was lost. Sync's journal owns
+      // that recovery; only repeat reads here.
+      if ((opts.method || 'GET').toUpperCase() !== 'GET' ||
+          !transient || attempt >= 2 || !isOnline() || !appVisible()) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt + Math.floor(Math.random() * 250)));
+      if (epoch !== _connectionEpoch) throw new Error('DISCONNECTED');
+      if (!isOnline() || !appVisible()) throw error;
+    }
+  }
+}
+
+async function driveFetchOnce(path, opts = {}) {
   const token = _accessToken;
   const headers = { ...(opts.headers || {}), Authorization: `Bearer ${token}` };
   const controller = new AbortController();
@@ -337,7 +376,7 @@ async function driveFetch(path, opts = {}) {
   }, DRIVE_REQUEST_TIMEOUT_MS);
   try {
     const resp = await fetch(`https://www.googleapis.com${path}`, {
-      ...opts, headers, signal: controller.signal,
+      ...opts, headers, signal: controller.signal, cache: 'no-store',
     });
     if (!resp.ok) {
       if (resp.status === 401) {
@@ -345,7 +384,22 @@ async function driveFetch(path, opts = {}) {
         throw new Error(DRIVE_AUTH_REQUIRED);
       }
       const txt = await resp.text();
-      throw new Error(`Drive ${resp.status}: ${txt.slice(0, 200)}`);
+      let detail;
+      try { detail = JSON.parse(txt)?.error; }
+      catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+      const reason = detail?.errors?.[0]?.reason || detail?.details?.find((entry) => entry.reason)?.reason || '';
+      if (resp.status === 403 &&
+          ['insufficientPermissions', 'ACCESS_TOKEN_SCOPE_INSUFFICIENT'].includes(reason)) {
+        _needsDriveConsent = true;
+        await clearCachedToken();
+        throw new Error(DRIVE_PERMISSION_REQUIRED);
+      }
+      const message = reason === 'storageQuotaExceeded'
+        ? 'Your Google Drive storage is full. Free space in Drive, then retry sync.'
+        : reason === 'insufficientFilePermissions'
+          ? 'Your Google account cannot edit the backup file. Check its sharing permissions in Drive.'
+          : String(detail?.message || txt || resp.statusText).replace(/\s+/g, ' ').slice(0, 500);
+      throw new DriveRequestError(resp.status, reason, message);
     }
     // Keep the timeout active through the body download, not just the headers.
     const body = await resp.arrayBuffer();
@@ -1040,7 +1094,10 @@ function runSync(interactive, operation, { allowAuth = interactive } = {}) {
   });
   setStatus('', '☁ syncing…');
   return result.catch((e) => {
-    setStatus('error', e.message === 'DISCONNECTED' ? '☁ disconnected' : '☁ sync failed');
+    _lastSyncError = e.message === 'DISCONNECTED' ? '' : String(e.message || e);
+    if (_lastSyncError) console.warn('Drive sync failed:', _lastSyncError);
+    setStatus('error', e.message === 'DISCONNECTED' ? '☁ disconnected'
+      : e.message === DRIVE_PERMISSION_REQUIRED ? '☁ reconnect Drive' : '☁ sync failed');
     throw e;
   });
 }
@@ -1283,6 +1340,7 @@ async function rememberSyncPoint(fileMeta, obj) {
   const syncedAt = Date.now();
   _lastSyncAt = syncedAt;
   await CWDB.setMeta('lastDriveSync', syncedAt);
+  _lastSyncError = '';
 }
 
 /* Upload-only (kept for the "Sync Now" button and older call sites). */
@@ -1388,6 +1446,7 @@ async function afterSync(res) {
 
 function handleAutoSyncFailure(e) {
   const msg = String(e?.message || e);
+  _lastSyncError = ['NO_CLIENT_ID', 'DISCONNECTED', 'BACKGROUNDED'].includes(msg) ? '' : msg;
   if (msg === 'NO_CLIENT_ID') { setStatus('', ''); return; }   // not configured
   if (msg === 'DISCONNECTED') { setStatus('', ''); return; }
   if (msg === DRIVE_AUTH_REQUIRED || msg === 'popup_failed_to_open') {
@@ -1398,6 +1457,11 @@ function handleAutoSyncFailure(e) {
       return;
     }
     setStatus('', '☁ tap to sync');
+    return;
+  }
+  if (msg === DRIVE_PERMISSION_REQUIRED) {
+    _needsGestureSync = true;
+    setStatus('error', '☁ reconnect Drive');
     return;
   }
   if (msg === 'CELLULAR_BLOCKED') { setStatus('error', '☁ off (cellular)'); return; }
@@ -1469,6 +1533,7 @@ async function disconnect() {
     await CWDB.setMeta('driveEnabled', false);
     await _syncQueue;
     resetTokenClient();
+    _lastSyncError = '';
     setStatus('', '☁ disconnected');
   } finally { _disconnecting--; }
 }
@@ -1479,6 +1544,7 @@ function resetTokenClient() {
   _tokenClient = null;
   _accessToken = null;
   _tokenExpiry = 0;
+  _needsDriveConsent = false;
   _inflightTokenPromise = null;
   _cachedClientId = '';
   _consecutiveSilentFailures = 0;
@@ -1560,7 +1626,7 @@ function openSetupDialog(ctx) {
           <label for="driveRecoveryVersion">Recovery copy</label>
           <select id="driveRecoveryVersion">${recoveryCopies.map((entry, index) =>
             `<option value="${index}" ${index === recoveryCopies.length - 1 ? 'selected' : ''}>${esc(new Date(entry.savedAt || 0).toLocaleString())} — ${entry.snapshot?.events?.length || 0} events</option>`).join('')}</select>` : ''}
-        <p id="driveError" role="alert"></p>
+        <p id="driveError" role="alert">${esc(connection.error || '')}</p>
       </div>
       <div class="actions">
         <button class="btn secondary" id="driveSaveId">Save ID</button>
@@ -1586,7 +1652,11 @@ function openSetupDialog(ctx) {
     const refreshBusy = () => {
       if (!document.getElementById('driveSaveId')) {
         window.removeEventListener?.('plotline:sync-status', refreshBusy);
-      } else busy(_pendingOperations > 0);
+      } else {
+        busy(_pendingOperations > 0);
+        const error = document.getElementById('driveError');
+        if (error) error.textContent = _lastSyncError;
+      }
     };
     window.addEventListener('plotline:sync-status', refreshBusy);
     document.getElementById('driveDisconnect')?.addEventListener('click', async () => {

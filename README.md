@@ -394,6 +394,10 @@ blocked, pending changes show **waiting to sync** (or **tap to sync** before the
 first successful sync); tap the pill or **Sync now** to authorize again.
 Stalled sign-in and network requests time out so you can retry instead of leaving
 sync stuck. Pending changes and recovery copies are retained for the next attempt.
+Tokens missing Drive permission are discarded; the next sync tap asks for consent
+again. Temporary read failures get bounded retries, while uncertain uploads use
+the recovery journal rather than blindly repeating writes. The sync dialog keeps
+the underlying error visible, including permission and storage-quota failures.
 Local logging works without Drive authorization. Disconnecting disables automatic
 sync on that device without deleting the remote backup.
 
