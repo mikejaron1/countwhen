@@ -190,6 +190,16 @@ async function test(name, action) {
     assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2]);
     assert.ok(await h.db.getMeta('lastDriveSync'));
   });
+  await test('upload metadata drift without a content change does not cause repeated writes', async () => {
+    const local = initial();
+    local.events.push(extraEvent(2));
+    const h = await harness({ local });
+    h.afterWrite = (file) => { file.version++; file.modifiedAt++; };
+    await h.drive.syncNow();
+    assert.equal(h.writes(), 1);
+    assert.equal(h.remote().events.length, 2);
+    assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
+  });
   await test('a first upload verifies by its returned ID before it appears in search', async () => {
     const h = await harness({ remote: null, staleListings: true });
     await h.drive.syncNow();
@@ -251,6 +261,27 @@ async function test(name, action) {
     assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2, 3]);
     assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2, 3]);
   });
+  await test('a concurrent edit during upload readback is detected and merged on retry', async () => {
+    const local = initial();
+    local.events.push(extraEvent(2));
+    const h = await harness({ local });
+    let changed = false;
+    h.intercept = ({ url }) => {
+      if (changed || h.writes() !== 1 || url.searchParams.get('alt') !== 'media') return;
+      changed = true;
+      const before = h.primary.content;
+      const remote = JSON.parse(before);
+      remote.events.push(extraEvent(3));
+      h.primary.content = JSON.stringify(remote);
+      h.primary.version++;
+      return new Response(before);
+    };
+    await h.drive.syncNow();
+    assert.equal(changed, true);
+    assert.equal(h.writes(), 2);
+    assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2, 3]);
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2, 3]);
+  });
   await test('an uncertain upload retains its exact file ID and failure details for the next retry', async () => {
     const local = initial();
     local.events.push(extraEvent(2));
@@ -290,19 +321,20 @@ async function test(name, action) {
       assert.equal(h.writes(), invalid === 'content' ? 0 : 1);
     }
   });
-  await test('17,000-event history completes the entire REST, merge, recovery and local-apply path', async () => {
+  await test('19,130-event history completes REST verification despite upload metadata drift', async () => {
     const local = initial();
-    local.events = Array.from({ length: 17000 }, (_, i) => ({
+    local.events = Array.from({ length: 19130 }, (_, i) => ({
       ...extraEvent(i + 1), note: 'Synthetic history - multibyte \u00e9 \u2615',
     }));
     const remote = clone(local);
-    local.events.push(extraEvent(17001)); remote.events.push(extraEvent(17002));
+    local.events.push(extraEvent(19131)); remote.events.push(extraEvent(19132));
     const h = await harness({ local, remote, staleListings: true, paginated: true });
+    h.afterWrite = (file) => { file.version++; file.modifiedAt++; };
     await h.drive.syncNow();
     assert.equal(h.writes(), 1);
-    assert.equal(h.remote().events.length, 17002);
-    assert.equal((await h.db.getAll('events')).length, 17002);
-    assert.equal((await h.db.getMeta('driveSyncBase')).events.length, 17002);
+    assert.equal(h.remote().events.length, 19132);
+    assert.equal((await h.db.getAll('events')).length, 19132);
+    assert.equal((await h.db.getMeta('driveSyncBase')).events.length, 19132);
     assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
   });
   if (failures) process.exitCode = 1;

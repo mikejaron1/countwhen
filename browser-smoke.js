@@ -228,7 +228,10 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
         restRevision++;
         restModifiedAt++;
         restWrites++;
-        return reply(restMeta());
+        const confirmation = restMeta();
+        restRevision++;
+        restModifiedAt++;
+        return reply(confirmation);
       }
       throw new Error('Unhandled sync recovery request: ' + request.method() + ' ' + url.pathname);
     });

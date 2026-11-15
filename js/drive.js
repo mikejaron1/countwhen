@@ -1348,10 +1348,18 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
       await savePending();
       _syncStep = 'verifying the uploaded backup';
       const verified = await statSyncFile(folderId, syncFileId);
-      if (!sameRemote(written, verified)) continue;
+      if (!verified || verified.id !== written.id) continue;
+      // Upload response metadata can precede subsequent metadata changes.
+      // Confirm the exact content under a stable direct-read revision instead.
       const contents = await validatedRemote(written.id);
-      if (!sameRecord(contents, candidate) ||
-          !sameRemote(verified, await statSyncFile(folderId, syncFileId))) continue;
+      if (!sameRecord(contents, candidate)) {
+        _syncStep = 'verifying the uploaded backup (readback content differs)';
+        continue;
+      }
+      if (!sameRemote(verified, await statSyncFile(folderId, syncFileId))) {
+        _syncStep = 'verifying the uploaded backup (revision changed during readback)';
+        continue;
+      }
       checkConnected();
       await maybeCleanupLegacyArtifacts(folderId);
       checkConnected();
