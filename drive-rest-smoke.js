@@ -18,7 +18,8 @@ const FOLDER_TYPE = 'application/vnd.google-apps.folder';
 const windows = [];
 
 async function harness({ local = initial(), remote = initial(), paginated = false,
-  staleListings = false, legacy = false, snapshots = false, incomplete = false } = {}) {
+  staleListings = false, legacy = false, snapshots = false, incomplete = false,
+  metadataChurn = false, omitChecksums = false } = {}) {
   const dom = new JSDOM('', { url: 'https://plotline.test/app/', runScripts: 'outside-only',
     pretendToBeVisual: true });
   windows.push(dom.window);
@@ -49,7 +50,7 @@ async function harness({ local = initial(), remote = initial(), paginated = fals
     trashed: file.trashed, version: String(file.version),
     modifiedTime: new Date(file.modifiedAt).toISOString(),
     ...(file.content == null ? {} : {
-      md5Checksum: createHash('md5').update(file.content).digest('hex'),
+      ...(!omitChecksums && { md5Checksum: createHash('md5').update(file.content).digest('hex') }),
       size: String(Buffer.byteLength(file.content)),
     }),
   });
@@ -115,6 +116,10 @@ async function harness({ local = initial(), remote = initial(), paginated = fals
     if (single) {
       const file = files.get(decodeURIComponent(single[1]));
       if (!file) return response({ error: { message: 'File not found.', errors: [{ reason: 'notFound' }] } }, 404);
+      if (method === 'GET' && metadataChurn && file.content != null) {
+        file.version++;
+        file.modifiedAt++;
+      }
       if (single[2]) {
         const copied = add({ ...file, ...JSON.parse(options.body), id: `file-${++nextId}` });
         return response(project(metadata(copied), fields));
@@ -198,6 +203,138 @@ async function test(name, action) {
     await h.drive.syncNow();
     assert.equal(h.writes(), 1);
     assert.equal(h.remote().events.length, 2);
+    assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
+  });
+  await test('metadata changes on every read do not block existing or newly created backups', async () => {
+    for (const remote of [initial(), null]) {
+      const local = initial();
+      local.events.push(extraEvent(2));
+      const h = await harness({ local, remote, metadataChurn: true, staleListings: true, snapshots: true });
+      await h.drive.syncNow();
+      assert.equal(h.writes(), 1);
+      assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2]);
+      assert.ok(await h.db.getMeta('lastDriveSync'));
+      assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
+    }
+  });
+  await test('a metadata-only change during uploaded content readback does not trigger a retry', async () => {
+    const local = initial();
+    local.events.push(extraEvent(2));
+    const h = await harness({ local });
+    h.intercept = ({ url }) => {
+      if (!h.writes() || url.searchParams.get('alt') !== 'media') return;
+      h.primary.version++;
+      h.primary.modifiedAt++;
+    };
+    await h.drive.syncNow();
+    assert.equal(h.writes(), 1);
+    assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2]);
+    assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
+    assert.ok(await h.db.getMeta('lastDriveSync'));
+  });
+  await test('successive local and remote edits sync repeatedly despite metadata-only changes', async () => {
+    const h = await harness({ metadataChurn: true });
+    for (let i = 0; i < 8; i++) {
+      await h.db.putMany('events', [extraEvent(i * 2 + 2)]);
+      const remote = JSON.parse(h.primary.content);
+      remote.events.push(extraEvent(i * 2 + 3));
+      h.primary.content = JSON.stringify(remote);
+      await h.drive.syncNow();
+      assert.equal(h.remote().events.length, i * 2 + 3);
+      assert.equal((await h.db.getAll('events')).length, i * 2 + 3);
+      assert.equal((await h.drive.getConnectionState()).error, '');
+    }
+    assert.equal(h.writes(), 8);
+  });
+  await test('two independent devices converge after overlapping syncs and repeated edits', async () => {
+    const first = await harness({ metadataChurn: true, staleListings: true });
+    const second = await harness();
+    second.window.fetch = first.window.fetch;
+    for (let i = 0; i < 4; i++) {
+      await first.db.putMany('events', [extraEvent(i * 2 + 2)]);
+      await second.db.putMany('events', [extraEvent(i * 2 + 3)]);
+      await Promise.all([first.drive.syncNow(), second.drive.syncNow()]);
+      await first.drive.syncNow();
+      await second.drive.syncNow();
+      const expected = Array.from({ length: i * 2 + 3 }, (_, n) => n + 1);
+      assert.deepEqual(first.remote().events.map((row) => row.id).sort((a, b) => a - b), expected);
+      for (const device of [first, second]) {
+        assert.deepEqual((await device.db.getAll('events')).map((row) => row.id).sort((a, b) => a - b), expected);
+        assert.equal((await device.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
+        assert.equal((await device.drive.getConnectionState()).error, '');
+      }
+    }
+  });
+  await test('one stale media read after upload retries without losing the candidate', async () => {
+    const local = initial();
+    local.events.push(extraEvent(2));
+    const h = await harness({ local, metadataChurn: true });
+    const stale = h.primary.content;
+    let returnedStale = false;
+    h.intercept = ({ url }) => {
+      if (returnedStale || !h.writes() || url.searchParams.get('alt') !== 'media') return;
+      returnedStale = true;
+      return new Response(stale);
+    };
+    await h.drive.syncNow();
+    assert.equal(returnedStale, true);
+    assert.equal(h.writes(), 2);
+    assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2]);
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2]);
+  });
+  await test('restore tolerates metadata-only changes without discarding the local safety copy', async () => {
+    const remote = initial();
+    remote.events.push(extraEvent(2));
+    const h = await harness({ remote, metadataChurn: true });
+    await h.drive.syncDown({ interactive: false });
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2]);
+    assert.equal(h.safety.length, 1);
+    assert.equal(h.writes(), 0);
+    assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
+  });
+  await test('missing checksums retain strict revision conflict checks', async () => {
+    const h = await harness({ omitChecksums: true, metadataChurn: true });
+    await assert.rejects(h.drive.syncNow(), /REMOTE_CONFLICT/);
+    assert.equal(h.writes(), 0);
+    assert.equal(await h.db.getMeta('lastDriveSync'), null);
+    const stable = await harness({ omitChecksums: true });
+    await stable.drive.syncNow();
+    assert.ok(await stable.db.getMeta('lastDriveSync'));
+  });
+  await test('a changed checksum is detected even if version and modified time do not change', async () => {
+    const local = initial();
+    local.events.push(extraEvent(2));
+    const h = await harness({ local });
+    h.afterWrite = (file) => {
+      if (h.writes() !== 1) return;
+      const remote = JSON.parse(file.content);
+      remote.events.push(extraEvent(3));
+      file.content = JSON.stringify(remote);
+    };
+    await h.drive.syncNow();
+    assert.equal(h.writes(), 2);
+    assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2, 3]);
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2, 3]);
+  });
+  await test('continuous content races fail safely and a later retry recovers every addition', async () => {
+    const local = initial();
+    local.events.push(extraEvent(2));
+    const h = await harness({ local, metadataChurn: true });
+    h.afterWrite = (file) => {
+      const remote = JSON.parse(file.content);
+      remote.events.push(extraEvent(h.writes() + 2));
+      file.content = JSON.stringify(remote);
+    };
+    await assert.rejects(h.drive.syncNow(), /REMOTE_CONFLICT/);
+    assert.equal(h.writes(), 3);
+    assert.equal(await h.db.getMeta('lastDriveSync'), null);
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2]);
+    assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'pending');
+    h.afterWrite = null;
+    await h.drive.syncNow();
+    assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2, 3, 4, 5]);
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2, 3, 4, 5]);
+    assert.equal((await h.drive.getConnectionState()).error, '');
     assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
   });
   await test('a first upload verifies by its returned ID before it appears in search', async () => {
@@ -328,7 +465,7 @@ async function test(name, action) {
     }));
     const remote = clone(local);
     local.events.push(extraEvent(19131)); remote.events.push(extraEvent(19132));
-    const h = await harness({ local, remote, staleListings: true, paginated: true });
+    const h = await harness({ local, remote, staleListings: true, paginated: true, metadataChurn: true });
     h.afterWrite = (file) => { file.version++; file.modifiedAt++; };
     await h.drive.syncNow();
     assert.equal(h.writes(), 1);

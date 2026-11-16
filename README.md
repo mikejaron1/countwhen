@@ -402,6 +402,10 @@ the underlying error visible, including permission and storage-quota failures.
 Drive searches follow every result page and reject incomplete searches instead
 of treating them as missing backups. Once a backup is identified, sync and upload
 verification use that file's ID rather than repeatedly searching by name.
+Content checksums distinguish actual backup edits from metadata-only Drive
+version changes, including changes during upload readback. Verification still
+requires exact backup contents and unchanged content across the read; when a
+checksum is unavailable, stricter version and timestamp checks remain in use.
 Failed manual retries open the sync dialog with a device-only error record,
 the failed step and release version; these diagnostics never travel in backups.
 Local logging works without Drive authorization. Disconnecting disables automatic

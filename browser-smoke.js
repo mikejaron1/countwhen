@@ -217,6 +217,8 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
         return reply({ id: 'rest-folder', mimeType: 'application/vnd.google-apps.folder', trashed: false });
       }
       if (url.pathname === '/drive/v3/files/rest-primary') {
+        restRevision++;
+        restModifiedAt++;
         return reply(url.searchParams.get('alt') === 'media' ? restRemote : restMeta());
       }
       if (/^\/drive\/v3\/files\/[^/]+$/.test(url.pathname)) {

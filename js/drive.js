@@ -1183,9 +1183,13 @@ async function replaceLocalFromSync(obj, options, revision) {
 }
 
 function sameRemote(a, b) {
-  return a == null || b == null ? a == null && b == null :
-    a.id === b.id && a.version === b.version &&
-    a.modifiedTime === b.modifiedTime && a.md5Checksum === b.md5Checksum;
+  if (a == null || b == null) return a == null && b == null;
+  if (a.id !== b.id) return false;
+  // Drive's version also advances for non-content changes, including changes
+  // invisible to users. Only the checksum identifies unchanged backup bytes.
+  if (a.md5Checksum && b.md5Checksum) return a.md5Checksum === b.md5Checksum;
+  return a.version === b.version && a.modifiedTime === b.modifiedTime &&
+    a.md5Checksum === b.md5Checksum;
 }
 
 async function validatedRemote(id) {
@@ -1350,14 +1354,14 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
       const verified = await statSyncFile(folderId, syncFileId);
       if (!verified || verified.id !== written.id) continue;
       // Upload response metadata can precede subsequent metadata changes.
-      // Confirm the exact content under a stable direct-read revision instead.
+      // Confirm exact content under a stable direct-read checksum instead.
       const contents = await validatedRemote(written.id);
       if (!sameRecord(contents, candidate)) {
         _syncStep = 'verifying the uploaded backup (readback content differs)';
         continue;
       }
       if (!sameRemote(verified, await statSyncFile(folderId, syncFileId))) {
-        _syncStep = 'verifying the uploaded backup (revision changed during readback)';
+        _syncStep = 'verifying the uploaded backup (content changed during readback)';
         continue;
       }
       checkConnected();
