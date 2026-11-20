@@ -760,7 +760,7 @@ async function test(name, fn) {
     assert.deepEqual(h.state.local.events, [event(1, 3)]);
     assert.deepEqual(h.state.remote.events, [event(1, 3)]);
   });
-  await test('a pending collision plus a newer remote edit defers instead of resurrecting a local delete', async () => {
+  await test('a pending collision plus a newer remote edit honors the local delete and retains remote recovery', async () => {
     const h = harness();
     h.state.local.events.push(event(1, 2));
     h.state.remote.events.push(event(1, 3));
@@ -768,13 +768,46 @@ async function test(name, fn) {
     await assert.rejects(h.api.syncNow(), /network interrupted/);
     const moved = h.state.remote.events.find((e) => e.id !== 1);
     moved.amount = 9; h.state.revision++;
+    h.state.remote.events.push(event(2, 4));
     await editLocal(h, () => { h.state.local.events = []; });
     h.state.onWrite = null;
-    await assert.rejects(h.api.syncNow(), /LOCAL_CONFLICT/);
-    assert.deepEqual(h.state.local.events, []);
+    await h.api.syncNow();
+    assert.deepEqual(h.state.local.events.map((e) => e.id).sort(), [1, 2]);
+    assert.deepEqual(h.state.remote.events, h.state.local.events);
+    assert.equal(h.state.local.events.find((e) => e.id === 1).amount, 3);
+    const recovery = h.meta.get('drivePendingSnapshot');
+    assert.equal(recovery.status, 'confirmed');
+    assert.ok(recovery.history.some((entry) => entry.snapshot.events.some((e) => e.id === moved.id && e.amount === 9)));
+  });
+  await test('an entry deleted during sync stays deleted when Drive edits it before retry', async () => {
+    const h = harness(backup({ events: [event(1)] }));
+    h.state.remote.events.push(event(2));
+    h.state.onRotate = async () => {
+      h.state.onRotate = null;
+      await editLocal(h, () => { h.state.local.events = []; });
+      h.state.remote.events[0].amount = 9;
+      h.state.remote.events.push(event(3));
+      h.state.revision++;
+    };
+    await h.api.syncNow();
+    assert.deepEqual(h.state.local.events.map((e) => e.id).sort(), [2, 3]);
+    assert.deepEqual(h.state.remote.events, h.state.local.events);
     assert.equal(h.state.writes, 1);
-    assert.equal(h.meta.has('lastDriveSync'), false);
-    assert.equal(h.meta.get('drivePendingSnapshot').status, 'pending');
+    assert.ok(h.meta.get('drivePendingSnapshot').history.some((entry) =>
+      entry.snapshot.events.some((e) => e.id === 1 && e.amount === 9)));
+  });
+  await test('undoing a deletion during sync clears the earlier deletion intent', async () => {
+    const h = harness(backup({ events: [event(1)] }));
+    h.state.remote.events.push(event(2));
+    h.state.onWrite = async () => {
+      if (h.state.writes === 1) await editLocal(h, () => { h.state.local.events = []; });
+      if (h.state.writes === 2) await editLocal(h, () => { h.state.local.events = [event(1, 5)]; });
+    };
+    await h.api.syncNow();
+    assert.deepEqual(h.state.local.events.map((e) => e.id).sort(), [1, 2]);
+    assert.equal(h.state.local.events.find((e) => e.id === 1).amount, 5);
+    assert.deepEqual(h.state.remote.events, h.state.local.events);
+    assert.equal(h.meta.get('drivePendingSnapshot').status, 'confirmed');
   });
   await test('older recovery without event identity maps defers newer deletes rather than guessing', async () => {
     const h = harness();

@@ -337,6 +337,75 @@ async function test(name, action) {
     assert.equal((await h.drive.getConnectionState()).error, '');
     assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
   });
+  await test('a deleted entry cannot strand sync when a concurrent upload brings back an edited copy', async () => {
+    const remote = initial();
+    remote.events.push(extraEvent(2));
+    const h = await harness({ remote });
+    let deleted = false;
+    h.intercept = async ({ url }) => {
+      if (deleted || url.searchParams.get('alt') !== 'media') return;
+      deleted = true;
+      await h.db.delete('events', 1);
+    };
+    h.afterWrite = (file) => {
+      if (h.writes() !== 1) return;
+      const competing = JSON.parse(file.content);
+      competing.events.push({ ...initial().events[0], note: 'Concurrent remote edit' }, extraEvent(3));
+      file.content = JSON.stringify(competing);
+      file.version++;
+    };
+    await h.drive.syncNow();
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [2, 3]);
+    assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [2, 3]);
+    const recovery = await h.db.getMeta('drivePendingSnapshot');
+    assert.equal(recovery.status, 'confirmed');
+    assert.ok(recovery.history.some((entry) =>
+      entry.snapshot.events.some((row) => row.note === 'Concurrent remote edit')));
+    assert.equal((await h.drive.getConnectionState()).error, '');
+    assert.equal(h.writes(), 2);
+  });
+  await test('an existing deletion-conflict journal recovers without restoring deleted entries', async () => {
+    const local = initial(), remote = initial();
+    local.events = [];
+    remote.events[0].note = 'Edited on Drive';
+    remote.events.push(extraEvent(2));
+    const h = await harness({ local, remote });
+    const current = clone(await h.io.buildExportObject());
+    await h.db.setMeta('drivePendingSnapshot', {
+      status: 'pending', snapshot: current, localSnapshot: current, remoteBase: initial(),
+      localDeletes: { events: [1] },
+      localIdMaps: { topics: { 1: 1 }, measurements: { 100: 100 }, pendtimes: {}, events: {} },
+      folderId: h.folder.id, fileId: h.primary.id,
+    });
+    await h.db.setMeta('driveLastFailure', {
+      step: 'merging changes',
+      message: 'LOCAL_CONFLICT: Drive conflicts with a recent local deletion. Recovery retained; retry sync.',
+    });
+    await h.drive.syncNow();
+    assert.deepEqual(h.remote().events.map((row) => row.id), [2]);
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id), [2]);
+    const recovery = await h.db.getMeta('drivePendingSnapshot');
+    assert.equal(recovery.status, 'confirmed');
+    assert.ok(recovery.history.some((entry) =>
+      entry.snapshot.events.some((row) => row.id === 1 && row.note === 'Edited on Drive')));
+    assert.equal(await h.db.getMeta('driveLastFailure'), null);
+    await h.drive.syncNow();
+    assert.deepEqual(h.remote().events.map((row) => row.id), [2]);
+  });
+  await test('undoing a deletion between uploads does not leave a stale deletion conflict', async () => {
+    const remote = initial();
+    remote.events.push(extraEvent(2));
+    const h = await harness({ remote });
+    h.afterWrite = async () => {
+      if (h.writes() === 1) await h.db.delete('events', 1);
+      if (h.writes() === 2) await h.db.put('events', { ...initial().events[0], note: 'Restored with Undo' });
+    };
+    await h.drive.syncNow();
+    assert.deepEqual(h.remote().events.map((row) => row.id).sort(), [1, 2]);
+    assert.equal(h.remote().events.find((row) => row.id === 1).note, 'Restored with Undo');
+    assert.deepEqual((await h.db.getAll('events')).map((row) => row.id).sort(), [1, 2]);
+    assert.equal((await h.db.getMeta('drivePendingSnapshot')).status, 'confirmed');
+  });
   await test('a first upload verifies by its returned ID before it appears in search', async () => {
     const h = await harness({ remote: null, staleListings: true });
     await h.drive.syncNow();

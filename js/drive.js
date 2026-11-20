@@ -1202,7 +1202,7 @@ async function validatedRemote(id) {
 /* Keep a bounded local journal, including confirmed uploads: readback success
  * does not rule out a later concurrent overwrite. Entries are detached copies,
  * never edited in place. This is recovery, not a server-side write guarantee. */
-async function saveRecovery(snapshot, localSnapshot, status = 'pending', localIdMaps, provenance = {}) {
+async function saveRecovery(snapshot, localSnapshot, status = 'pending', localIdMaps, provenance = {}, extraSnapshots = []) {
   const previous = await CWDB.getMeta('drivePendingSnapshot');
   const history = [...(previous?.history || (previous?.snapshot
     ? [{ savedAt: previous.savedAt, snapshot: previous.snapshot }] : []))];
@@ -1215,6 +1215,7 @@ async function saveRecovery(snapshot, localSnapshot, status = 'pending', localId
     }
   };
   append(localSnapshot);
+  for (const obj of extraSnapshots) append(obj);
   append(snapshot);
   await CWDB.setMeta('drivePendingSnapshot', {
     savedAt: Date.now(), status, snapshot, localSnapshot, localIdMaps, ...provenance,
@@ -1242,11 +1243,20 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
     let recoveredSnapshot = pending?.snapshot;
     let recoveredRemoteBase = pending?.remoteBase;
     const localDeletes = { ...pending?.localDeletes };
-    const retainDeletes = (deletes) => {
+    const retainDeletes = (deletes, current = local) => {
       for (const [key, ids] of Object.entries(deletes || {})) {
         localDeletes[key] = [...new Set([...(localDeletes[key] || []), ...ids])];
       }
+      // Undo or a later edit cancels a deletion, in the candidate's ID space.
+      for (const [key, ids] of Object.entries(localDeletes)) {
+        const idKey = key === 'appdata' ? 'name' : 'id';
+        const map = localIdMaps[key] || {};
+        const kept = new Set((current[key] || []).map((row) =>
+          Object.hasOwn(map, row[idKey]) ? map[row[idKey]] : row[idKey]));
+        localDeletes[key] = ids.filter((id) => !kept.has(id));
+      }
     };
+    let recoveredDeletes;
     if (pending?.snapshot &&
         !sameRecord(comparableBackup(local), comparableBackup(pending.snapshot))) {
       if (pending.localSnapshot && !pending.localIdMaps?.events &&
@@ -1258,15 +1268,16 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
         : mergeBackups(pending.localSnapshot || base, local, pending.snapshot);
       candidate = result.merged;
       localIdMaps = pending.localIdMaps?.events ? result.localIdMaps : recoveryIdMaps(local, pending, result.localIdMaps);
-      retainDeletes(result.localDeletes);
+      recoveredDeletes = result.localDeletes;
     }
+    retainDeletes(recoveredDeletes);
     let resultStats = null;
     let hadRemote = false;
     let localRetries = 0;
-    const savePending = () => {
+    const savePending = (extraSnapshots = []) => {
       _syncStep = 'saving a recovery copy';
       return saveRecovery(candidate, local, 'pending', localIdMaps,
-        { remoteBase: recoveredRemoteBase || retryBase, localDeletes, folderId, fileId: syncFileId });
+        { remoteBase: recoveredRemoteBase || retryBase, localDeletes, folderId, fileId: syncFileId }, extraSnapshots);
     };
     const acceptLocalChanges = async (next) => {
       if (sameLocal(localState, next)) return false;
@@ -1277,7 +1288,7 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
         const result = rebaseLocalChanges(local, next.data, candidate, localIdMaps);
         candidate = result.merged;
         localIdMaps = result.localIdMaps;
-        retainDeletes(result.localDeletes);
+        retainDeletes(result.localDeletes, next.data);
       }
       localState = next;
       local = next.data;
@@ -1310,10 +1321,20 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
         const result = mergeBackups(retryBase, candidate, remote, {
           preferRemote: (Date.parse(stat.modifiedTime) || 0) > localState.lastChange,
         });
+        let deletedEvents = 0;
         for (const [key, ids] of Object.entries(localDeletes)) {
           const deleted = new Set(ids), idKey = key === 'appdata' ? 'name' : 'id';
           if (result.merged[key].some((row) => deleted.has(row[idKey]))) {
-            throw new Error('LOCAL_CONFLICT: Drive conflicts with a recent local deletion. Recovery retained; retry sync.');
+            if (key !== 'events') {
+              throw new Error('LOCAL_CONFLICT: Drive conflicts with a recent local deletion. Recovery retained; retry sync.');
+            }
+            // Entries have no dependents. Honor the explicit delete, keeping
+            // the competing Drive edit in recovery instead of blocking sync.
+            const kept = result.merged.events.filter((row) => !deleted.has(row.id));
+            deletedEvents = result.merged.events.length - kept.length;
+            result.merged.events = kept;
+            result.merged.eventcount = kept.length;
+            result.stats.deleted += deletedEvents;
           }
         }
         candidate = result.merged;
@@ -1323,6 +1344,7 @@ function syncNow({ interactive = false, allowMerge = true, allowAuth = interacti
         // Carry the remote state just observed forward on a retry, so records
         // already merged aren't mistaken for fresh ID collisions/deletions.
         retryBase = remote;
+        if (deletedEvents) await savePending([remote]);
         await rotateVersions(folderId, stat.id, stat.md5Checksum);
       }
       const errors = CWIO.validateBackup(candidate);

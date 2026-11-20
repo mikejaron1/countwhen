@@ -514,6 +514,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       updateSyncFile = async (id, data) => {
         await pauseNetwork('write');
         fakeRemote = JSON.parse(JSON.stringify(data));
+        if (window.competingEntry) {
+          fakeRemote.events = fakeRemote.events.filter((event) => event.id !== competingEntry.id);
+          fakeRemote.events.push(competingEntry);
+          fakeRemote.eventcount = fakeRemote.events.length;
+          window.competingEntry = null;
+        }
         fakeRevision++;
         return statSyncFile();
       };
@@ -556,7 +562,12 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
       await page.locator('#confirmYes').click();
       await page.waitForFunction(() => !document.querySelector('.dialog'), null, { timeout: 1500 });
       await page.evaluate(() => CWMODEL.whenIdle());
-      await page.evaluate(async () => { releaseNetwork(); await pendingSlowSync; });
+      await page.evaluate(async (id) => {
+        window.competingEntry = { ...fakeRemote.events.find((event) => event.id === id),
+          note: 'Concurrent Drive edit of deleted entry' };
+        releaseNetwork();
+        await pendingSlowSync;
+      }, removedId);
       assert.equal(await page.evaluate(() => syncFailure), null);
       const preserved = await page.evaluate(async ({ added, removed }) => {
         const events = await CWDB.getAll('events');
@@ -564,6 +575,9 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css
           removed: events.some((event) => event.id === removed) };
       }, { added: logged.id, removed: removedId });
       assert.deepEqual(preserved, { added: `Saved during remote ${phase}`, removed: false });
+      assert.equal(await page.evaluate(async (id) => (await CWDB.getMeta('drivePendingSnapshot')).history
+        .some((entry) => entry.snapshot.events.some((event) =>
+          event.id === id && event.note === 'Concurrent Drive edit of deleted entry')), removedId), true);
       await page.evaluate(() => CWDRIVE.syncNow());
       assert.equal(await page.evaluate((id) => fakeRemote.events.some((event) => event.id === id), removedId), false);
       assert.equal(await page.evaluate((id) => fakeRemote.events.find((event) => event.id === id)?.note, logged.id),

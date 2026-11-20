@@ -428,7 +428,10 @@ pending times and app settings:
 - Added on either side → kept.
 - Deleted on one side, untouched on the other → the delete is honoured.
 - Deleted on one side, *edited* on the other → the edit wins. Data is
-  never silently lost to a delete race.
+  never silently lost to a delete race. An entry explicitly deleted while
+  sync is in flight (or while recovering a failed sync) stays deleted across
+  retries; any competing Drive edit is retained in local recovery instead of
+  blocking sync. Undo cancels that pending deletion.
 - Edited differently on both sides → whichever device was touched most
   recently wins, and the sync reports how many conflicts it resolved.
 
